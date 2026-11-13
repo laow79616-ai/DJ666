@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}DJ666 音乐随听{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=bak1">
+  {% block extra_head %}{% endblock %}
+</head>
+{% set p = request.url.path %}
+<body data-page="{% block page_id %}other{% endblock %}">
+  <div class="pjax-bar" id="pjaxBar"></div>
+  <div class="bg-orb bg-orb-a"></div>
+  <div class="bg-orb bg-orb-b"></div>
+{% set admin_area = p == '/admin' or p.startswith('/admin/') %}
+  {% if admin_area %}
+  <header class="topbar admin-topbar">
+    <a class="brand" href="/admin" data-no-pjax>
+      <span class="brand-mark">DJ</span>
+      <span class="brand-name">666</span>
+      <span class="brand-sub admin-badge">管理后台</span>
+    </a>
+    <nav class="nav admin-nav" id="adminNav" aria-label="后台导航">
+      <a href="/" data-no-pjax>返回前台</a>
+      {% if user %}
+      <form class="inline-form" action="/logout" method="post" data-no-pjax>
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button type="submit" class="link-btn">退出</button>
+      </form>
+      {% endif %}
+    </nav>
+  </header>
+  {% else %}
+  <header class="topbar site-topbar">
+    <a class="brand" href="/">
+      <span class="brand-mark">DJ</span>
+      <span class="brand-name">666</span>
+      <span class="brand-sub">音乐随听</span>
+    </a>
+    <nav class="nav top-actions" id="siteNav" aria-label="账户">
+      {% if user %}
+      <a href="/settings"{% if p.startswith('/settings') %} class="is-active" aria-current="page"{% endif %}>设置</a>
+      <form class="inline-form" action="/logout" method="post" data-no-pjax>
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button type="submit" class="link-btn">退出</button>
+      </form>
+      {% else %}
+      <a href="/login"{% if p == '/login' %} class="is-active" aria-current="page"{% endif %}>登录</a>
+      <a class="btn btn-sm{% if p == '/register' %} is-active{% endif %}" href="/register">注册</a>
+      {% endif %}
+    </nav>
+  </header>
+  {% endif %}
+
+  <div id="flashArea">
+  {% if flashes %}
+  <div class="flash-wrap">
+    {% for item in flashes %}
+    <div class="flash flash-{{ item.category }}">{{ item.message }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+  </div>
+
+  <main class="page" id="appMain">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <p>DJ666 · 随听、一起聊 · <a href="/rules">平台合约规则</a></p>
+  </footer>
+
+  {% if not admin_area %}
+  <div class="fab-nav" id="fabNav">
+    <div class="fab-menu" id="fabMenu" role="menu" hidden>
+      <a href="/" data-fab="home" role="menuitem"{% if p == '/' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">⌂</span>首页</a>
+      <a href="/music" data-fab="music" role="menuitem"{% if p == '/music' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">♪</span>音乐</a>
+      <a href="/dj" data-fab="dj" data-no-pjax role="menuitem"{% if p == '/dj' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">🎚</span>打碟</a>
+      <a href="/chat" data-fab="chat" role="menuitem"{% if p == '/chat' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">💬</span>公屏</a>
+    </div>
+    <button type="button" class="fab-btn" id="fabBtn" aria-label="页面导航" aria-haspopup="menu" aria-expanded="false" aria-controls="fabMenu">
+      <span class="fab-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+    </button>
+  </div>
+  {% endif %}
+
+  <div class="player" id="playerBar" hidden>
+    <div class="player-info">
+      <span class="live-dot"></span>
+      <div class="player-titles">
+        <strong id="nowPlaying">未选择曲目</strong>
+        <span class="player-sub muted" id="playerSub"></span>
+      </div>
+    </div>
+    <div class="player-ctrls">
+      <button type="button" class="player-btn" id="plMode" title="列表循环" aria-label="播放模式">🔁</button>
+      <button type="button" class="player-btn" id="plPrev" title="上一首" aria-label="上一首">⏮</button>
+      <button type="button" class="player-btn player-main" id="plToggle" title="播放" aria-label="播放" aria-pressed="false"><span class="pl-disc" aria-hidden="true"><span class="pl-disc-label">DJ666</span></span><span class="pl-icon" id="plToggleIcon" aria-hidden="true">▶</span></button>
+      <button type="button" class="player-btn" id="plNext" title="下一首" aria-label="下一首">⏭</button>
+      <button type="button" class="player-btn" id="plMute" title="静音" aria-label="静音" aria-pressed="false">🔊</button>
+    </div>
+    <audio id="audio" controls preload="none"></audio>
+    <button type="button" class="player-btn player-close" id="plClose" title="关闭播放器" aria-label="关闭播放器">×</button>
+  </div>
+
+  <script src="/static/tg.js?v=1" defer></script>
+  <script src="/static/app.js?v=tgeng1" defer></script>
+  <script src="/static/ann_interact.js?v=tgc1" defer></script>
+  <div id="pageScripts">{% block scripts %}{% endblock %}</div>
+</body>
+</html>

@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}个人设置 · DJ666{% endblock %}
+{% block page_id %}settings{% endblock %}
+{% block content %}
+<section class="hero slim">
+  <p class="eyebrow">SETTINGS</p>
+  <h1>个人设置</h1>
+  <p class="lead">修改展示用户名和登录密码，上传音乐包，联系投稿联系人，分享站点，或查阅平台合约规则。</p>
+</section>
+
+<section class="panel settings-music" id="music">
+  <div class="panel-head">
+    <h2>上传音乐</h2>
+    <span class="count">{{ my_tracks|length }} 首</span>
+  </div>
+  <p class="muted">请上传「音乐包」：一个 ZIP、RAR 或 7Z 压缩包，里面放一首或多首音频（mp3 / wav / ogg / m4a / flac）。不支持直接上传单个音频文件。压缩包内的子文件夹会自动扫描，系统会忽略 __MACOSX、.DS_Store 等无关文件。</p>
+  <p class="hint">音乐包最大 200MB，其中单个音频不超过 50MB。上传后会先出现在下方你的曲目列表中，管理员审核通过后才会显示在首页供所有人播放。管理员账号上传的曲目会直接发布。</p>
+  <form class="stack-form upload-pack-form" action="/settings/upload" method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label>选择音乐包
+      <input type="file" name="file" accept=".zip,.rar,.7z,application/zip,application/x-rar-compressed,application/x-7z-compressed" required>
+    </label>
+    <button type="submit" class="btn">上传音乐包</button>
+  </form>
+
+  {% if dup_batches %}
+  <div class="dup-check" id="dupcheck">
+    <h3 class="ann-log-title">重复曲目待确认</h3>
+    <p class="hint">以下音频与曲库中已有曲目重复（内容完全相同，或文件名和大小都相同），暂未导入。请逐首选择「跳过」或「覆盖」：跳过不会新增曲目；覆盖会用新文件替换原曲目的音频，保留原曲目名称。只能覆盖自己上传的曲目。不处理则默认跳过，24 小时后自动清除。</p>
+    {% for batch in dup_batches %}
+    <form class="dup-batch" action="/settings/upload/resolve" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <input type="hidden" name="token" value="{{ batch.token }}">
+      {% if batch.pack_name %}<p class="muted dup-batch-from">来自音乐包：{{ batch.pack_name }}</p>{% endif %}
+      <ul class="dup-list">
+        {% for item in batch["items"] %}
+        <li class="dup-item">
+          <div class="dup-info">
+            <strong class="dup-name">{{ item.name }}</strong>
+            <span class="muted">{{ (item.size / 1048576)|round(2) }} MB</span>
+            {% for m in item.matches %}
+            <span class="dup-match">与《{{ m.title }}》重复（{{ m.reason }} · {{ m.status_label }} · {% if m.can_overwrite and m.uploader_id == user.id %}你上传的{% else %}{{ m.uploader }} 上传{% endif %}）</span>
+            {% endfor %}
+          </div>
+          <div class="dup-choice" role="radiogroup" aria-label="{{ item.name }} 的处理方式">
+            <label><input type="radio" name="act_{{ item.idx }}" value="skip" checked> 跳过</label>
+            {% for m in item.matches if m.can_overwrite %}
+            <label><input type="radio" name="act_{{ item.idx }}" value="overwrite:{{ m.id }}"> 覆盖{% if loop.length > 1 %}《{{ m.title }}》{% endif %}</label>
+            {% else %}
+            <span class="muted dup-noover">（不是你上传的曲目，只能跳过）</span>
+            {% endfor %}
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      <div class="dup-actions">
+        <button type="submit" class="btn btn-sm">确认处理</button>
+        <button type="submit" class="btn btn-sm btn-ghost" name="skip_all" value="1">全部跳过</button>
+      </div>
+    </form>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="my-tracks">
+    <h3 class="ann-log-title">我的曲目</h3>
+    {% if my_tracks %}
+    <ul class="track-list my-track-list" id="myTrackList" data-playlist="mine">
+      {% for track in my_tracks %}
+      <li class="track-item my-track-item" data-src="/uploads/{{ track.filename }}" data-title="{{ track.title }}">
+        <button type="button" class="play-btn" aria-label="播放 {{ track.title }}">▶</button>
+        <div class="track-meta my-track-meta">
+          <form class="track-rename-form" action="/settings/tracks/{{ track.id }}/rename" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf }}">
+            <input type="text" name="title" value="{{ track.title }}" maxlength="200" required aria-label="曲目名称">
+            <button type="submit" class="btn btn-sm">保存名称</button>
+          </form>
+          <span class="muted my-track-sub">
+            <span class="status-badge status-{{ track.status }}">
+              {% if track.status == 'approved' %}已发布
+              {% elif track.status == 'rejected' %}已拒绝
+              {% else %}待审核{% endif %}
+            </span>
+            {% if track.pack_name %} · 来自 {{ track.pack_name }}{% endif %}
+            · {{ track.created_at|fmt_time }}
+          </span>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">你还没有上传过曲目。</p>
+    {% endif %}
+  </div>
+</section>
+
+
+<section class="panel contact-panel" id="contact">
+  <div class="panel-head">
+    <h2>联系平台投稿联系人</h2>
+  </div>
+  {% if contact.configured %}
+  <p class="muted">想投稿音乐或合作，可以直接联系平台投稿联系人{% if contact.name %}「<strong class="text-em">{{ contact.name }}</strong>」{% endif %}：</p>
+  <ul class="contact-list">
+    {% if contact.telegram_url %}
+    <li><span class="contact-k">Telegram</span><a class="contact-v" href="{{ contact.telegram_url }}" target="_blank" rel="noopener noreferrer">{{ contact.telegram_label }}</a></li>
+    {% endif %}
+    {% if contact.email %}
+    <li><span class="contact-k">邮箱</span><a class="contact-v" href="mailto:{{ contact.email }}">{{ contact.email }}</a></li>
+    {% endif %}
+  </ul>
+  {% if contact.note %}<p class="hint contact-note">{{ contact.note }}</p>{% endif %}
+  {% else %}
+  <p class="muted">平台暂未设置投稿联系人，请稍后再来查看。</p>
+  {% if user.is_admin %}<p class="hint">管理员可在 /admin 的「投稿联系人」中设置 Telegram、邮箱等联系方式。</p>{% endif %}
+  {% endif %}
+</section>
+
+<section class="settings-grid">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>修改用户名</h2>
+    </div>
+    <p class="muted">登录邮箱仍是 <strong class="text-em">{{ user.email }}</strong>，公屏和列表将显示你的用户名。</p>
+    <form class="stack-form" action="/settings/username" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <label>用户名（2–20 个字符，仅中文、字母、数字和下划线）
+        <input type="text" name="username" value="{{ user.username }}" minlength="2" maxlength="20" required autocomplete="nickname">
+      </label>
+      <button type="submit" class="btn">保存用户名</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>修改登录密码</h2>
+    </div>
+    <form class="stack-form" action="/settings/password" method="post" autocomplete="off">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <label>当前密码
+        <input type="password" name="current_password" required minlength="8" autocomplete="current-password">
+      </label>
+      <label>新密码（至少 8 位）
+        <input type="password" name="new_password" required minlength="8" autocomplete="new-password">
+      </label>
+      <label>确认新密码
+        <input type="password" name="new_password2" required minlength="8" autocomplete="new-password">
+      </label>
+      <button type="submit" class="btn">更新密码</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>一键分享</h2>
+    </div>
+    <p class="muted">把 DJ666 分享给朋友。点击后会复制站点链接；若浏览器支持，也会唤起系统分享。</p>
+    <div class="share-row">
+      <input type="text" id="shareUrl" value="" readonly aria-label="分享链接">
+      <button type="button" class="btn" id="shareBtn">分享 DJ666</button>
+    </div>
+    <p class="share-toast" id="shareToast" hidden>链接已复制，快去分享吧。</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>平台合约规则</h2>
+    </div>
+    <p class="muted">使用本站即表示你同意遵守社区约定。完整规则对所有用户公开可查。</p>
+    <div class="rules-preview">
+      <p>请文明互动，不发布违法、色情、辱骂或侵权内容。公屏仅登录用户可发言。登录用户可在本页上传音乐包，审核通过后出现在首页。管理员可删除违规内容和账号。</p>
+    </div>
+    <p><a class="btn" href="/rules">查看完整规则</a></p>
+  </section>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const urlInput = document.getElementById("shareUrl");
+  const btn = document.getElementById("shareBtn");
+  const toast = document.getElementById("shareToast");
+  const shareUrl = (window.location.origin || "https://www.dj666.pw") + "/";
+  if (urlInput) urlInput.value = shareUrl;
+  function showToast(text) {
+    if (!toast) return;
+    toast.textContent = text;
+    toast.hidden = false;
+  }
+  async function copyLink() {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(shareUrl);
+      return true;
+    }
+    if (urlInput) {
+      urlInput.focus();
+      urlInput.select();
+      return document.execCommand("copy");
+    }
+    return false;
+  }
+  if (btn) {
+    btn.addEventListener("click", async function () {
+      let copied = false;
+      try {
+        copied = await copyLink();
+      } catch (e) {
+        copied = false;
+      }
+      if (navigator.share) {
+        try {
+          await navigator.share({
+            title: "DJ666 音乐随听",
+            text: "来 DJ666 一起听音乐、看公告、聊公屏。",
+            url: shareUrl
+          });
+        } catch (e) {
+          if (e && e.name !== "AbortError") {
+            /* ignore share errors if copy succeeded */
+          }
+        }
+      }
+      showToast(copied ? "链接已复制，快去分享吧。" : "请手动复制上面的链接再分享。");
+    });
+  }
+})();
+</script>
+{% endblock %}

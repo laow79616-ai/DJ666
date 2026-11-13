@@ -1,0 +1,40 @@
+{% macro track_list(tracks, list_id="trackList", name="music", show_search=False) -%}
+{% if show_search %}
+<div class="track-cats" data-track-cats="{{ list_id }}" role="group" aria-label="曲目分类">
+  <button type="button" class="track-cat is-active" data-track-cat="" aria-pressed="true">全部</button>
+  {% for key, label in track_categories %}
+  <button type="button" class="track-cat" data-track-cat="{{ key }}" aria-pressed="false">{{ label }}</button>
+  {% endfor %}
+</div>
+<div class="track-search" role="search">
+  <span class="track-search-ico" aria-hidden="true">🔍</span>
+  <input type="search" class="track-search-input" data-track-search="{{ list_id }}" placeholder="搜索曲名…" aria-label="搜索曲名" autocomplete="off" enterkeyhint="search">
+  <span class="track-search-count muted" data-track-search-count="{{ list_id }}" hidden></span>
+</div>
+<p class="muted track-search-empty" data-track-search-empty="{{ list_id }}" hidden>没有找到匹配的曲目。</p>
+{% endif %}
+<ul class="track-list" id="{{ list_id }}" data-playlist="{{ name }}">
+  {% for track in tracks %}
+  {% set own = user and track.uploader_id == user.id %}
+  {% set mine = user and (own or user.is_admin) %}
+  <li class="track-item{% if own %} is-mine{% endif %}{% if mine %} is-editable{% endif %}" data-src="/uploads/{{ track.filename }}" data-title="{{ track.title }}" data-track-cat="{{ track.category or '' }}">
+    <button type="button" class="play-btn" aria-label="播放 {{ track.title }}">▶</button>
+    <div class="track-meta">
+      {% if mine %}<strong class="track-title is-editable" data-track-rename role="button" tabindex="0" title="点击修改曲名{% if not own %}（管理员）{% endif %}" aria-label="修改曲名：{{ track.title }}"><span class="track-title-text">{{ track.title }}</span><span class="track-edit-ico" aria-hidden="true">✎</span></strong>
+      {% else %}<strong class="track-title"><span class="track-title-text">{{ track.title }}</span></strong>{% endif %}
+      <span class="muted">{{ display_name(track.uploader, "未知用户") }} · {{ track.created_at|fmt_time }}</span>
+      {% if mine %}
+      <form class="track-rename-inline" action="/settings/tracks/{{ track.id }}/rename" method="post" data-no-pjax hidden>
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="text" name="title" value="{{ track.title }}" maxlength="200" required aria-label="新的曲目名称">
+        <button type="submit" class="btn btn-sm">保存</button>
+        <button type="button" class="btn btn-sm btn-ghost" data-track-rename-cancel>取消</button>
+        <span class="track-rename-msg" aria-live="polite"></span>
+      </form>
+      {% endif %}
+    </div>
+    {% if mine %}<button type="button" class="track-rename-btn" data-track-rename title="修改曲目名称" aria-label="修改曲目名称" style="visibility:visible;opacity:1;min-width:64px;min-height:44px;padding:11px 14px;background:#3cefff;color:#071016;font-weight:800;font-size:1.05rem;line-height:1;border:0;border-radius:999px;z-index:6;position:relative;-webkit-appearance:none;appearance:none;white-space:nowrap">改名</button>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{%- endmacro %}

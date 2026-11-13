@@ -1,0 +1,118 @@
+{# Shared DJ mixer + 录音 + 上传优化 UI. Used by /dj and the admin 「DJ 混音」 tab. Needs: library, opt_cfg, user, csrf.
+   Set hide_mixer=True in admin to keep only 上传优化 (public /dj is unchanged). #}
+{% if not hide_mixer %}
+<section class="mixer" id="mixer">
+  <header class="mixer-head">
+    <p class="eyebrow">DJ MIXER</p>
+    {% if mixer_embedded %}<h2 class="mixer-h">简易打碟台</h2>{% else %}<h1>简易打碟台</h1>{% endif %}
+    <p class="lead">同时加载并播放两首曲子（Deck A / Deck B），调节各自音量，再用交叉淡入淡出在两轨之间过渡。可从本机选择文件，也可从站点曲库点选。播放只在你的浏览器里进行，本地文件不会上传（除非你使用下方的录音自动优化或「上传优化」）。</p>
+  </header>
+
+  <div class="mixer-decks">
+    {% for deck in ["A", "B"] %}
+    <article class="mixer-deck" data-deck="{{ deck }}">
+      <h2>Deck {{ deck }}</h2>
+      <div class="mixer-load">
+        <label class="btn btn-sm mixer-file-btn">本地文件
+          <input type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac" data-file="{{ deck }}" hidden>
+        </label>
+        {% if library %}
+        <label class="mixer-lib">
+          <span class="muted">曲库</span>
+          <select data-lib="{{ deck }}" aria-label="从曲库为 Deck {{ deck }} 选曲">
+            <option value="">从站点曲库选择…</option>
+            {% for t in library %}
+            <option value="{{ t.url }}">{{ t.title }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        {% endif %}
+      </div>
+      <p class="mixer-title" data-title="{{ deck }}">未加载曲目</p>
+      <div class="mixer-transport">
+        <button type="button" class="btn mixer-play" data-play="{{ deck }}" disabled>播放</button>
+        <input type="range" class="mixer-seek" data-seek="{{ deck }}" min="0" max="1000" value="0" step="1" disabled aria-label="Deck {{ deck }} 进度">
+        <span class="mixer-time muted" data-time="{{ deck }}">0:00 / 0:00</span>
+      </div>
+      <label class="mixer-vol">
+        <span>音量</span>
+        <input type="range" data-vol="{{ deck }}" min="0" max="100" value="80" aria-label="Deck {{ deck }} 音量">
+        <b data-vol-lab="{{ deck }}">80%</b>
+      </label>
+    </article>
+    {% endfor %}
+  </div>
+
+  <div class="mixer-xfade">
+    <div class="mixer-xfade-labels">
+      <span>A</span>
+      <strong>交叉淡入淡出</strong>
+      <span>B</span>
+    </div>
+    <input type="range" id="xfader" min="0" max="100" value="50" aria-label="交叉淡入淡出，左为 A，右为 B">
+    <div class="mixer-xfade-hint muted" id="xfadeHint">居中 · 两轨同时可听</div>
+    <div class="mixer-master-row">
+      <button type="button" class="btn" id="playBoth">同时播放</button>
+      <button type="button" class="btn btn-ghost" id="pauseBoth">全部暂停</button>
+    </div>
+  </div>
+
+  <div class="mixer-rec" id="mixerRec">
+    <div class="mixer-rec-head">
+      <h2><span class="rec-dot" aria-hidden="true"></span>录音</h2>
+      <span class="mixer-rec-timer" id="recTimer">00:00</span>
+    </div>
+    <div class="mixer-rec-src" role="radiogroup" aria-label="录音来源">
+      <label class="mixer-rec-opt"><input type="radio" name="recSource" value="deck" checked><span><b>录打碟台</b><small>A/B 两轨 + 音量 + 交叉推子的总输出</small></span></label>
+      <label class="mixer-rec-opt"><input type="radio" name="recSource" value="system"><span><b>录电脑声音</b><small>录电脑上任何软件正在播放的声音</small></span></label>
+    </div>
+    <div class="mixer-rec-syshint" id="recSysHint" hidden>
+      <p>点「开始」后浏览器会弹出共享窗口：选<b>「整个屏幕」</b>并勾选<b>「共享系统音频」</b>（或选正在放歌的<b>标签页</b>并勾选<b>「共享标签页音频」</b>），再点「共享」。画面不会被录下，只录声音。</p>
+      <p class="muted">⚠️ 录系统声音只有 <b>Windows 电脑上的 Chrome / Edge</b> 支持；Mac 和其它浏览器只能录浏览器标签页的声音。播放软件的音量请调到 100。</p>
+    </div>
+    <p class="muted mixer-rec-note">停止后{% if user %}会自动上传到下方「上传优化」生成优质版本{% else %}可下载原始录音；登录后可自动上传优化{% endif %}。</p>
+    <div class="mixer-meter" aria-hidden="true"><i id="recMeter"></i><b id="recPeak"></b></div>
+    <div class="mixer-rec-row">
+      <button type="button" class="btn" id="recStart">●&nbsp;<span>开始录音</span></button>
+      <button type="button" class="btn btn-ghost" id="recStop" disabled>■ 停止</button>
+      <label class="mixer-rec-auto" title="曲目从头开始重复时自动停止，并裁掉重复的部分；音乐停止超过 8 秒也会自动停止"><input type="checkbox" id="recRepeat" checked> 重复自动停止</label>
+      {% if user %}
+      <label class="mixer-rec-auto"><input type="checkbox" id="recAuto" checked> 停止后自动上传优化</label>
+      {% endif %}
+    </div>
+    <p class="mixer-rec-warn" id="recWarn" role="alert" hidden></p>
+    <p class="mixer-rec-status muted" id="recStatus" role="status"></p>
+    <div class="mixer-rec-result" id="recResult" hidden></div>
+  </div>
+</section>
+{% endif %}
+
+<section class="djopt" id="djopt" data-csrf="{{ csrf }}" data-logged-in="{{ 1 if user else 0 }}" data-admin="{{ 1 if user and user.is_admin else 0 }}" data-max-mb="{{ opt_cfg.maxMB }}" data-max-hours="{{ opt_cfg.maxHours }}">
+  <header class="djopt-head">
+    <p class="eyebrow">DJ MASTERING</p>
+    <h2>上传优化</h2>
+    <p class="lead">上传别人做好的 DJ 曲目或你的混音录音，服务器自动做：去超低频杂音（25Hz 高通）→ 轻度均衡（低频更扎实、人声/高频更通透）→ 两遍 EBU R128 响度测量并统一到俱乐部响度 → 真峰值限幅防爆音。完成后可 A/B 对比试听、下载 FLAC 无损 / MP3 320k，或一键导入曲库。</p>
+    <p class="djopt-warn">⚠️ 说明：MP3 等有损文件转成 FLAC/WAV 只是换成无损格式保存，<b>已丢失的音质不会恢复</b>；优化主要改善的是响度、动态和均衡。FLAC 适合下一步再加工或存档，日常播放选 MP3 320k 即可。请只上传你有权使用的音频。</p>
+  </header>
+  {% if user %}
+  <form class="djopt-form" id="djoptForm" data-no-pjax onsubmit="return false">
+    <label class="btn mixer-file-btn">选择音频文件
+      <input type="file" id="djoptFile" accept="audio/*,.mp3,.wav,.flac,.m4a,.ogg,.aac,.webm,.opus,.aif,.aiff" hidden>
+    </label>
+    <span class="djopt-fname muted" id="djoptFname">未选择文件</span>
+    <label class="djopt-target">目标响度
+      <select id="djoptTarget">
+        <option value="-8">-8 LUFS（更响，夜店大音量）</option>
+        <option value="-9" selected>-9 LUFS（俱乐部标准，推荐）</option>
+        <option value="-10">-10 LUFS（保留更多动态）</option>
+        <option value="-14">-14 LUFS（流媒体平台标准）</option>
+      </select>
+    </label>
+    <button type="button" class="btn" id="djoptGo" disabled>开始优化</button>
+  </form>
+  <p class="muted djopt-limits">单个文件最大 {{ opt_cfg.maxMB }}MB、时长不超过 {{ opt_cfg.maxHours }} 小时；30 分钟的曲目大约需要 1–2 分钟处理。任务排队依次处理，结果保留 24 小时，导入曲库的不会被清理。</p>
+  {% else %}
+  <p class="djopt-login">上传优化需要登录。<a class="btn btn-sm" href="/login?next=/dj" data-no-pjax>登录</a> <a class="btn btn-sm btn-ghost" href="/register" data-no-pjax>注册</a></p>
+  {% endif %}
+  <div class="djopt-jobs" id="djoptJobs"></div>
+</section>

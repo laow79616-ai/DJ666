@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% from "_tg_media.html" import media_grid %}
+{% block title %}DJ666 音乐随听{% endblock %}
+{% block page_id %}home{% endblock %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">{{ hero_eyebrow }}</p>
+  <h1>{{ hero_title }}</h1>
+</section>
+
+<section class="panel panel-announce" id="announce">
+  <div class="panel-head announce-head">
+    <h2>公告</h2>
+    {% if announcements or ann_q or ann_date or ann_total %}
+    <form class="ann-filters" method="get" action="/" role="search">
+      <div class="ann-search">
+        <span class="ann-search-ico" aria-hidden="true">🔍</span>
+        <input type="search" class="ann-search-input" name="q" value="{{ ann_q or '' }}" data-ann-search placeholder="搜索公告…" aria-label="搜索公告" autocomplete="off" enterkeyhint="search">
+        <span class="ann-search-count muted" data-ann-search-count{% if not ann_q and not ann_date %} hidden{% endif %}>{% if ann_q or ann_date %}{{ announcements|length }} / {{ ann_total }}{% endif %}</span>
+      </div>
+      <div class="ann-date">
+        <label class="ann-date-wrap">
+          <span class="ann-date-ico" aria-hidden="true">📅</span>
+          <input type="date" class="ann-date-input" name="date" value="{{ ann_date or '' }}" data-ann-date-filter aria-label="按发布日期筛选（东南亚DJ时间）">
+          <button type="button" class="ann-date-clear" data-ann-date-clear{% if not ann_date %} hidden{% endif %} title="清除日期" aria-label="清除日期">×</button>
+        </label>
+      </div>
+    </form>
+    {% endif %}
+  </div>
+  {% if announcements %}
+    <div class="tg-feed" id="annFeed" data-ann-paged="1">
+      {% for ann in announcements %}
+      {% set media = ann_media(ann) %}
+      {% set st = ann_stats.get(ann.id, {"likes": 0, "comments": 0, "liked": False, "items": []}) %}
+      {% set links = ann_links(ann) %}
+      <article class="tg-post" id="ann-{{ ann.id }}" data-ann-text="{{ ann.title }} {{ ann.content }}{% for l in links %} {{ l.label }} {{ l.url }}{% endfor %}" data-ann-date="{{ ann.created_at|fmt_date }}">
+        <div class="tg-bubble{% if media %} has-media{% endif %}">
+          <div class="tg-author">dj666.pw (东南亚时报)</div>
+          {{ media_grid(media) }}
+          {% if ann.title or ann.content %}
+          <div class="tg-text">
+            {% if ann.title %}<strong class="tg-title">{{ ann.title }}</strong>{% endif %}
+            {% if ann.content %}<div class="ann-body">{{ ann.content|linkify }}</div>{% endif %}
+          </div>
+          {% endif %}
+          {% if links %}
+          <ul class="ann-links">
+            {% for l in links %}
+            <li><a class="ann-link" href="{{ l.url }}" target="_blank" rel="noopener nofollow noreferrer" title="{{ l.url }}"><span class="ann-link-ico" aria-hidden="true">🔗</span><span class="ann-link-text">{{ l.label }}</span><span class="ann-link-go" aria-hidden="true">↗</span></a></li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          <div class="tg-meta">{{ ann.created_at|fmt_time }} 东南亚DJ时间</div>
+          <div class="ann-bar" data-ann-id="{{ ann.id }}">
+            {% if user %}
+            <form class="ann-like-form" action="/announcements/{{ ann.id }}/like" method="post" data-no-pjax>
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <button type="submit" class="ann-act ann-like{% if st.liked %} is-liked{% endif %}" aria-pressed="{{ 'true' if st.liked else 'false' }}" title="{{ '取消点赞' if st.liked else '点赞' }}">
+                <svg class="ann-heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.1 4.3 2.5h2c.7-1.4 2.2-2.5 4.3-2.5 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg>
+                <span class="ann-act-label">点赞</span><b class="ann-like-count">{{ st.likes|cn_count }}</b>
+              </button>
+            </form>
+            {% else %}
+            <a class="ann-act ann-like" href="/login?next=/%23ann-{{ ann.id }}" title="登录后可点赞">
+              <svg class="ann-heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.1 4.3 2.5h2c.7-1.4 2.2-2.5 4.3-2.5 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg>
+              <span class="ann-act-label">点赞</span><b class="ann-like-count">{{ st.likes|cn_count }}</b>
+            </a>
+            {% endif %}
+            <button type="button" class="ann-act ann-cmt-toggle" aria-expanded="false" aria-controls="ann-cmts-{{ ann.id }}">
+              <svg class="ann-bubble-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg>
+              <span class="ann-act-label">评论</span><b class="ann-cmt-count">{{ st.comments|cn_count }}</b>
+            </button>
+            <span class="ann-views" title="浏览量（dj666）"><svg class="ann-eye-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M1.5 12S5.5 5 12 5s10.5 7 10.5 7-4 7-10.5 7S1.5 12 1.5 12z"/><circle cx="12" cy="12" r="3"/></svg><b>{{ (st.views or 0)|cn_count }}</b><span class="sr-only">浏览</span></span>
+          </div>
+          <div class="ann-comments" id="ann-cmts-{{ ann.id }}" hidden>
+            <ul class="ann-cmt-list">
+              {% for c in st["items"] %}
+              <li class="ann-cmt" data-cmt-id="{{ c.id }}" data-ts="{{ c.created_at|epoch }}">
+                <div class="ann-cmt-head"><b>{{ display_name(c.user) }}</b><span>{{ c.created_at|fmt_time }}</span>
+                  {% if user and (user.is_admin or user.id == c.user_id) %}
+                  <form class="ann-cmt-del" action="/announcements/comments/{{ c.id }}/delete" method="post" data-no-pjax>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                  {% endif %}
+                </div>
+                <p class="ann-cmt-text">{{ c.content }}</p>
+              </li>
+              {% endfor %}
+            </ul>
+            <p class="ann-cmt-empty muted"{% if st["items"] %} hidden{% endif %}>还没有评论{% if user %}，来说两句吧{% endif %}。</p>
+            {% if (st.real_comments or 0) > st["items"]|length %}<p class="muted ann-cmt-more">仅显示最近 {{ st["items"]|length }} 条评论。</p>{% endif %}
+            {% if user %}
+            <form class="ann-cmt-form" action="/announcements/{{ ann.id }}/comments" method="post" data-no-pjax>
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <textarea name="content" rows="2" maxlength="{{ ann_comment_max }}" placeholder="写评论…（Ctrl + Enter 发送）" required></textarea>
+              <div class="ann-cmt-actions"><span class="ann-cmt-msg" role="status"></span><button type="submit" class="btn btn-sm">发送</button></div>
+            </form>
+            {% else %}
+            <p class="ann-cmt-login"><a href="/login?next=/%23ann-{{ ann.id }}">登录</a> 或 <a href="/register">注册</a> 后可以点赞和评论</p>
+            {% endif %}
+          </div>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% if ann_total > ann_page_size or ann_page > 1 %}
+    <nav class="ann-pager" aria-label="公告分页">
+      <p class="muted">共 {{ ann_total }} 条公告，第 {{ ann_page }} / {{ ann_pages }} 页（每页 {{ ann_page_size }} 条，已发布内容全部保留）</p>
+      <div class="ann-pager-links">
+        {% if ann_page > 1 %}
+        <a class="btn btn-sm btn-ghost" href="/?{% if ann_q %}q={{ ann_q|urlencode }}&amp;{% endif %}{% if ann_date %}date={{ ann_date }}&amp;{% endif %}{% if ann_page-1 > 1 %}page={{ ann_page-1 }}{% endif %}#announce">上一页</a>
+        {% endif %}
+        {% if ann_page < ann_pages %}
+        <a class="btn btn-sm" href="/?{% if ann_q %}q={{ ann_q|urlencode }}&amp;{% endif %}{% if ann_date %}date={{ ann_date }}&amp;{% endif %}page={{ ann_page+1 }}#announce">下一页</a>
+        {% endif %}
+      </div>
+    </nav>
+    {% endif %}
+    <p class="muted ann-search-empty" data-ann-search-empty hidden>没有找到匹配的公告。</p>
+  {% elif ann_q or ann_date %}
+    <p class="muted ann-search-empty" data-ann-search-empty>没有找到匹配的公告。</p>
+  {% else %}
+    <p class="muted">暂无公告。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,1274 @@
+{% extends "base.html" %}
+{% from "_tg_media.html" import media_grid %}
+{% macro track_cat_select(track) -%}
+<form class="inline-form" action="/admin/tracks/{{ track.id }}/category" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <select name="category" class="track-cat-select" onchange="this.form.submit()" aria-label="曲目分类">
+    <option value=""{% if not track.category %} selected{% endif %}>未分类</option>
+    {% for key, label in track_categories %}
+    <option value="{{ key }}"{% if track.category == key %} selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+</form>
+{%- endmacro %}
+{% block title %}管理后台 · DJ666{% endblock %}
+{% block extra_head %}
+<style>
+.admin-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.admin-hero .btn { flex: none; white-space: nowrap; }
+.admin-tabs-inner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.admin-tabs-inner .admin-tabs-track { flex: 1; min-width: 0; }
+a.admin-dj-entry {
+  flex: none;
+  white-space: nowrap;
+}
+#adminTabs a.admin-tab-dj.is-active {
+  color: #120814;
+  background: linear-gradient(135deg, var(--pink), var(--gold));
+  border-color: transparent;
+  box-shadow: 0 0 18px rgba(255, 47, 155, 0.35);
+}
+</style>
+{% endblock %}
+{% block content %}
+<section class="hero slim admin-hero">
+  <div>
+    <p class="eyebrow">ADMIN</p>
+    <h1>管理后台</h1>
+    <p class="lead">发布公告、上传并管理曲目、管理用户，维护公屏内容。</p>
+  </div>
+  <a class="btn admin-dj-entry" href="#djmix" data-dj-tab-link>🎚 DJ 混音</a>
+</section>
+
+<section class="stats admin-stats">
+  <div class="stat"><b>{{ users|length }}</b><span>用户</span></div>
+  <div class="stat"><b>{{ tracks|length }}</b><span>曲目</span></div>
+  <div class="stat"><b>{{ ann_total if ann_total is defined else announcements|length }}</b><span>公告</span></div>
+  <div class="stat"><b>{{ chat_count }}</b><span>聊天消息</span></div>
+  <div class="stat"><b>{{ ann_comment_total }}</b><span>公告评论</span></div>
+</section>
+
+<nav class="admin-tabs" id="adminTabs" role="tablist" aria-label="后台类目">
+  <div class="admin-tabs-inner">
+  <div class="admin-tabs-track">
+    <a class="admin-tab" role="tab" href="#upload" data-tab="upload" aria-controls="upload" aria-selected="false">上传音乐</a>
+    <a class="admin-tab" role="tab" href="#tracks" data-tab="tracks" aria-controls="tracks" aria-selected="false">曲目{% if pending_tracks %}<span class="tab-badge">{{ pending_tracks|length }}</span>{% endif %}</a>
+    <a class="admin-tab" role="tab" href="#contact" data-tab="contact" aria-controls="contact" aria-selected="false">投稿联系人</a>
+    <a class="admin-tab" role="tab" href="#homecopy" data-tab="homecopy" aria-controls="homecopy" aria-selected="false">首页文案</a>
+    <a class="admin-tab" role="tab" href="#announce" data-tab="announce" aria-controls="announce" aria-selected="false">发布公告</a>
+    <a class="admin-tab" role="tab" href="#anncomments" data-tab="anncomments" aria-controls="anncomments" aria-selected="false">公告评论</a>
+    <a class="admin-tab" role="tab" href="#telegram" data-tab="telegram" aria-controls="telegram" aria-selected="false">Telegram 采集<span class="tab-badge" id="tgTabBadge"{% if not tg_new_total %} hidden{% endif %} data-tg-new-total>{{ tg_new_total }}</span></a>
+    <a class="admin-tab" role="tab" href="#tgfilter" data-tab="tgfilter" aria-controls="tgfilter" aria-selected="false">过滤内容</a>
+    <a class="admin-tab" role="tab" href="#botconfig" data-tab="botconfig" aria-controls="botconfig" aria-selected="false">机器人配置</a>
+    <a class="admin-tab" role="tab" href="#users" data-tab="users" aria-controls="users" aria-selected="false">用户</a>
+    <a class="admin-tab" role="tab" href="#chat" data-tab="chat" aria-controls="chat" aria-selected="false">公屏</a>
+    <a class="admin-tab" role="tab" href="#keywords" data-tab="keywords" aria-controls="keywords" aria-selected="false">关键词屏蔽</a>
+    <a class="admin-tab" role="tab" href="#backups" data-tab="backups" aria-controls="backups" aria-selected="false">备份记录</a>
+  </div>
+  <a class="btn btn-sm admin-dj-entry admin-tab admin-tab-dj" role="tab" href="#djmix" data-tab="djmix" aria-controls="djmix" aria-selected="false">🎚 DJ 混音</a>
+  </div>
+</nav>
+<div class="admin-panes" id="adminPanes">
+
+<section class="panel admin-pane" role="tabpanel" id="upload">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>上传音乐</h2>
+    </div>
+    <div class="admin-pane-body">
+      <form class="upload-form" id="musicUploadForm" action="/upload" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="text" name="title" id="musicUploadTitle" placeholder="曲目标题（可选，仅单个文件时生效）" maxlength="200">
+        <select name="category" id="musicUploadCategory" aria-label="曲目分类">
+          <option value="">未分类</option>
+          {% for key, label in track_categories %}
+          <option value="{{ key }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+        <input type="file" name="file" id="musicUploadFiles" accept=".mp3,.wav,.ogg,.m4a,.flac,audio/*" multiple>
+        <button type="submit" class="btn" id="musicUploadBtn">上传音乐</button>
+      </form>
+      <div class="upload-batch" id="musicUploadStatus" hidden>
+        <p class="upload-batch-summary" id="musicUploadSummary"></p>
+        <ul class="upload-batch-list" id="musicUploadList"></ul>
+        <button type="button" class="btn btn-sm" id="musicUploadReload" hidden>刷新查看曲目</button>
+      </div>
+      <p class="hint">可一次多选多个音频批量上传（mp3 / wav / ogg / m4a / flac，单个最大 50MB，每次最多 50 个），上传后立即显示在首页，无需再审核；默认用文件名作为曲目标题，上传后可在下方「曲目」里点「改名」修改。上传时可选择分类（最新DJ列表 / KTV-DJ / 备注曲），也可稍后在「曲目」列表里修改；未分类的曲目只出现在用户音乐页的「全部」里。上传时会自动查重（内容完全相同，或文件名和大小都相同），重复的文件默认跳过，可逐个或批量选择「覆盖」用新文件替换原曲目的音频（保留原名称、分类和状态）。音乐包（ZIP / RAR / 7Z）请到「个人设置」上传，普通用户上传的音乐包由这里审核后才会公开。</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="tracks">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>曲目{% if pending_tracks %} <span class="count">{{ pending_tracks|length }} 待审核</span>{% endif %}</h2>
+    </div>
+    <div class="admin-pane-body">
+      <div class="ann-log" style="margin-top:0;padding-top:0;border-top:0;">
+        <h3 class="ann-log-title">待审核</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in pending_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <a href="/uploads/{{ track.filename }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
+                  <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="text" name="title" value="{{ track.title }}" maxlength="200" required>
+                    <button type="submit" class="btn btn-sm">保存</button>
+                  </form>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td class="row-actions-cell">
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/approve" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn">通过</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/reject" method="post" onsubmit="return confirm('确定拒绝这首曲目？拒绝后不会出现在首页。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">拒绝</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                </td>
+              </tr>
+              {% else %}
+              <tr><td colspan="6" class="muted">暂无待审核曲目。</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="ann-log">
+        <h3 class="ann-log-title">已发布</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in published_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <a href="/uploads/{{ track.filename }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
+                  <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="text" name="title" value="{{ track.title }}" maxlength="200" required>
+                    <button type="submit" class="btn btn-sm">保存</button>
+                  </form>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                </td>
+              </tr>
+              {% else %}
+              <tr><td colspan="6" class="muted">暂无已发布曲目。</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {% if rejected_tracks %}
+      <div class="ann-log">
+        <h3 class="ann-log-title">已拒绝</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in rejected_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <a href="/uploads/{{ track.filename }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
+                  <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="text" name="title" value="{{ track.title }}" maxlength="200" required>
+                    <button type="submit" class="btn btn-sm">保存</button>
+                  </form>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/approve" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn">改通过</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="contact">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>投稿联系人{% if not contact.configured %} <span class="count">未设置</span>{% endif %}</h2>
+    </div>
+    <div class="admin-pane-body">
+      <p class="hint" style="margin-top:0;">这里填写的联系方式会显示在用户「个人设置」页面的「联系平台投稿联系人」区域。留空的项目不会显示。</p>
+      <form class="stack-form contact-form" action="/admin/contact" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <div class="contact-form-grid">
+          <label>显示名称（可选）
+            <input type="text" name="name" value="{{ contact.name }}" maxlength="40" placeholder="如：投稿小助手">
+          </label>
+          <label>Telegram（用户名或 t.me 链接）
+            <input type="text" name="telegram" value="{{ contact.telegram }}" maxlength="120" placeholder="@username 或 https://t.me/username" autocomplete="off">
+          </label>
+          <label>邮箱
+            <input type="email" name="email" value="{{ contact.email }}" maxlength="120" placeholder="name@example.com" autocomplete="off">
+          </label>
+          <label>备注说明（可选）
+            <input type="text" name="note" value="{{ contact.note }}" maxlength="200" placeholder="如：投稿请注明曲名和作者">
+          </label>
+        </div>
+        <div class="contact-form-actions">
+          <button type="submit" class="btn">保存联系人</button>
+          <button type="submit" name="clear" value="1" class="btn btn-ghost" formnovalidate onclick="return confirm('确定清空投稿联系人？');">清空</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="homecopy">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>首页文案</h2>
+    </div>
+    <div class="admin-pane-body">
+      <p class="hint" style="margin-top:0;">这两行显示在网站首页顶部。留空的项目会使用默认文案，首页不会出现空白标题。</p>
+      <form class="stack-form" action="/admin/homecopy" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label>顶部小标题
+          <input type="text" name="eyebrow" value="{{ hero_copy.eyebrow }}" maxlength="{{ hero_eyebrow_max }}" placeholder="{{ hero_copy_defaults.eyebrow }}" autocomplete="off">
+        </label>
+        <label>主标题
+          <input type="text" name="title" value="{{ hero_copy.title }}" maxlength="{{ hero_title_max }}" placeholder="{{ hero_copy_defaults.title }}" autocomplete="off">
+        </label>
+        <div class="contact-form-actions">
+          <button type="submit" class="btn">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="announce">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>发布公告</h2>
+    </div>
+    <div class="admin-pane-body">
+      <div class="tg-composer-wrap" id="annComposer">
+        <div class="tg-channel-head">
+          <div class="tg-avatar" aria-hidden="true">DJ</div>
+          <div class="tg-channel-info">
+            <strong>DJ666 公告频道</strong>
+            <span class="muted" id="annMode">新公告 · 发布后显示在首页</span>
+          </div>
+          <button type="button" class="link-btn" id="annCancelEdit" hidden>取消编辑</button>
+        </div>
+
+        <div class="tg-preview-area">
+          <p class="tg-preview-label">预览</p>
+          <article class="tg-post" id="annPreviewPost">
+            <div class="tg-avatar" aria-hidden="true">DJ</div>
+            <div class="tg-bubble" id="annPreview">
+              <div class="tg-author">DJ666 公告</div>
+              <div id="annPreviewMedia"></div>
+              <div class="tg-text" id="annPreviewText"><span class="muted">在下方输入内容、添加图片或视频，这里实时预览首页效果。</span></div>
+              <div class="tg-meta">刚刚</div>
+            </div>
+          </article>
+        </div>
+
+        <form id="annForm" class="tg-composer" action="/admin/announcements/create" method="post" data-create-action="/admin/announcements/create">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <input type="hidden" name="media_present" value="1">
+          <input type="hidden" name="tg_id" id="annTgId" value="">
+          <div id="annMediaInputs"></div>
+          <input type="text" name="title" id="annTitle" class="tg-title-input" placeholder="标题（可选，加粗显示）" maxlength="200">
+          <input type="hidden" name="links_present" value="1">
+          <div class="ann-link-editor" id="annLinkEditor">
+            <div class="ann-link-rows" id="annLinkRows"></div>
+            <button type="button" class="btn btn-sm btn-ghost" id="annLinkAdd">＋ 添加文案链接</button>
+            <span class="hint">每行一个「文案 + 链接」，首页公告里逐行显示，点击跳转；文案可留空（显示网址）。仅支持 http / https，最多 {{ ann_max_links }} 行。</span>
+          </div>
+          <div class="tg-tray" id="annTray" hidden></div>
+          <div class="tg-inputbar" id="annDrop">
+            <label class="tg-attach" title="添加图片/视频（最多 {{ ann_max_media }} 个）">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M16.5 6.5v10a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v10.5a1.5 1.5 0 0 1-3 0V6.5H9v9a3 3 0 0 0 6 0V5a4.5 4.5 0 0 0-9 0v11.5a6 6 0 0 0 12 0v-10h-1.5z"/></svg>
+              <input type="file" id="annFiles" multiple accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,.mov,.m4v" hidden>
+            </label>
+            <textarea name="content" id="annContent" rows="2" placeholder="写点什么…（Ctrl + Enter 发布）"></textarea>
+            <button type="submit" class="tg-send" id="annSend" title="发布">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3.4 20.4 20.85 12.9a1 1 0 0 0 0-1.8L3.4 3.6a.99.99 0 0 0-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91z"/></svg>
+            </button>
+          </div>
+          <p class="hint tg-hint">
+            <span class="tg-counter"><b id="annCount">0</b>/{{ ann_max_media }}</span>
+            图片 jpg / png / gif / webp，视频 mp4 / webm / mov，可混合，单个文件最大 {{ ann_max_mb // 1024 if ann_max_mb >= 1024 else ann_max_mb }}{{ "GB" if ann_max_mb >= 1024 else "MB" }}。可拖拽文件到输入框；缩略图可拖动或用 ◀ ▶ 调整顺序，× 移除。
+          </p>
+        </form>
+      </div>
+
+      <div class="ann-log">
+        <h3 class="ann-log-title">已发布记录（{{ ann_total }}）</h3>
+        <p class="hint">每条公告下方均可「手动编辑内容」并保存。已编辑的内容会显示在首页；日后从 Telegram 再次发布同一来源时，将优先保留这份已编辑内容。列表分页显示，不会删除任何已发布公告。</p>
+        {% if ann_total > ann_page_size %}
+        <p class="muted">第 {{ ann_page }} / {{ ann_pages }} 页，每页 {{ ann_page_size }} 条。
+          {% if ann_page > 1 %}<a href="/admin?apage={{ ann_page-1 }}#announce">上一页</a>{% endif %}
+          {% if ann_page < ann_pages %}　<a href="/admin?apage={{ ann_page+1 }}#announce">下一页</a>{% endif %}
+        </p>
+        {% endif %}
+        <div class="tg-feed admin-feed">
+          {% for ann in announcements %}
+          {% set media = ann_media(ann) %}
+          <article class="tg-post">
+            <div class="tg-avatar" aria-hidden="true">DJ</div>
+            <div class="tg-bubble{% if media %} has-media{% endif %}">
+              <div class="tg-author">DJ666 公告{% if ann.source_url %} <a class="tg-src" href="{{ ann.source_url }}" target="_blank" rel="noopener">TG 来源</a>{% endif %}</div>
+              {{ media_grid(media) }}
+              {% if ann.title or ann.content %}
+              <div class="tg-text">
+                {% if ann.title %}<strong class="tg-title">{{ ann.title }}</strong>{% endif %}
+                {% if ann.content %}<div class="ann-body">{{ ann.content|linkify }}</div>{% endif %}
+              </div>
+              {% endif %}
+              {% set links = ann_links(ann) %}
+              {% if links %}
+              <ul class="ann-links">
+                {% for l in links %}
+                <li><a class="ann-link" href="{{ l.url }}" target="_blank" rel="noopener noreferrer" title="{{ l.url }}"><span class="ann-link-ico" aria-hidden="true">🔗</span><span class="ann-link-text">{{ l.label }}</span><span class="ann-link-go" aria-hidden="true">↗</span></a></li>
+                {% endfor %}
+              </ul>
+              {% endif %}
+              <div class="tg-meta">{{ ann.created_at|fmt_time }}</div>
+              <div class="tg-actions">
+                {% set ast = ann_stats.get(ann.id) %}
+                <button type="button" class="btn btn-sm" data-ann-edit="{{ ann.id }}">编辑</button>
+                <span class="admin-ann-stats" title="前台显示数 = dj666 同步数据 + 本站真实数据；括号内为本站真实数">❤ {{ (ast.likes if ast else 0)|cn_count }}{% if ast and ast.tg_likes %} (本站 {{ ast.real_likes }}){% endif %} · 💬 {% if ast and ast.real_comments %}<a href="#anncomments">{{ ast.comments|cn_count }}</a>{% else %}{{ (ast.comments if ast else 0)|cn_count }}{% endif %}{% if ast and ast.tg_comments %} (本站 {{ ast.real_comments }}){% endif %} · 👁 {{ (ast.views if ast else 0)|cn_count }}</span>
+                <form class="inline-form" action="/admin/announcements/{{ ann.id }}/delete" method="post" onsubmit="return confirm('确定删除这条公告？');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                  <button type="submit" class="link-btn danger">删除</button>
+                </form>
+              </div>
+              <div class="ann-manual-edit">
+                <button type="button" class="btn" data-ann-edit="{{ ann.id }}">手动编辑内容</button>
+                {% if ann.content_edited %}
+                <span class="hint">已手动编辑并保存，日后自动发布同一来源时将保留此内容，不会被采集原文覆盖。</span>
+                {% else %}
+                <span class="hint">在此修改并保存这条公告；保存后首页同步，日后自动发布将优先使用已编辑内容。</span>
+                {% endif %}
+              </div>
+            </div>
+          </article>
+          {% else %}
+          <p class="muted">暂无公告。</p>
+          {% endfor %}
+        </div>
+        {% if ann_total > ann_page_size %}
+        <p class="ann-pager muted">第 {{ ann_page }} / {{ ann_pages }} 页
+          {% if ann_page > 1 %}<a href="/admin?apage={{ ann_page-1 }}#announce">上一页</a>{% endif %}
+          {% if ann_page < ann_pages %}　<a href="/admin?apage={{ ann_page+1 }}#announce">下一页</a>{% endif %}
+        </p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="anncomments">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>公告评论 <span class="muted" style="font-size:.8rem;font-weight:500">{{ ann_comment_total }} 条评论 · {{ ann_like_total }} 个赞</span></h2>
+    </div>
+    <div class="admin-pane-body">
+      {% if ann_comments %}
+      <form id="annCmtBatch" action="/admin/ann-comments/batch-delete" method="post" onsubmit="return confirm('确定删除勾选的评论？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <div class="anncmt-bar">
+          <label><input type="checkbox" id="annCmtAll"> 全选</label>
+          <button type="submit" class="btn btn-sm btn-danger">删除所选</button>
+          {% if ann_comment_total > ann_comments|length %}<span class="muted">仅显示最近 {{ ann_comments|length }} 条</span>{% endif %}
+        </div>
+      </form>
+      <div class="table-wrap">
+        <table class="anncmt-table">
+          <thead><tr><th></th><th>用户</th><th>评论内容</th><th>所属公告</th><th>时间</th><th></th></tr></thead>
+          <tbody>
+            {% for c in ann_comments %}
+            <tr>
+              <td><input type="checkbox" name="ids" value="{{ c.id }}" form="annCmtBatch" class="anncmt-pick"></td>
+              <td>{{ display_name(c.user) }}</td>
+              <td class="anncmt-text">{{ c.content }}</td>
+              <td class="anncmt-ann muted"><a href="/#ann-{{ c.announcement_id }}" target="_blank" rel="noopener">#{{ c.announcement_id }}</a> {% if c.announcement %}{{ (c.announcement.title or c.announcement.content or "（仅媒体）")|truncate(28, True, "…") }}{% endif %}</td>
+              <td class="muted">{{ c.created_at|fmt_time }}</td>
+              <td>
+                <form class="inline-form" action="/admin/ann-comments/{{ c.id }}/delete" method="post" onsubmit="return confirm('确定删除这条评论？');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                  <button type="submit" class="link-btn danger">删除</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">暂无公告评论。用户在首页公告下发表的评论会显示在这里。</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="telegram">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>Telegram 采集 <span class="count" id="tgHeadCount"{% if not tg_new_total %} hidden{% endif %}><span data-tg-new-total>{{ tg_new_total }}</span> 条待处理</span></h2>
+    </div>
+    <div class="admin-pane-body">
+      <div class="tg-collect-bar">
+        <div>
+          <p>频道：<a href="https://t.me/{{ tg_channel }}" target="_blank" rel="noopener">t.me/{{ tg_channel }}</a>（读取公开预览页 t.me/s/{{ tg_channel }}，回翻采集<strong>近一个月</strong>，自动去重）</p>
+          <p class="muted">采集时按「过滤内容」规则自动去除推广语、忽略广告帖。互动数据（公开预览中的表情点赞与浏览）会同步到已发布公告，与本站点赞评论分开显示。公开预览不含评论文字。</p>
+          <p class="muted" id="tgCollectStatus" data-running="{{ '1' if tg_running else '0' }}">上次采集：{{ tg_cfg.last_run or "尚未采集" }}{% if tg_cfg.last_result %} · {{ tg_cfg.last_result }}{% endif %}{% if tg_running %} · 正在采集（进度会自动更新，页面不再整页刷新）{% endif %}</p>
+          <p class="muted" id="tgAutoStatus">自动发布：{% if tg_cfg.auto_publish %}已开启（延迟 {{ tg_cfg.auto_publish_delay }} 分钟）{% else %}已关闭{% endif %} · 上次自动发布：{{ tg_cfg.last_auto_publish or "尚未自动发布" }} · 上次互动同步：{{ tg_cfg.last_eng_sync or "尚未同步" }}</p>
+          <p class="muted" id="tgCmtStatus">原帖评论同步：读取中…</p>
+        </div>
+        <div class="tg-collect-actions">
+        <form action="/admin/telegram/fetch" method="post" data-no-pjax onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='采集中…';">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <button type="submit" class="btn" id="tgFetchBtn"{% if tg_running %} disabled{% endif %}>立即采集</button>
+        </form>
+        {% if tg_new_total %}
+        <form id="tgPublishAllForm" action="/admin/telegram/publish-all" method="post" data-no-pjax
+              data-confirm-tpl="将把当前全部 {n} 条已过滤的待处理内容发布到公告首页。确定发布？"
+              onsubmit="return confirm(this.getAttribute('data-confirm-tpl').replace('{n}', '{{ tg_new_total }}'));">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <button type="submit" class="btn" id="tgPublishAllBtn"{% if tg_running %} disabled{% endif %}>一键发布（{{ tg_new_total }}）</button>
+        </form>
+        {% else %}
+        <button type="button" class="btn btn-ghost" id="tgPublishAllBtn" disabled title="暂无待处理内容">一键发布</button>
+        {% endif %}
+        </div>
+      </div>
+      <p class="hint" id="tgCollectLive"{% if not tg_running %} hidden{% endif %}>正在采集中。待处理总数会在上方更新；列表保持当前画面以免页面跳动。如需查看最新条目，可点击 <button type="button" class="link-btn" id="tgRefreshList">刷新列表</button>。</p>
+      <form class="tg-settings-form" action="/admin/telegram/settings" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label class="tg-check"><input type="checkbox" name="enabled" value="1" {% if tg_cfg.enabled %}checked{% endif %}> 定时自动采集</label>
+        <label>每
+          <select name="interval">
+            {% for m in tg_intervals %}<option value="{{ m }}" {% if m == tg_cfg.interval %}selected{% endif %}>{{ m }}</option>{% endfor %}
+          </select> 分钟</label>
+        <label class="tg-check"><input type="checkbox" name="auto_publish" value="1" {% if tg_cfg.auto_publish %}checked{% endif %}> 自动发布</label>
+        <label>延迟
+          <select name="auto_publish_delay">
+            {% for m in tg_auto_publish_delays %}<option value="{{ m }}" {% if m == tg_cfg.auto_publish_delay %}selected{% endif %}>{{ m }}</option>{% endfor %}
+          </select> 分钟</label>
+        <button type="submit" class="btn btn-sm">保存设置</button>
+        <span class="muted">新内容进入待处理后，满延迟时间（默认 1 小时）且仍在近一个月窗口内会自动发布到公告（每轮最多 50 条，忽略规则仍生效）。每次采集同步公开预览的点赞与浏览；也可使用「一键发布」。</span>
+      </form>
+      <p class="tgf-link">🧹 过滤内容：去除推广语 {{ tgf_strip|length }} 条 · 整条忽略 {{ tgf_block|length }} 条 · 赌博广告 {{ tgf_gamble|length }} 条{% if tgf_cfg.gamble %}（已启用）{% else %}（已关闭）{% endif %} · 图片 {{ tgf_images|length }} 张 — 采集时自动过滤，<a href="#tgfilter">管理「过滤内容」↓</a></p>
+
+      <h3 class="ann-log-title" id="tgPendingTitle">待处理（<span data-tg-new-total>{{ tg_new_total }}</span>）</h3>
+      {% if tg_new_total > tg_new|length %}
+      <p class="hint" id="tgPendingHint">列表仅显示最近 {{ tg_new|length }} 条；「一键发布」会发布全部 <span data-tg-new-total>{{ tg_new_total }}</span> 条待处理内容。</p>
+      {% endif %}
+      {% if tg_new %}
+      <form class="inline-form" action="/admin/telegram/clear" method="post" onsubmit="return confirm('忽略全部待处理内容并删除其已下载媒体？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button type="submit" class="link-btn danger">全部忽略</button>
+      </form>
+      <form id="tgBatch" class="tgf-batch-bar" action="/admin/telegram/batch" method="post" data-batch-scope="new">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label class="tg-check"><input type="checkbox" data-select-all="new"> 全选</label>
+        <span class="muted" data-sel-count="new">已选 0 条</span>
+        <button type="submit" name="action" value="ignore" class="btn btn-sm btn-danger" data-need-sel data-confirm="忽略所选 {n} 条并删除其已下载媒体？">批量忽略</button>
+        <button type="submit" name="action" value="learn" class="btn btn-sm btn-ghost" data-need-sel data-confirm="把所选 {n} 条的图片（含视频封面）加入图片过滤规则，并忽略这些条目？" title="以后采集到相同或相似的图片会自动移除">图片加入过滤并忽略</button>
+        <label class="tg-check small"><input type="checkbox" name="with_source" value="1"> 附来源</label>
+        <button type="submit" name="action" value="publish" class="btn btn-sm btn-ghost" data-need-sel data-confirm="把所选 {n} 条发布为公告（首页可见）？">批量发布</button>
+      </form>
+      {% endif %}
+      <div class="tg-feed admin-feed">
+        {% for item in tg_new %}
+        {% set media = ann_media(item) %}
+        <article class="tg-post">
+          <div class="tg-avatar tg-avatar-tg" aria-hidden="true">TG</div>
+          <div class="tg-bubble{% if media %} has-media{% endif %}">
+            <div class="tg-author"><label class="tgf-pick" title="选择"><input type="checkbox" name="ids" value="{{ item.id }}" form="tgBatch" data-sel="new"></label>@{{ item.channel }} · <a href="{{ item.url }}" target="_blank" rel="noopener">#{{ item.post_id }}</a></div>
+            {{ media_grid(media, "none") }}
+            {% if item.content_edited %}<span class="tg-edited-badge">已编辑</span>{% endif %}
+            {% set elinks = ann_links_of(item) %}
+            {% if item.edit_title or item.text %}<div class="tg-text">{% if item.edit_title %}<strong class="tg-title">{{ item.edit_title }}</strong>{% endif %}{% if item.text %}<div class="ann-body tg-clamp">{{ item.text|linkify }}</div>{% endif %}</div>{% endif %}
+            {% if elinks %}
+            <ul class="ann-links">
+              {% for l in elinks %}<li><a class="ann-link" href="{{ l.url }}" target="_blank" rel="noopener nofollow noreferrer" title="{{ l.url }}"><span class="ann-link-ico" aria-hidden="true">🔗</span><span class="ann-link-text">{{ l.label }}</span><span class="ann-link-go" aria-hidden="true">↗</span></a></li>{% endfor %}
+            </ul>
+            {% endif %}
+            {% if item.note %}<p class="tg-note">⚠ {{ item.note }}</p>{% endif %}
+            {% if item.filter_info %}<p class="tgf-note">🧹 {{ item.filter_info }}</p>{% endif %}
+            <div class="tg-meta">频道发布 {{ item.posted_at|fmt_time }} · 采集 {{ item.collected_at|fmt_time }}</div>
+            <div class="tg-actions">
+              <form class="inline-form" action="/admin/telegram/{{ item.id }}/publish" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                <label class="tg-check small"><input type="checkbox" name="with_source" value="1"> 附来源链接</label>
+                <button type="submit" class="btn btn-sm">一键发布</button>
+              </form>
+              <button type="button" class="btn btn-sm btn-ghost" data-tg-edit="{{ item.id }}">编辑后发布</button>
+              <form class="inline-form" action="/admin/telegram/{{ item.id }}/ignore" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                <button type="submit" class="link-btn danger">忽略</button>
+              </form>
+            </div>
+            <div class="ann-manual-edit">
+              <button type="button" class="btn btn-sm" data-tg-text-edit="{{ item.id }}" aria-expanded="false" aria-controls="tg-edit-{{ item.id }}">手动编辑内容</button>
+              {% if item.content_edited %}
+              <span class="hint">已保存编辑。自动发布或一键发布将使用此文字，不会被再次采集覆盖。</span>
+              {% else %}
+              <span class="hint">修改并保存后，自动发布或一键发布将优先使用编辑后的文字。</span>
+              {% endif %}
+            </div>
+            <form class="tg-pending-edit" id="tg-edit-{{ item.id }}" action="/admin/telegram/{{ item.id }}/edit" method="post" hidden>
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <input type="hidden" name="links_present" value="1">
+              <label class="tg-edit-label" for="tg-edit-title-{{ item.id }}">标题 <span class="hint">（可选，首页加粗显示在最上方）</span></label>
+              <input type="text" id="tg-edit-title-{{ item.id }}" name="title" maxlength="200" value="{{ item.edit_title or '' }}" placeholder="标题（可留空）">
+              <label class="tg-edit-label" for="tg-edit-text-{{ item.id }}">正文</label>
+              <textarea id="tg-edit-text-{{ item.id }}" name="text" rows="8">{{ item.text }}</textarea>
+              <div class="tg-edit-label">文案链接 <span class="hint">（可多条；只支持 http:// 或 https://，首页显示在正文下方，点击新窗口打开）</span></div>
+              <div class="tg-edit-links" data-tg-links>
+                {% for l in elinks %}
+                <div class="tg-edit-link-row"><input type="text" name="link_text" maxlength="80" placeholder="文案（如：点击查看详情）" value="{{ l.text }}"><input type="text" name="link_url" maxlength="500" placeholder="链接 https://…" inputmode="url" autocomplete="off" value="{{ l.url }}"><button type="button" class="link-btn danger" data-tg-link-del>删除</button></div>
+                {% endfor %}
+              </div>
+              <button type="button" class="btn btn-sm btn-ghost" data-tg-link-add>＋ 添加文案链接</button>
+              <div class="tg-pending-edit-actions">
+                <button type="submit" class="btn btn-sm">保存编辑</button>
+                <button type="button" class="btn btn-sm btn-ghost" data-tg-text-edit-cancel="{{ item.id }}">取消</button>
+              </div>
+            </form>
+          </div>
+        </article>
+        {% else %}
+        <p class="muted">暂无待处理内容，点「立即采集」获取频道最新帖子。</p>
+        {% endfor %}
+      </div>
+      {% if tg_done %}
+      <h3 class="ann-log-title">最近已发布</h3>
+      <ul class="tg-done-list">
+        {% for item in tg_done %}
+        <li><a href="{{ item.url }}" target="_blank" rel="noopener">#{{ item.post_id }}</a> <span class="muted">{{ (item.text or "（仅媒体）")[:60] }}</span></li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if tg_ignored %}
+      <details class="tgf-ignored">
+        <summary>已忽略 / 已过滤（最近 {{ tg_ignored|length }} 条，可勾选恢复）</summary>
+        <form id="tgBatchIgn" class="tgf-batch-bar" action="/admin/telegram/batch" method="post" data-batch-scope="ign">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <label class="tg-check"><input type="checkbox" data-select-all="ign"> 全选</label>
+          <span class="muted" data-sel-count="ign">已选 0 条</span>
+          <button type="submit" name="action" value="restore" class="btn btn-sm btn-ghost" data-need-sel>恢复到待处理</button>
+          <span class="muted">恢复后只有文字（媒体在忽略时已删除）。</span>
+        </form>
+        <ul class="tgf-ign-list">
+          {% for item in tg_ignored %}
+          <li>
+            <label class="tg-check"><input type="checkbox" name="ids" value="{{ item.id }}" form="tgBatchIgn" data-sel="ign"> <a href="{{ item.url }}" target="_blank" rel="noopener">#{{ item.post_id }}</a></label>
+            <span class="tgf-ign-text">{{ ((item.raw_text or item.text or "（仅媒体）")|replace("\n", " "))[:80] }}</span>
+            <span class="tgf-reason">{{ item.filter_info or "手动忽略" }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="tgfilter">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>过滤内容 <span class="count">TG采集 · 文字 {{ tgf_strip|length + tgf_block|length }} 条 · 赌博广告 {{ tgf_gamble|length }} 条 · 图片 {{ tgf_images|length }} 张</span></h2>
+    </div>
+    <div class="admin-pane-body">
+      <p class="hint">用于「Telegram 采集」：每次采集（手动或定时）都会先按这里的规则过滤；规则增删后会立即重新扫描「待处理」里尚未发布的条目。已发布到首页的公告不受影响。文字匹配不区分大小写，并忽略空格、表情、箭头和标点（例如「➡️」「➞」视为相同）。赌博广告采用「关键词组合打分」：弱词（如「点数」「充值」）单独出现不会忽略帖子，以免误伤曲名或新闻报道；命中「返水」「首充」「点击上桌」等广告号召语才会整条忽略。</p>
+
+      <div class="tgf-grid">
+        <form class="tgf-card" action="/admin/telegram/filters/text" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <h3>添加文字规则 <span class="muted">（每行一条，可直接粘贴多行）</span></h3>
+          <textarea name="patterns" rows="5" placeholder="例如：&#10;关注大事件频道➡️ @Svip 投稿：@tx188&#10;投稿：@&#10;#付费广告" required></textarea>
+          <div class="tgf-modes">
+            <label class="tg-check"><input type="radio" name="mode" value="strip" checked> 去除推广语：删掉包含该文字的那一行/片段，保留其余新闻内容</label>
+            <label class="tg-check"><input type="radio" name="mode" value="block"> 整条忽略：包含该文字的帖子视为广告，整条自动忽略（连同图片视频）</label>
+            <label class="tg-check"><input type="radio" name="mode" value="gamble"> 赌博广告：加入组合打分词库（单个弱词不会整条忽略）</label>
+          </div>
+          <button type="submit" class="btn btn-sm">批量添加</button>
+        </form>
+
+        <form class="tgf-card" action="/admin/telegram/filters/images" method="post" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <h3>添加图片规则 <span class="muted">（上传推广图/水印图样本，可多选）</span></h3>
+          {% if not tgf_pil %}<p class="tgf-note">⚠ 服务器图片组件未安装，暂不可用。</p>{% endif %}
+          <input type="file" name="files" multiple accept="image/jpeg,image/png,image/gif,image/webp" required>
+          <input type="text" name="label" maxlength="100" placeholder="备注（可选，如：BTC.cc 广告图）">
+          <p class="hint">采集到的图片（视频按封面）与样本「看起来相同」即自动移除，可识别缩放、压缩、轻微改色后的同一张图；无法识别只在角落加了水印的不同照片。也可以在待处理里勾选条目，点「图片加入过滤并忽略」。</p>
+          <button type="submit" class="btn btn-sm">上传样本</button>
+        </form>
+      </div>
+
+      <form class="tgf-settings" action="/admin/telegram/filters/settings" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label class="tg-check"><input type="checkbox" name="autolearn" value="1" {% if tgf_cfg.autolearn %}checked{% endif %}> 整条忽略广告时，自动把它的图片加入图片规则</label>
+        <label class="tg-check"><input type="checkbox" name="gamble" value="1" {% if tgf_cfg.gamble %}checked{% endif %}> 启用「赌博广告」过滤（组合判断，关闭后不再跳过这类帖子）</label>
+        <label>图片相似度
+          <select name="level">
+            {% for key, name in tgf_levels.items() %}<option value="{{ key }}" {% if key == tgf_cfg.level %}selected{% endif %}>{{ name }}</option>{% endfor %}
+          </select></label>
+        <button type="submit" class="btn btn-sm">保存设置</button>
+      </form>
+      <form class="tgf-settings" action="/admin/telegram/filters/rescan" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button type="submit" class="btn btn-sm btn-ghost">立即重新扫描待处理</button>
+        <span class="muted">按当前规则检查所有未发布的采集条目。</span>
+      </form>
+
+      <form id="tgfDel" action="/admin/telegram/filters/delete" method="post" data-batch-scope="rule">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <div class="tgf-batch-bar">
+          <label class="tg-check"><input type="checkbox" data-select-all="rule"> 全选规则</label>
+          <span class="muted" data-sel-count="rule">已选 0 条</span>
+          <button type="submit" class="btn btn-sm btn-danger" data-need-sel data-confirm="删除所选 {n} 条过滤规则？">删除所选</button>
+        </div>
+
+        {% for title, rows, desc in [("去除推广语", tgf_strip, "删除匹配的行/片段，其余内容保留；整条只剩推广语时自动忽略"), ("整条忽略", tgf_block, "命中即整条忽略（广告）")] %}
+        <h3 class="ann-log-title">{{ title }}（{{ rows|length }}） <span class="muted tgf-desc">{{ desc }}</span></h3>
+        {% if rows %}
+        <ul class="keyword-list tgf-rule-list">
+          {% for r in rows %}
+          <li>
+            <label class="tg-check"><input type="checkbox" name="ids" value="{{ r.id }}" data-sel="rule"> <span class="keyword-word">{{ r.pattern }}</span></label>
+            <span class="muted tgf-hits" title="命中次数">{% if r.source == "seed" %}默认 · {% endif %}{{ r.hits or 0 }} 次</span>
+            <button type="submit" name="ids" value="{{ r.id }}" class="link-btn danger" formnovalidate data-single onclick="return confirm('删除这条规则？');">删除</button>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="muted">暂无。</p>
+        {% endif %}
+        {% endfor %}
+
+        <h3 class="ann-log-title">赌博广告（{{ tgf_gamble|length }}）{% if tgf_cfg.gamble %}<span class="tgf-on">已启用</span>{% else %}<span class="tgf-off">已关闭</span>{% endif %} <span class="muted tgf-desc">组合打分，弱词单独不生效；新闻/曝光/避雷类帖子不会因「百家乐」「博彩」等词被忽略。可在上方开关关闭整组。</span></h3>
+        {% if tgf_gamble %}
+        <ul class="keyword-list tgf-rule-list">
+          {% for r in tgf_gamble %}
+          <li>
+            <label class="tg-check"><input type="checkbox" name="ids" value="{{ r.id }}" data-sel="rule"> <span class="keyword-word">{{ r.pattern }}</span></label>
+            <span class="tgf-w tgf-w-{{ 4 if (r.weight or 2) >= 4 else (3 if (r.weight or 2) == 3 else 1) }}">{% if (r.weight or 2) >= 4 %}强{% elif (r.weight or 2) == 3 %}中{% else %}弱{% endif %}</span>
+            <span class="muted tgf-hits" title="命中次数">{% if r.source == "seed" %}默认 · {% endif %}{{ r.hits or 0 }} 次</span>
+            <button type="submit" name="ids" value="{{ r.id }}" class="link-btn danger" formnovalidate data-single onclick="return confirm('删除这条规则？');">删除</button>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="muted">暂无赌博广告规则。可在上方选择「赌博广告」批量添加关键词。</p>
+        {% endif %}
+
+        <h3 class="ann-log-title">图片规则（{{ tgf_images|length }}）</h3>
+        {% if tgf_images %}
+        <div class="tgf-img-grid">
+          {% for r in tgf_images %}
+          <div class="tgf-img">
+            <label>
+              <input type="checkbox" name="ids" value="{{ r.id }}" data-sel="rule">
+              {% if r.sample %}<img src="/admin/telegram/filters/img/{{ r.sample }}" loading="lazy" alt="">{% else %}<span class="tgf-noimg">无预览</span>{% endif %}
+            </label>
+            <div class="tgf-img-meta">
+              <span title="{{ r.label }}">{{ r.label or "（无备注）" }}</span>
+              <span class="muted">{{ {"auto": "自动", "item": "来自采集", "manual": "上传"}.get(r.source, r.source) }} · {{ r.hits or 0 }} 次</span>
+              <button type="submit" name="ids" value="{{ r.id }}" class="link-btn danger" data-single onclick="return confirm('删除这条图片规则？');">删除</button>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="muted">暂无图片规则。上传样本，或在待处理里勾选广告条目点「图片加入过滤并忽略」。</p>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="botconfig">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>机器人配置 <span class="count">{% if not bot.configured %}未设置{% elif bot.last_test and bot.last_ok %}已连接{% if bot.username %} @{{ bot.username }}{% endif %}{% elif bot.last_test %}连接失败{% else %}已保存 · 未测试{% endif %}</span></h2>
+    </div>
+    <div class="admin-pane-body">
+      <nav class="bot-subnav" aria-label="机器人配置分区"><a href="#botconfig">Token</a><a href="#botads">广告图片</a><a href="#botbuttons">内联按钮</a></nav>
+      <p class="hint" style="margin-top:0;">配置 Telegram 机器人（Bot Token 从 @BotFather 获取），之后可用于推送公告和通知。Token 只保存在服务器上，页面只显示末尾 4 位。</p>
+      <div class="bot-status">
+        <div><span class="bot-k">当前 Token</span>{% if bot.configured %}<code class="bot-mask">{{ bot.masked }}</code>{% if bot.saved_at %}<span class="muted"> · 保存于 {{ bot.saved_at }}</span>{% endif %}{% else %}<span class="muted">未设置</span>{% endif %}</div>
+        {% if bot.configured %}
+        <div><span class="bot-k">连接状态</span>
+          {% if not bot.last_test %}<span class="muted">尚未测试</span>
+          {% elif bot.last_ok %}<span class="bot-ok">✓ 连接成功</span>{% if bot.username %} · <a href="https://t.me/{{ bot.username }}" target="_blank" rel="noopener noreferrer">@{{ bot.username }}</a>{% endif %}{% if bot.name %} <span class="muted">（{{ bot.name }}）</span>{% endif %}<span class="muted"> · {{ bot.last_test }}</span>
+          {% else %}<span class="bot-bad">✗ 连接失败</span>{% if bot.last_error %}：{{ bot.last_error }}{% endif %}<span class="muted"> · {{ bot.last_test }}</span>{% endif %}
+        </div>
+        <div><span class="bot-k">/start 回复</span>
+          {% if bot.webhook == "1" %}<span class="bot-ok">✓ 已开启</span><span class="muted"> · 用户发送 /start 会收到下方的广告图片和内联按钮</span>
+          {% elif bot.webhook == "0" %}<span class="bot-bad">✗ Webhook 设置失败</span>{% if bot.webhook_error %}：{{ bot.webhook_error }}{% endif %}<span class="muted"> · 点「测试连接」重试</span>
+          {% else %}<span class="muted">未开启 · 点「测试连接」开启</span>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+      <form class="stack-form bot-form" action="/admin/bot/save" method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label>{% if bot.configured %}更换 Bot Token（留空则保持不变）{% else %}Telegram Bot Token{% endif %}
+          <input type="password" name="token" value="" maxlength="100" placeholder="{% if bot.configured %}{{ bot.masked }}{% else %}123456789:AA…{% endif %}" autocomplete="new-password" spellcheck="false" required>
+        </label>
+        <div class="contact-form-actions">
+          <button type="submit" class="btn">保存</button>
+          <button type="submit" class="btn btn-ghost" name="then_test" value="1">保存并测试</button>
+        </div>
+      </form>
+      {% if bot.configured %}
+      <div class="contact-form-actions bot-actions">
+        <form class="inline-form" action="/admin/bot/test" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <button type="submit" class="btn">测试连接</button>
+        </form>
+        <form class="inline-form" action="/admin/bot/clear" method="post" onsubmit="return confirm('确定删除已保存的 Bot Token？');">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <button type="submit" class="btn btn-ghost">删除 Token</button>
+        </form>
+      </div>
+      {% endif %}
+      <div class="bot-sub" id="botads">
+        <h3 class="bot-sub-title">广告图片 <span class="count" id="botAdCount">{{ bot_ads|length }} 张</span></h3>
+        <p class="hint">上传推送时使用的广告图片（jpg / png / gif / webp，单张最大 10MB，可多选，最多 50 张）。先选择图片，再点「上传并保存」才会保存。图片只保存在服务器上，仅管理员可预览；用户给机器人发送 /start 时，会收到第 1 张图片和下方的内联按钮，其余图片（最多再 9 张）随后以相册发送。</p>
+        <form class="bot-ad-upload" id="botAdForm" action="/admin/bot/ads/upload" method="post" enctype="multipart/form-data" data-max-bytes="{{ 10 * 1024 * 1024 }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <label class="bot-ad-pick" for="botAdFiles">
+            <span class="bot-ad-pick-icon" aria-hidden="true">🖼</span>
+            <span class="bot-ad-pick-text"><b>① 选择图片</b><small id="botAdPickInfo">点这里选择一张或多张图片</small></span>
+            <input type="file" name="files" id="botAdFiles" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" multiple>
+          </label>
+          <div class="bot-ad-pending" id="botAdPending" hidden></div>
+          <div class="bot-ad-actions">
+            <button type="submit" class="btn bot-ad-submit" id="botAdSubmit">② 上传并保存</button>
+            <button type="button" class="btn btn-ghost" id="botAdClear" hidden>清除选择</button>
+            <span class="bot-ad-status" id="botAdStatus" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+        <h4 class="bot-ad-saved-title">已保存的图片 <span class="count" id="botAdCount2">{{ bot_ads|length }} 张</span></h4>
+        <ul class="bot-ad-grid" id="botAdGrid"{% if not bot_ads %} hidden{% endif %}>
+          {% for ad in bot_ads %}
+          <li class="bot-ad" data-file="{{ ad.file }}">
+            <a class="bot-ad-thumb" href="{{ ad.url }}" target="_blank" rel="noopener" title="查看原图"><img src="{{ ad.url }}" alt="{{ ad.name }}" loading="lazy"></a>
+            <div class="bot-ad-meta">
+              <span class="bot-ad-name" title="{{ ad.name }}">{{ ad.name }}</span>
+              <span class="muted">{% if ad.w %}{{ ad.w }}×{{ ad.h }} · {% endif %}{% if ad.size >= 1048576 %}{{ "%.1f"|format(ad.size / 1048576) }} MB{% else %}{{ [1, (ad.size / 1024)|round(0)|int]|max }} KB{% endif %}{% if ad.uploaded %} · {{ ad.uploaded }}{% endif %}</span>
+            </div>
+            <form class="inline-form" action="/admin/bot/ads/{{ ad.file }}/delete" method="post" onsubmit="return confirm('确定删除这张广告图片？');">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <button type="submit" class="btn btn-sm btn-ghost">删除</button>
+            </form>
+          </li>
+          {% endfor %}
+        </ul>
+        <p class="muted bot-empty" id="botAdEmpty"{% if bot_ads %} hidden{% endif %}>还没有保存的广告图片。选择图片后点「上传并保存」。</p>
+      </div>
+
+      <div class="bot-sub" id="botbuttons">
+        <h3 class="bot-sub-title">内联按钮 <span class="count">{{ bot_buttons|length }} 个</span></h3>
+        <p class="hint">消息下方的 Inline Keyboard 按钮：填写按钮文字和跳转链接（只支持 http:// 或 https://，如 https://t.me/xxx）。默认每个按钮单独一行，选择「接上一行」可与上一个按钮并排（每行最多 8 个）。改完点「保存按钮」生效。</p>
+        <form class="bot-btn-form" id="botBtnForm" action="/admin/bot/buttons" method="post" data-max="{{ bot_btn_max }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <div class="bot-btn-rows" id="botBtnRows">
+            {% for b in bot_buttons %}
+            <div class="bot-btn-row">
+              <input type="text" name="btn_text" value="{{ b.text }}" maxlength="64" placeholder="按钮文字" aria-label="按钮文字">
+              <input type="url" name="btn_url" value="{{ b.url }}" maxlength="500" placeholder="https://t.me/…" aria-label="跳转链接" inputmode="url" spellcheck="false">
+              <select name="btn_row" aria-label="位置"><option value="new"{% if not b.same_row %} selected{% endif %}>新一行</option><option value="same"{% if b.same_row %} selected{% endif %}>接上一行</option></select>
+              <div class="bot-btn-ops">
+                <button type="button" class="link-btn" data-btn-up title="上移">↑</button>
+                <button type="button" class="link-btn" data-btn-down title="下移">↓</button>
+                <button type="button" class="link-btn danger" data-btn-del title="删除">删除</button>
+              </div>
+            </div>
+            {% endfor %}
+            {% if not bot_buttons %}
+            <div class="bot-btn-row">
+              <input type="text" name="btn_text" value="" maxlength="64" placeholder="按钮文字" aria-label="按钮文字">
+              <input type="url" name="btn_url" value="" maxlength="500" placeholder="https://t.me/…" aria-label="跳转链接" inputmode="url" spellcheck="false">
+              <select name="btn_row" aria-label="位置"><option value="new" selected>新一行</option><option value="same">接上一行</option></select>
+              <div class="bot-btn-ops">
+                <button type="button" class="link-btn" data-btn-up title="上移">↑</button>
+                <button type="button" class="link-btn" data-btn-down title="下移">↓</button>
+                <button type="button" class="link-btn danger" data-btn-del title="删除">删除</button>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          <div class="contact-form-actions">
+            <button type="button" class="btn btn-sm btn-ghost" id="botBtnAdd">＋ 添加按钮</button>
+            <button type="submit" class="btn">保存按钮</button>
+          </div>
+        </form>
+        <div class="bot-kb-preview">
+          <span class="bot-k">预览</span>
+          <div class="bot-kb" id="botKbPreview" aria-live="polite"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="users">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>用户</h2>
+    </div>
+    <div class="admin-pane-body">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>用户名</th><th>邮箱</th><th>角色</th><th>注册时间</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for u in users %}
+            <tr>
+              <td>{{ display_name(u) }}</td>
+              <td>{{ u.email }}</td>
+              <td>{{ "管理员" if u.is_admin else "用户" }}</td>
+              <td>{{ u.created_at|fmt_time }}</td>
+              <td>
+                {% if u.id != user.id %}
+                <form class="inline-form" action="/admin/users/{{ u.id }}/delete" method="post" onsubmit="return confirm('将同时删除该用户的曲目和聊天记录，确定吗？');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                  <button type="submit" class="link-btn danger">删除</button>
+                </form>
+                {% else %}
+                <span class="muted">当前账号</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="chat">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>公屏</h2>
+    </div>
+    <div class="admin-pane-body">
+      <p>当前共 {{ chat_count }} 条消息。</p>
+      <div class="table-wrap chat-admin-list">
+        <table>
+          <thead>
+            <tr><th>用户</th><th>消息内容</th><th>时间</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for msg in chat_messages %}
+            <tr>
+              <td>{{ display_name(msg.user) }}</td>
+              <td class="chat-admin-content">
+                {% set cm = chat_media(msg) %}
+                {% if cm %}<div class="chat-media admin-chat-media">{{ media_grid(cm) }}</div><span class="muted">{{ cm|length }} 个媒体</span>{% endif %}
+                {% if msg.content %}<div>{{ msg.content }}</div>{% endif %}
+              </td>
+              <td class="muted">{{ msg.created_at|fmt_time }}</td>
+              <td>
+                <form class="inline-form" action="/admin/chat/{{ msg.id }}/delete" method="post" onsubmit="return confirm('确定删除这条消息？');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                  <button type="submit" class="link-btn danger">删除</button>
+                </form>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="muted">暂无聊天消息。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <form class="chat-clear-form" action="/admin/chat/clear" method="post" onsubmit="return confirm('确定清空全部公屏消息？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button type="submit" class="btn btn-danger">清空聊天</button>
+      </form>
+
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="keywords">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>关键词屏蔽 <span class="count">{{ block_keywords|length }} 个词{% if block_logs %} · {{ block_logs|length }} 条拦截{% endif %}</span></h2>
+    </div>
+    <div class="admin-pane-body">
+      <div class="keyword-block">
+                <p class="hint">消息内容包含以下任一关键词时将被拦截，不会出现在公屏。匹配不区分大小写。</p>
+        <form class="keyword-add-form" action="/admin/chat/keywords/add" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <input type="text" name="word" maxlength="80" placeholder="输入屏蔽关键词" required>
+          <button type="submit" class="btn">添加</button>
+        </form>
+        {% if block_keywords %}
+        <ul class="keyword-list">
+          {% for kw in block_keywords %}
+          <li>
+            <span class="keyword-word">{{ kw.word }}</span>
+            <form class="inline-form" action="/admin/chat/keywords/{{ kw.id }}/delete" method="post" onsubmit="return confirm('确定删除这个屏蔽词？');">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <button type="submit" class="link-btn danger">删除</button>
+            </form>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="muted">暂无屏蔽关键词。</p>
+        {% endif %}
+      </div>
+
+      <div class="ann-log block-log">
+        <h3 class="ann-log-title">拦截记录</h3>
+        <p class="hint">仅管理员可见，按时间最新在前。</p>
+        <div class="table-wrap chat-admin-list">
+          <table>
+            <thead>
+              <tr><th>用户</th><th>消息内容</th><th>关键词</th><th>时间</th></tr>
+            </thead>
+            <tbody>
+              {% for log in block_logs %}
+              <tr>
+                <td>{{ display_name(log.user) }}</td>
+                <td class="chat-admin-content">{{ log.content }}</td>
+                <td>{{ log.keyword }}</td>
+                <td class="muted">{{ log.created_at|fmt_time }}</td>
+              </tr>
+              {% else %}
+              <tr><td colspan="4" class="muted">暂无拦截记录。</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <form class="chat-clear-form" action="/admin/chat/block-logs/clear" method="post" onsubmit="return confirm('确定清空全部拦截记录？');">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <button type="submit" class="btn btn-danger">清空拦截记录</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane" role="tabpanel" id="backups">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>备份记录</h2>
+    </div>
+    <div class="admin-pane-body bak-panel" id="bakPanel" data-csrf="{{ csrf }}">
+      <p class="hint">系统每 10 分钟自动备份数据库、配置、代码和资料。上传的音频用硬链接增量快照（未改动的文件不占新空间），临时优化目录不备份。本页只查看记录，不会还原。</p>
+      <p class="bak-msg" id="bakMsg" role="status" hidden></p>
+      <div class="bak-stats" id="bakStats">
+        <div class="bak-stat"><span class="lbl">最近一次</span><span class="val" id="bakLast">读取中…</span></div>
+        <div class="bak-stat"><span class="lbl">下次计划</span><span class="val" id="bakNext">—</span></div>
+        <div class="bak-stat"><span class="lbl">磁盘剩余</span><span class="val" id="bakDisk">—</span></div>
+        <div class="bak-stat"><span class="lbl">备份目录</span><span class="val bak-path" id="bakPath">/opt/dj666_backups/auto</span></div>
+      </div>
+      <div class="bak-actions">
+        <button type="button" class="btn" id="bakRun">立即备份</button>
+        <span class="muted" id="bakRunHint">备份在后台独立运行，不会中断网站。</span>
+      </div>
+      <div class="table-wrap">
+        <table class="bak-table">
+          <thead>
+            <tr><th>时间</th><th>结果</th><th>大小</th><th>用时</th><th>说明</th></tr>
+          </thead>
+          <tbody id="bakRows"><tr><td colspan="5" class="muted">读取中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel admin-pane admin-pane-djmix" role="tabpanel" id="djmix">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-body">
+      <link rel="stylesheet" href="/static/mixer.css?v=tgab1">
+      {% set mixer_embedded = True %}
+      {% set hide_mixer = True %}
+      {% include "_mixer.html" %}
+      {% if user and user.is_admin %}
+      <section class="tga" id="tgaPanel" data-csrf="{{ csrf }}" aria-labelledby="tgaTitle">
+        <header class="tga-head">
+          <div>
+            <p class="eyebrow">TELEGRAM IMPORT</p>
+            <h2 id="tgaTitle">Telegram 音乐导入</h2>
+          </div>
+          <span class="tga-badge" id="tgaBadge">检查中…</span>
+        </header>
+        <p class="tga-note">用一个 Telegram 账号读取频道里的音频，服务器下载原文件后自动进入下方「上传优化」（FLAC + MP3、A/B 对比、导入曲库）。<b>仅处理自有或已授权频道的音频。</b></p>
+        <p class="tga-msg" id="tgaMsg" role="status" hidden></p>
+
+        <details class="tga-box" id="tgaCfgBox">
+          <summary>接口配置 <span class="tga-cfg-state" id="tgaCfgState">未配置 api_id / api_hash</span></summary>
+          <form class="tga-form" id="tgaCfgForm" autocomplete="off" onsubmit="return false">
+            <p class="hint">在 <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer">my.telegram.org → API development tools</a> 创建应用后获得。保存后不会再显示具体值。</p>
+            <label>api_id <input type="text" name="api_id" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="纯数字"></label>
+            <label>api_hash <input type="password" name="api_hash" autocomplete="new-password" spellcheck="false" placeholder="32 位字符"></label>
+            <label>每日下载上限 <input type="number" name="daily_cap" min="1" max="200" placeholder="30"></label>
+            <div class="tga-actions">
+              <button type="button" class="btn btn-sm" data-tga-cfg-save>保存配置</button>
+              <button type="button" class="btn btn-sm btn-ghost danger" data-tga-cfg-clear>清除配置（同时退出登录）</button>
+            </div>
+          </form>
+        </details>
+
+        <div class="tga-box" id="tgaLogin" hidden>
+          <h3>登录 Telegram 账号 <small class="muted">建议使用专门的小号</small></h3>
+          <form class="tga-form tga-step" data-step="phone" autocomplete="off" onsubmit="return false">
+            <label>手机号 <input type="tel" name="phone" autocomplete="off" placeholder="+60123456789（带国家区号）"></label>
+            <button type="button" class="btn btn-sm" data-tga-send>发送验证码</button>
+          </form>
+          <form class="tga-form tga-step" data-step="code" autocomplete="off" onsubmit="return false" hidden>
+            <label>验证码 <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Telegram 里收到的验证码"></label>
+            <button type="button" class="btn btn-sm" data-tga-code>登录</button>
+            <button type="button" class="link-btn" data-tga-restart>换手机号 / 重新发送</button>
+          </form>
+          <form class="tga-form tga-step" data-step="password" autocomplete="off" onsubmit="return false" hidden>
+            <label>两步验证密码 <input type="password" name="password" autocomplete="off"></label>
+            <button type="button" class="btn btn-sm" data-tga-pw>提交</button>
+          </form>
+        </div>
+
+        <div class="tga-box" id="tgaMain" hidden>
+          <div class="tga-account"><span id="tgaMe"></span><span class="muted" id="tgaQuota"></span>
+            <button type="button" class="btn btn-sm btn-ghost" data-tga-logout>退出登录</button></div>
+          <div class="tga-browse">
+            <form class="tga-form tga-inline" onsubmit="return false">
+              <input type="text" name="chat" id="tgaChat" placeholder="频道链接 https://t.me/xxx 或 @用户名" autocomplete="off">
+              <button type="button" class="btn btn-sm" data-tga-open>打开频道</button>
+            </form>
+            <form class="tga-form tga-inline" onsubmit="return false">
+              <input type="search" name="q" id="tgaQ" placeholder="搜索公开频道 / 群组名称" autocomplete="off">
+              <button type="button" class="btn btn-sm btn-ghost" data-tga-search>搜索</button>
+            </form>
+          </div>
+          <div class="tga-recent" id="tgaRecent" hidden>
+            <h3>最近打开的频道 <small class="muted">点击直接打开；☆ 置顶，× 移除</small></h3>
+            <div class="tga-chips" id="tgaChips"></div>
+          </div>
+          <ul class="tga-results" id="tgaResults" hidden></ul>
+          <div class="tga-dl" id="tgaDl" hidden><div class="djopt-bar"><i></i></div><p class="muted" id="tgaDlText"></p></div>
+          <div class="tga-list" id="tgaList" hidden>
+            <h3 id="tgaChatTitle"></h3>
+            <div class="tga-batch" id="tgaBatchBar">
+              <label class="tg-check"><input type="checkbox" id="tgaSelAll"> 全选</label>
+              <button type="button" class="btn btn-sm btn-ghost" id="tgaSelNone">取消</button>
+              <button type="button" class="btn btn-sm" id="tgaBatchGo" disabled>下载并优化（0）</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="tgaBatchCancel" hidden>取消剩余排队</button>
+              <span class="muted" id="tgaBatchInfo"></span>
+            </div>
+            <p class="muted tga-batch-tip">全选默认跳过已下载/已导入的条目；若要重新下载，请单独勾选。</p>
+            <div class="tga-table-wrap"><table class="tga-table">
+              <thead><tr><th class="tga-col-check"></th><th>标题</th><th>艺人</th><th>时长</th><th>大小</th><th>日期</th><th>状态</th><th></th></tr></thead>
+              <tbody id="tgaRows"></tbody>
+            </table></div>
+            <button type="button" class="btn btn-sm btn-ghost" id="tgaMore" hidden>加载更多（50 条）</button>
+          </div>
+        </div>
+        <p class="hint tga-limits">限制：全站一次只下载一个文件（批量会按顺序排队，条目之间至少间隔 5 秒）；每天最多下载的数量可在配置里调整，批量勾选超出剩余额度时只会加入额度内的条目；单个文件最大 500MB。遇到 Telegram 限流会显示需要等待的时间。</p>
+      </section>
+      <script src="/static/tg_audio.js?v=optlim1" defer></script>
+      <script src="/static/admin_backup.js?v=bak3" defer></script>
+      {% endif %}
+      <p class="hint">本页只保留「上传优化」和 Telegram 音乐导入。前台 <a href="/dj" target="_blank" rel="noopener">/dj</a> 仍提供简易打碟台和录音。</p>
+    </div>
+  </div>
+</section>
+
+</div>
+<script>
+/* Admin tabs: show only one category pane at a time (#hash / ?tab= deep links). */
+(function () {
+  var tabs = Array.prototype.slice.call(document.querySelectorAll("#adminTabs .admin-tab"));
+  var panes = Array.prototype.slice.call(document.querySelectorAll("#adminPanes > .admin-pane"));
+  var ids = panes.map(function (p) { return p.id; });
+  var KEY = "dj666AdminTab";
+  function paneFor(name) {
+    if (!name) return null;
+    if (ids.indexOf(name) >= 0) return name;
+    var el = document.getElementById(name);
+    var pane = el && el.closest && el.closest("#adminPanes > .admin-pane");
+    return pane ? pane.id : null;
+  }
+  function show(name, opts) {
+    opts = opts || {};
+    var id = paneFor(name) || ids[0];
+    panes.forEach(function (p) { var on = p.id === id; p.classList.toggle("is-active", on); p.hidden = !on; });
+    tabs.forEach(function (t) {
+      var on = t.dataset.tab === id;
+      t.classList.toggle("is-active", on);
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+      if (on && t.scrollIntoView) {
+        var track = t.parentNode, l = t.offsetLeft, r = l + t.offsetWidth;
+        if (l < track.scrollLeft || r > track.scrollLeft + track.clientWidth) track.scrollLeft = Math.max(0, l - 16);
+      }
+    });
+    try { sessionStorage.setItem(KEY, id); } catch (e) {}
+    if (opts.push) history.replaceState(null, "", location.pathname + "#" + (opts.hash || id));
+    if (opts.scrollTo) {
+      var el = document.getElementById(opts.scrollTo);
+      if (el && el.id !== id) el.scrollIntoView({ block: "start" });
+    }
+    if (opts.toTabs) {
+      var bar = document.getElementById("adminTabs");
+      if (bar && bar.getBoundingClientRect().top < 0) bar.scrollIntoView({ block: "start" });
+    }
+    return id;
+  }
+  window.adminShowTab = function (name) { return show(name, { push: true }); };
+  function fromUrl() {
+    var h = (location.hash || "").replace("#", "");
+    var q = (location.search.match(/[?&]tab=([^&]+)/) || [])[1];
+    return h || (q ? decodeURIComponent(q) : "");
+  }
+  document.documentElement.classList.add("admin-tabs-on");
+  var start = fromUrl();
+  if (!start) {
+    var ref = ""; try { ref = new URL(document.referrer).pathname; } catch (e) {}
+    if (/^\/admin(\/|$)/.test(ref)) { try { start = sessionStorage.getItem(KEY) || ""; } catch (e) {} }
+  }
+  show(start, { scrollTo: fromUrl() });
+  window.addEventListener("hashchange", function () { var h = fromUrl(); show(h, { scrollTo: h, toTabs: true }); });
+  document.getElementById("adminTabs").addEventListener("click", function (e) {
+    var t = e.target.closest(".admin-tab"); if (!t) return;
+    e.preventDefault(); show(t.dataset.tab, { push: true, toTabs: true });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-dj-tab-link]"), function (a) {
+    a.addEventListener("click", function (e) { e.preventDefault(); show("djmix", { push: true, toTabs: true }); });
+  });
+  document.getElementById("adminTabs").addEventListener("keydown", function (e) {
+    var i = tabs.indexOf(document.activeElement); if (i < 0) return;
+    var j = e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : -1;
+    if (j < 0 || j >= tabs.length) return;
+    e.preventDefault(); show(tabs[j].dataset.tab, { push: true }); tabs[j].focus();
+  });
+  // in-page links to another category (e.g. 「管理过滤内容」, 评论数 → 公告评论)
+  document.getElementById("adminPanes").addEventListener("click", function (e) {
+    var a = e.target.closest('a[href^="#"]'); if (!a) return;
+    var name = a.getAttribute("href").slice(1); var id = paneFor(name); if (!id) return;
+    e.preventDefault(); show(name, { push: true, hash: name, scrollTo: name, toTabs: name === id });
+  });
+  // keep the current tab across plain form posts that redirect back to /admin
+  document.getElementById("adminPanes").addEventListener("submit", function (e) {
+    var p = e.target.closest(".admin-pane"); if (p) try { sessionStorage.setItem(KEY, p.id); } catch (err) {}
+  }, true);
+})();
+</script>
+<script>
+(function () {
+  var all = document.getElementById("annCmtAll");
+  if (all) all.addEventListener("change", function () {
+    document.querySelectorAll(".anncmt-pick").forEach(function (c) { c.checked = all.checked; });
+  });
+})();
+</script>
+<script type="application/json" id="annData">{{ ann_data|tojson }}</script>
+<script type="application/json" id="tgData">{{ tg_data|tojson }}</script>
+<script src="/static/admin_tg_status.js?v=tgtitle1" defer></script>
+<script src="/static/dj_optimize.js?v=optlim1" defer></script>
+<script src="/static/admin_ann.js?v=tgtitle1" defer></script>
+<script src="/static/admin_upload.js?v=cat1" defer></script>
+<script src="/static/admin_bot.js?v=adsup2" defer></script>
+<script>
+(function () {
+  // Multi-select batch bars (TG 待处理 / 已忽略 / 过滤规则)
+  function boxes(scope) { return Array.prototype.slice.call(document.querySelectorAll('input[data-sel="' + scope + '"]')); }
+  function refresh(scope) {
+    var n = boxes(scope).filter(function (b) { return b.checked; }).length;
+    document.querySelectorAll('[data-sel-count="' + scope + '"]').forEach(function (el) { el.textContent = "已选 " + n + " 条"; });
+    var form = document.querySelector('[data-batch-scope="' + scope + '"]');
+    if (form) form.querySelectorAll("[data-need-sel]").forEach(function (b) { b.disabled = n === 0; });
+    var all = document.querySelector('[data-select-all="' + scope + '"]');
+    if (all) { var t = boxes(scope).length; all.checked = t > 0 && n === t; all.indeterminate = n > 0 && n < t; }
+  }
+  ["new", "ign", "rule"].forEach(function (scope) {
+    var all = document.querySelector('[data-select-all="' + scope + '"]');
+    if (all) all.addEventListener("change", function () { boxes(scope).forEach(function (b) { b.checked = all.checked; }); refresh(scope); });
+    boxes(scope).forEach(function (b) { b.addEventListener("change", function () { refresh(scope); }); });
+    refresh(scope);
+  });
+  document.querySelectorAll("[data-batch-scope]").forEach(function (form) {
+    form.addEventListener("submit", function (e) {
+      var btn = e.submitter;
+      if (btn && btn.hasAttribute("data-single")) {
+        // single delete: send only this rule id
+        boxes(form.dataset.batchScope).forEach(function (b) { b.checked = false; });
+        return;
+      }
+      var scope = form.dataset.batchScope;
+      var n = boxes(scope).filter(function (b) { return b.checked; }).length;
+      if (!n) { e.preventDefault(); alert("请先勾选条目。"); return; }
+      var msg = btn && btn.getAttribute("data-confirm");
+      if (msg && !confirm(msg.replace("{n}", n))) e.preventDefault();
+    });
+  });
+})();
+</script>
+{% endblock %}

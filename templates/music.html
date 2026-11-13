@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% from "_track_list.html" import track_list with context %}
+{% block title %}音乐 · DJ666{% endblock %}
+{% block page_id %}music{% endblock %}
+{% block extra_head %}
+<style>
+/* Critical 「改名」 rules so a stale style.css cannot hide the button. */
+#music, #music .track-list, #music .track-item { overflow: visible !important; }
+#music .track-list { padding-right: 64px; padding-bottom: 108px; }
+@media (max-width: 340px) { #music .track-list { padding-right: 56px; } }
+#music .track-item.is-editable {
+  display: -webkit-flex;
+  display: flex;
+  display: grid;
+  -webkit-grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  -webkit-column-gap: 8px;
+  column-gap: 8px;
+  -webkit-align-items: center;
+  align-items: center;
+  position: relative;
+  overflow: visible !important;
+}
+#music .track-item.is-editable .play-btn { grid-column: 1; grid-row: 1; }
+#music .track-item.is-editable .track-meta { grid-column: 2; grid-row: 1; min-width: 0; }
+#music .track-rename-btn {
+  display: -webkit-inline-flex !important;
+  display: inline-flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  z-index: 6;
+  flex: 0 0 auto;
+  -webkit-align-items: center;
+  align-items: center;
+  -webkit-justify-content: center;
+  justify-content: center;
+  min-width: 64px;
+  min-height: 44px;
+  padding: 11px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: #3cefff;
+  color: #071016;
+  font-weight: 800;
+  font-size: 1.05rem;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+#music .track-item.is-editable .track-rename-btn { grid-column: 3; grid-row: 1; }
+#music .track-rename-btn[hidden] { display: none !important; }
+</style>
+{% endblock %}
+{% block content %}
+<section class="hero slim">
+  <p class="eyebrow">MUSIC</p>
+  <h1>音乐</h1>
+</section>
+
+<section class="panel" id="music">
+  <div class="panel-head">
+    <h2>音乐列表</h2>
+    <span class="music-head-actions">
+      <span class="count">{{ tracks|length }} 首</span>
+      {% if tracks %}
+      <button type="button" class="btn btn-sm" data-play-all="music">▶ 全部播放</button>
+      <button type="button" class="btn btn-sm btn-ghost" data-play-all="music" data-shuffle="1">🔀 随机播放</button>
+      {% endif %}
+    </span>
+  </div>
+  {% if tracks %}
+  {{ track_list(tracks, "trackList", "music", show_search=True) }}
+  {% else %}
+  <p class="muted">暂无曲目。</p>
+  {% endif %}
+  {% if not user %}
+  <p class="hint">登录后可在「设置」上传自己的音乐包。<a href="/login?next=/music">登录</a> 或 <a href="/register">注册</a></p>
+  {% endif %}
+</section>
+{% endblock %}

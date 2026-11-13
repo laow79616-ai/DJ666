@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}登录 · DJ666{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <h1>登录</h1>
+  <p class="muted">使用用户名或注册邮箱登录，即可播放音乐并参与公屏聊天。</p>
+  <form method="post" action="/login" class="auth-form" data-no-pjax>
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="next" value="{{ next_url or '/' }}">
+    <label>账号
+      <input type="text" name="account" required autocomplete="username" placeholder="用户名或邮箱">
+    </label>
+    <label>密码
+      <input type="password" name="password" required autocomplete="current-password">
+    </label>
+    <button type="submit" class="btn btn-block">登录</button>
+  </form>
+  <p class="hint">还没有账号？<a href="/register">立即注册</a></p>
+</section>
+{% endblock %}

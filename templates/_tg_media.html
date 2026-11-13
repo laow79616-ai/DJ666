@@ -1,0 +1,19 @@
+{% macro media_grid(items, video_preload="none") -%}
+{% if items %}
+{% set c = items|length %}
+{% if c <= 4 %}{% set big = 0 %}{% elif c % 3 == 0 %}{% set big = 0 %}{% elif c % 3 == 1 %}{% set big = 4 %}{% else %}{% set big = 2 %}{% endif %}
+<div class="tg-media tg-n{{ c if c <= 4 else 'many' }}">
+  {% for m in items %}
+  {% if m.type == "video" %}
+  <div class="tg-cell is-video{% if loop.index0 < big %} big{% endif %}">
+    <video src="{{ m.url }}" controls preload="{{ video_preload }}" playsinline{% if m.poster %} poster="{{ m.poster }}"{% endif %}></video>
+  </div>
+  {% else %}
+  <a class="tg-cell{% if loop.index0 < big %} big{% endif %}" href="{{ m.url }}" data-lightbox target="_blank" rel="noopener">
+    <img src="{{ m.url }}" loading="lazy" alt="">
+  </a>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+{%- endmacro %}

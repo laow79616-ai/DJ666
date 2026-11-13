@@ -1,0 +1,11 @@
+[Unit]
+Description=DJ666 automatic backup (database, data, config, code, uploads hardlinks)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+ExecStart=/usr/bin/python3 /opt/dj666/scripts/dj666_backup.py

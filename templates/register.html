@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}注册 · DJ666{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <h1>注册</h1>
+  <p class="muted">用邮箱创建账号，加入 DJ666。注册前请阅读并同意平台规则。</p>
+  <form method="post" action="/register" class="auth-form" data-no-pjax>
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label>邮箱
+      <input type="email" name="email" required autocomplete="username" placeholder="you@example.com">
+    </label>
+    <label>密码（至少 8 位）
+      <input type="password" name="password" required minlength="8" autocomplete="new-password">
+    </label>
+    <label>确认密码
+      <input type="password" name="password2" required minlength="8" autocomplete="new-password">
+    </label>
+    <div class="rules-preview">
+      <p>注册即表示你愿意遵守社区约定：文明互动、不发布违法或侵权内容，并接受管理员对违规内容或账号的处理。</p>
+      <p><a href="/rules" target="_blank" rel="noopener">查看《平台合约规则》全文</a></p>
+    </div>
+    <label class="agree-row">
+      <input type="checkbox" name="agree" value="1" required>
+      <span>我已阅读并同意<a href="/rules" target="_blank" rel="noopener">《平台合约规则》</a></span>
+    </label>
+    <button type="submit" class="btn btn-block">创建账号</button>
+  </form>
+  <p class="hint">已有账号？<a href="/login">去登录</a></p>
+</section>
+{% endblock %}

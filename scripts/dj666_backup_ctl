@@ -1,0 +1,8 @@
+#!/bin/sh
+# Trigger the backup oneshot as root. Only "start" is allowed (sudoers).
+set -e
+if [ "$#" -ne 1 ] || [ "$1" != "start" ]; then
+  echo "usage: dj666_backup_ctl start" >&2
+  exit 2
+fi
+exec /bin/systemctl start --no-block dj666-backup.service

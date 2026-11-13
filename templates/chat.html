@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% from "_tg_media.html" import media_grid %}
+{% block title %}公屏 · DJ666{% endblock %}
+{% block page_id %}chat{% endblock %}
+{% block content %}
+<section class="panel chat-panel chat-page-panel" id="chat">
+  <div class="panel-head chat-head">
+    <h2>公屏聊天</h2>
+    <div class="chat-search" role="search">
+      <span class="chat-search-ico" aria-hidden="true">🔍</span>
+      <input type="search" class="chat-search-input" data-chat-search placeholder="搜索消息…" aria-label="搜索公屏消息" autocomplete="off" enterkeyhint="search">
+      <span class="chat-search-count muted" data-chat-search-count hidden></span>
+    </div>
+  </div>
+  <p class="muted chat-search-empty" data-chat-search-empty hidden>没有找到匹配的消息。</p>
+  <div class="chat-log" id="chatLog">
+    {% for msg in messages %}
+    {% set cm = chat_media(msg) %}
+    {% set mine = user and msg.user_id == user.id %}
+    {% set rp = replies.get(msg.id) %}
+    <div class="chat-msg{% if mine %} is-mine{% endif %}" data-id="{{ msg.id }}" data-user="{{ display_name(msg.user) }}" data-excerpt="{{ chat_excerpt(msg) }}" data-chat-text="{{ msg.content }}{% if rp and rp.excerpt and not rp.deleted %} {{ rp.excerpt }}{% endif %}" data-created="{{ msg.created_at|chat_created_ms }}"{% if mine %} data-mine="1"{% endif %}>
+      <div class="chat-meta">{% if user and not mine %}<button type="button" class="chat-user" title="回复 {{ display_name(msg.user) }}">{{ display_name(msg.user) }}</button>{% else %}<b>{{ display_name(msg.user) }}</b>{% endif %} <span>{{ msg.created_at|fmt_time }}</span></div>
+      {% if rp %}<div class="chat-quote{% if rp.deleted %} is-deleted{% endif %}"{% if rp.id %} data-jump="{{ rp.id }}"{% endif %}><b>回复 @{{ rp.user }}</b>{% if rp.deleted %}<span>原消息已删除</span>{% elif rp.excerpt %}<span>{{ rp.excerpt }}</span>{% endif %}</div>{% endif %}
+      {% if cm %}<div class="chat-media">{{ media_grid(cm) }}</div>{% endif %}
+      {% if msg.content %}<p>{{ msg.content }}</p>{% endif %}
+    </div>
+    {% else %}
+    <p class="muted" id="chatEmpty">还没有消息，来打个招呼吧。</p>
+    {% endfor %}
+  </div>
+  {% if user %}
+  <form class="chat-form chat-form-media" id="chatForm" action="/chat" method="post">
+    <div class="chat-composer-handle" role="slider" aria-orientation="vertical" aria-label="拖动调整输入栏位置" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" tabindex="0">
+      <span class="chat-composer-grip" aria-hidden="true"></span>
+    </div>
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="reply_to" id="chatReplyTo" value="">
+    <div id="chatMediaInputs"></div>
+    <div class="chat-reply-bar" id="chatReplyBar" hidden>
+      <div class="chat-reply-text"><b id="chatReplyUser"></b><span id="chatReplyExcerpt"></span></div>
+      <button type="button" class="chat-reply-x" id="chatReplyCancel" title="取消回复" aria-label="取消回复">×</button>
+    </div>
+    <div class="tg-tray chat-tray" id="chatTray" hidden></div>
+    <div class="chat-input-row">
+      <label class="tg-attach chat-attach" title="发送图片/视频（每条最多 10 个）">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M16.5 6.5v10a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v10.5a1.5 1.5 0 0 1-3 0V6.5H9v9a3 3 0 0 0 6 0V5a4.5 4.5 0 0 0-9 0v11.5a6 6 0 0 0 12 0v-10h-1.5z"/></svg>
+        <input type="file" id="chatFiles" multiple accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,.mov,.m4v" hidden>
+      </label>
+      <input type="text" name="content" id="chatContent" maxlength="300" placeholder="说点什么…（可附图片/视频）">
+      <button type="submit" class="btn" id="chatSend">发送</button>
+    </div>
+    <p class="hint chat-media-hint" id="chatMediaHint" hidden><span id="chatCount">0</span>/10 · 图片 jpg/png/gif/webp，视频 mp4/webm/mov</p>
+  </form>
+  {% else %}
+  <div class="chat-guest-hint" id="chatGuestHint">
+    <div class="chat-composer-handle" role="slider" aria-orientation="vertical" aria-label="拖动调整输入栏位置" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" tabindex="0">
+      <span class="chat-composer-grip" aria-hidden="true"></span>
+    </div>
+    <p class="hint">登录后可参与公屏互动。<a href="/login?next=/chat">登录</a> 或 <a href="/register">注册</a></p>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+{% if user %}<script src="/static/chat_media.js?v=2"></script>{% endif %}
+<script>
+(function () {
+  const log = document.getElementById("chatLog");
+  if (!log) return;
+  const form = document.getElementById("chatForm");
+  const LOGGED_IN = !!form;
+  const IS_ADMIN = {{ "true" if user and user.is_admin else "false" }};
+  const RECALL_SECS = 120;
+  function esc(v) { const d = document.createElement("div"); d.textContent = v == null ? "" : v; return d.innerHTML; }
+  function mediaHtml(list) {
+    if (!list || !list.length) return "";
+    const c = list.length;
+    const big = c <= 4 ? 0 : (c % 3 === 0 ? 0 : (c % 3 === 1 ? 4 : 2));
+    let html = '<div class="chat-media"><div class="tg-media tg-n' + (c <= 4 ? c : "many") + '">';
+    list.forEach(function (m, i) {
+      const cls = "tg-cell" + (i < big ? " big" : "");
+      const url = esc(m.url);
+      if (m.type === "video") html += '<div class="' + cls + ' is-video"><video src="' + url + '" controls preload="metadata" playsinline></video></div>';
+      else html += '<a class="' + cls + '" href="' + url + '" data-lightbox target="_blank" rel="noopener"><img src="' + url + '" loading="lazy" alt=""></a>';
+    });
+    return html + "</div></div>";
+  }
+  function renderMessages(items) {
+    if (!document.body.contains(log)) return;
+    if (!items.length) {
+      log.innerHTML = '<p class="muted" id="chatEmpty">还没有消息，来打个招呼吧。</p>';
+      return;
+    }
+    const empty = document.getElementById("chatEmpty");
+    if (empty) empty.remove();
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+    const want = new Set(items.map(function (m) { return String(m.id); }));
+    log.querySelectorAll(".chat-msg").forEach(function (el) {
+      if (!want.has(el.dataset.id)) el.remove();
+    });
+    const have = new Set(Array.prototype.map.call(log.querySelectorAll(".chat-msg"), function (el) { return el.dataset.id; }));
+    let added = false;
+    items.forEach(function (msg) {
+      if (have.has(String(msg.id))) return;
+      const el = document.createElement("div");
+      const name = msg.username || "已注销用户";
+      el.className = "chat-msg" + (msg.mine ? " is-mine" : "");
+      el.dataset.id = msg.id;
+      el.dataset.user = name;
+      el.dataset.excerpt = msg.excerpt || "";
+      if (msg.mine) el.dataset.mine = "1";
+      if (msg.created) el.dataset.created = String(msg.created);
+      var replyEx = (msg.reply && !msg.reply.deleted && msg.reply.excerpt) ? msg.reply.excerpt : "";
+      el.setAttribute("data-chat-text", [msg.content || "", replyEx].join(" ").trim());
+      const who = LOGGED_IN && !msg.mine
+        ? '<button type="button" class="chat-user" title="回复 ' + esc(name) + '">' + esc(name) + '</button>'
+        : '<b>' + esc(name) + '</b>';
+      let quote = "";
+      if (msg.reply) {
+        const r = msg.reply;
+        quote = '<div class="chat-quote' + (r.deleted ? ' is-deleted' : '') + '"' + (r.id ? ' data-jump="' + esc(r.id) + '"' : '') + '><b>回复 @' + esc(r.user) + '</b>' +
+          (r.deleted ? '<span>原消息已删除</span>' : (r.excerpt ? '<span>' + esc(r.excerpt) + '</span>' : '')) + '</div>';
+      }
+      el.innerHTML = '<div class="chat-meta">' + who + ' <span>' + esc(msg.time || "") + '</span></div>' + quote +
+        mediaHtml(msg.media) + (msg.content ? '<p>' + esc(msg.content) + '</p>' : '');
+      log.appendChild(el);
+      added = true;
+    });
+    if (added && nearBottom && !chatSearchQuery()) log.scrollTop = log.scrollHeight;
+    applyChatSearch();
+  }
+  function chatSearchQuery() {
+    var input = document.querySelector("[data-chat-search]");
+    return ((input && input.value) || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  function applyChatSearch() {
+    var q = chatSearchQuery();
+    var msgs = log.querySelectorAll(".chat-msg");
+    var shown = 0, total = msgs.length;
+    msgs.forEach(function (el) {
+      var blob = el.getAttribute("data-chat-text") || "";
+      if (!blob) {
+        var p = el.querySelector("p");
+        var qel = el.querySelector(".chat-quote:not(.is-deleted) span");
+        blob = ((p && p.textContent) || "") + " " + ((qel && qel.textContent) || "");
+      }
+      var hit = !q || blob.toLowerCase().indexOf(q) !== -1;
+      el.hidden = !hit;
+      if (hit) shown++;
+    });
+    var cnt = document.querySelector("[data-chat-search-count]");
+    if (cnt) { cnt.hidden = !q; cnt.textContent = shown + " / " + total; }
+    var empty = document.querySelector("[data-chat-search-empty]");
+    if (empty) empty.hidden = !q || shown > 0 || total === 0;
+  }
+  document.addEventListener("input", function (e) {
+    if (e.target && e.target.matches && e.target.matches("[data-chat-search]")) applyChatSearch();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && e.target && e.target.matches && e.target.matches("[data-chat-search]")) {
+      e.target.value = "";
+      applyChatSearch();
+    }
+  });
+  async function pollChat() {
+    try {
+      const res = await fetch("/api/chat", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      renderMessages(data.messages || []);
+    } catch (e) {}
+  }
+  // Quote click: jump to the original message if it is still on screen.
+  log.addEventListener("click", function (e) {
+    const q = e.target.closest(".chat-quote[data-jump]");
+    if (!q) return;
+    const t = log.querySelector('.chat-msg[data-id="' + q.dataset.jump + '"]');
+    if (!t) return;
+    t.scrollIntoView({ block: "center", behavior: "smooth" });
+    t.classList.add("flash"); setTimeout(function () { t.classList.remove("flash"); }, 1200);
+  });
+
+  if (LOGGED_IN) {
+    const csrf = form.querySelector('input[name="csrf_token"]').value;
+    const replyTo = document.getElementById("chatReplyTo");
+    const bar = document.getElementById("chatReplyBar");
+    const input = document.getElementById("chatContent");
+    function setReply(msgEl) {
+      if (!msgEl) { replyTo.value = ""; bar.hidden = true; return; }
+      replyTo.value = msgEl.dataset.id;
+      document.getElementById("chatReplyUser").textContent = "回复 @" + (msgEl.dataset.user || "");
+      document.getElementById("chatReplyExcerpt").textContent = msgEl.dataset.excerpt || "";
+      bar.hidden = false;
+      input.focus();
+    }
+    document.getElementById("chatReplyCancel").addEventListener("click", function () { setReply(null); input.focus(); });
+    log.addEventListener("click", function (e) {
+      const b = e.target.closest(".chat-user");
+      if (!b) return;
+      e.preventDefault();
+      setReply(b.closest(".chat-msg"));
+    });
+
+    // Long-press / right-click: regular users may recall their own message within 2 minutes;
+    // admins may delete any message at any time. Expired recall is hidden, not shown-then-failed.
+    let menu = null, pressTimer = null, pressXY = null, suppressClick = false, menuExpire = null;
+    function createdMs(el) {
+      var t = parseInt(el && el.dataset.created, 10);
+      return t > 0 ? t : 0;
+    }
+    function canRecall(el) {
+      if (!el) return false;
+      if (IS_ADMIN) return true;
+      if (el.dataset.mine !== "1") return false;
+      var t = createdMs(el);
+      return t > 0 && (Date.now() - t) < RECALL_SECS * 1000;
+    }
+    function closeMenu() {
+      if (menuExpire) { clearTimeout(menuExpire); menuExpire = null; }
+      if (menu) { menu.remove(); menu = null; }
+    }
+    function openMenu(msgEl, x, y) {
+      if (!canRecall(msgEl)) return;
+      closeMenu();
+      menu = document.createElement("div");
+      menu.className = "chat-action-sheet";
+      var title = IS_ADMIN ? "删除消息" : "撤回消息";
+      var label = IS_ADMIN ? "删除消息" : "撤回消息";
+      menu.innerHTML = '<div class="chat-action-box" role="menu"><p class="chat-action-title">' + title + '</p>' +
+        '<button type="button" class="chat-action danger" data-act="del">' + label + '</button>' +
+        '<button type="button" class="chat-action" data-act="cancel">取消</button></div>';
+      document.body.appendChild(menu);
+      const box = menu.firstChild;
+      if (window.matchMedia("(min-width: 641px)").matches && x != null) {
+        menu.classList.add("at-point");
+        const w = box.offsetWidth, h = box.offsetHeight;
+        box.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + "px";
+        box.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
+      }
+      msgEl.classList.add("pressed");
+      if (!IS_ADMIN) {
+        var left = RECALL_SECS * 1000 - (Date.now() - createdMs(msgEl));
+        if (left > 0) menuExpire = setTimeout(function () { closeMenu(); msgEl.classList.remove("pressed"); }, left + 50);
+      }
+      // Ignore the click that ends the long-press gesture itself (finger lifts over the sheet).
+      let armed = false;
+      menu.addEventListener("pointerdown", function () { armed = true; });
+      menu.addEventListener("click", function (e) {
+        if (!armed && e.detail !== 0) return;
+        const act = e.target.closest("[data-act]");
+        if (!act && e.target !== menu) return;
+        msgEl.classList.remove("pressed");
+        if (act && act.dataset.act === "del") { closeMenu(); deleteMsg(msgEl); }
+        else closeMenu();
+      });
+      (window.DJPageLeave = window.DJPageLeave || []).push(closeMenu);
+    }
+    async function deleteMsg(msgEl) {
+      if (!canRecall(msgEl)) { alert(IS_ADMIN ? "无法删除这条消息。" : "已超过2分钟，无法撤回这条消息。"); return; }
+      if (!confirm(IS_ADMIN ? "确定删除这条消息？删除后所有人都看不到。" : "确定撤回这条消息？撤回后所有人都看不到。")) return;
+      const fd = new FormData(); fd.append("csrf_token", csrf);
+      try {
+        const res = await fetch("/chat/" + encodeURIComponent(msgEl.dataset.id) + "/delete", {
+          method: "POST", body: fd, headers: { "X-Requested-With": "dj666-ajax", "Accept": "application/json" }
+        });
+        const data = await res.json().catch(function () { return null; });
+        if (!res.ok || !data || !data.ok) { alert((data && data.error) || "删除失败，请刷新后重试"); return; }
+        if (replyTo.value === msgEl.dataset.id) setReply(null);
+        msgEl.remove();
+        pollChat();
+      } catch (e) { alert("网络错误，删除失败"); }
+    }
+    function mineAt(target) {
+      const m = target.closest && target.closest(".chat-msg");
+      if (!m || !log.contains(m) || !canRecall(m)) return null;
+      return m;
+    }
+    function clearPress() { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } }
+    log.addEventListener("pointerdown", function (e) {
+      suppressClick = false;
+      if (e.button !== 0) return;
+      const m = mineAt(e.target);
+      if (!m || e.target.closest("video, button")) return;
+      pressXY = [e.clientX, e.clientY];
+      clearPress();
+      pressTimer = setTimeout(function () {
+        pressTimer = null; suppressClick = true;
+        if (navigator.vibrate) { try { navigator.vibrate(15); } catch (err) {} }
+        openMenu(m, pressXY[0], pressXY[1]);
+      }, 550);
+    });
+    log.addEventListener("pointermove", function (e) {
+      if (pressTimer && pressXY && Math.abs(e.clientX - pressXY[0]) + Math.abs(e.clientY - pressXY[1]) > 12) clearPress();
+    });
+    ["pointerup", "pointercancel", "pointerleave"].forEach(function (t) { log.addEventListener(t, clearPress); });
+    log.addEventListener("scroll", clearPress, { passive: true });
+    log.addEventListener("contextmenu", function (e) {
+      const m = mineAt(e.target);
+      if (!m) return;
+      e.preventDefault();
+      clearPress();
+      if (!menu) openMenu(m, e.clientX, e.clientY);
+    });
+    // Swallow the click that ends a long-press (e.g. on an image link).
+    log.addEventListener("click", function (e) {
+      if (suppressClick) { suppressClick = false; e.preventDefault(); e.stopPropagation(); }
+    }, true);
+    document.addEventListener("keydown", function onKey(e) {
+      if (!document.body.contains(log)) { document.removeEventListener("keydown", onKey); return; }
+      if (e.key === "Escape") { closeMenu(); if (!bar.hidden) setReply(null); }
+    });
+  }
+
+  log.scrollTop = log.scrollHeight;
+  const timer = setInterval(pollChat, 5000);
+  // Stop polling when in-site navigation leaves this page.
+  (window.DJPageLeave = window.DJPageLeave || []).push(function () { clearInterval(timer); });
+})();
+</script>
+{% endblock %}

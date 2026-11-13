@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}打碟混音 · DJ666{% endblock %}
+{% block page_id %}mixer{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/mixer.css?v=tgab1">
+{% endblock %}
+{% block content %}
+<link rel="stylesheet" href="/static/mixer.css?v=tgab1">
+{% include "_mixer.html" %}
+<script type="application/json" id="mixerLibrary">{{ library|tojson }}</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/dj_optimize.js?v=optlim1" defer></script>
+<script src="/static/dj_repeat.js?v=t108" defer></script>
+<script src="/static/mixer.js?v=t108" defer></script>
+{% endblock %}

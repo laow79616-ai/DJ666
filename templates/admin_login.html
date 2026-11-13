@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}管理员登录 · DJ666{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <p class="eyebrow">ADMIN</p>
+  <h1>管理员登录</h1>
+  <p class="muted">请使用管理员账号登录后台。</p>
+  {% if login_error %}
+  <p class="flash flash-error" role="alert">{{ login_error }}</p>
+  {% endif %}
+  <form method="post" action="/admin/login" class="auth-form" data-no-pjax>
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label>账号
+      <input type="text" name="account" required autocomplete="username" placeholder="管理员用户名或邮箱" value="{{ account or '' }}">
+    </label>
+    <label>密码
+      <input type="password" name="password" required autocomplete="current-password">
+    </label>
+    <button type="submit" class="btn btn-block">登录后台</button>
+  </form>
+</section>
+{% endblock %}

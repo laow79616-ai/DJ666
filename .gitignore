@@ -1,0 +1,38 @@
+# secrets and runtime data — never commit
+.env
+.env.*
+!.env.example
+data/
+uploads/
+backups/
+logs/
+*.log
+
+# databases, keys, encrypted sessions
+*.db
+*.sqlite
+*.sqlite3
+*.enc
+*.key
+*.pem
+*.session
+*.session-journal
+tg_session.*
+tg_user.json
+
+# python / venv
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+dist/
+build/
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
