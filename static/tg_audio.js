@@ -102,7 +102,7 @@
     if (st.logged_in && st.me) {
       $("#tgaMe").textContent = "当前账号：" + st.me.name + (st.me.username ? "（@" + st.me.username + "）" : "");
     }
-    $("#tgaQuota").textContent = "今日已下载 " + (st.today || 0) + " / " + (st.daily_cap || 30) + (st.flood_wait ? " · Telegram 限流中，还需等待 " + st.flood_wait + " 秒" : "");
+    $("#tgaQuota").textContent = "今日已下载 " + (st.today || 0) + (st.flood_wait ? " · Telegram 限流中，还需等待 " + st.flood_wait + " 秒（将自动继续）" : "");
     if (st.error) say(st.error, "err");
     var dl = st.download, box = $("#tgaDl");
     if (dl && dl.job_id && (dl.active || dl.state === "failed")) {
@@ -116,7 +116,7 @@
       $("#tgaDlText").textContent = "✅ " + dl.name + " 已下载，正在下方「上传优化」中处理";
     } else box.hidden = true;
     paintBatch(st);
-    var batchBusy = batchIsBusy(st.batch);
+    var batchBusy = batchIsBusy(st.queue || st.batch);
     clearTimeout(pollTimer);
     if ((dl && dl.active) || batchBusy) pollTimer = setTimeout(load, 2000);
   }
@@ -129,8 +129,9 @@
   }
   function statusText(it) {
     if (!it || !it.status) return "";
-    if (it.status === "queued") return "排队";
+    if (it.status === "queued") return "等待";
     if (it.status === "downloading") {
+      if (it.error) return it.error;
       var p = it.progress;
       if (p == null && it.size) p = Math.round((it.received || 0) / it.size * 100);
       return "下载中 " + (p || 0) + "%";
@@ -181,6 +182,8 @@
     var n = selectedRows().length;
     var go = $("#tgaBatchGo");
     if (go) { go.textContent = "下载并优化（" + n + "）"; go.disabled = n === 0; }
+    var sc = $("#tgaSelCount");
+    if (sc) sc.textContent = n ? ("已选 " + n + " 首") : "";
     var boxes = root.querySelectorAll("#tgaRows input.tga-row-cb:not(:disabled)");
     var all = $("#tgaSelAll");
     if (all && boxes.length) {
@@ -197,25 +200,63 @@
       all.indeterminate = pick > 0 && !all.checked;
     } else if (all) { all.checked = false; all.indeterminate = false; }
   }
-  function paintBatch(st) {
-    var b = (st && st.batch) || {};
-    var items = b.items || [];
-    var queued = items.filter(function (it) { return it.status === "queued"; }).length;
-    var busy = batchIsBusy(b);
-    var cancel = $("#tgaBatchCancel");
-    if (cancel) cancel.hidden = queued === 0;
-    var info = $("#tgaBatchInfo");
-    if (info) {
-      var running = items.filter(function (it) { return it.status === "downloading" || it.status === "optimizing"; }).length;
-      var done = items.filter(function (it) { return it.status === "done"; }).length;
-      var fail = items.filter(function (it) { return it.status === "failed"; }).length;
-      var bits = [];
-      if (b.message) bits.push(b.message);
-      if (busy || items.length) {
-        bits.push("队列 " + done + " 完成 / " + fail + " 失败 / " + queued + " 排队" + (running ? " / " + running + " 进行中" : ""));
-      }
-      info.textContent = bits.join(" ");
+  function queueCounts(b) {
+    var c = (b && b.counts) || {};
+    var items = (b && b.items) || [];
+    function n(k) {
+      if (typeof c[k] === "number") return c[k];
+      return items.filter(function (it) { return it.status === k; }).length;
     }
+    return { queued: n("queued"), downloading: n("downloading"), optimizing: n("optimizing"), done: n("done"), failed: n("failed") };
+  }
+  function paintQueue(st) {
+    var b = (st && (st.queue || st.batch)) || {};
+    var items = b.items || [];
+    var box = $("#tgaQueue");
+    var counts = queueCounts(b);
+    if (box) box.hidden = items.length === 0;
+    var el = $("#tgaQueueCounts");
+    if (el) {
+      el.innerHTML = '<span>等待 <b>' + counts.queued + '</b></span> · <span class="is-dl">下载中 <b>' + counts.downloading +
+        '</b></span> · <span class="is-opt">优化中 <b>' + counts.optimizing + '</b></span> · <span class="is-done">已完成 <b>' +
+        counts.done + '</b></span> · <span class="is-fail">失败 <b>' + counts.failed + '</b></span>';
+    }
+    var today = $("#tgaQueueToday");
+    if (today) today.textContent = "今日已下载 " + ((st && st.today) || b.today || 0);
+    var cancel = $("#tgaBatchCancel");
+    if (cancel) cancel.disabled = counts.queued === 0;
+    var retry = $("#tgaQueueRetry");
+    if (retry) retry.disabled = counts.failed === 0;
+    var clr = $("#tgaQueueClearDone");
+    if (clr) {
+      var removable = items.filter(function (it) { return it.status === "done" || it.status === "cancelled"; }).length;
+      clr.disabled = removable === 0;
+    }
+    var list = $("#tgaQueueList");
+    if (list) {
+      var order = {downloading:0, optimizing:1, queued:2, done:3, failed:4, cancelled:5};
+      items = items.slice().sort(function (a, b) {
+        var d = (order[a.status] != null ? order[a.status] : 9) - (order[b.status] != null ? order[b.status] : 9);
+        return d || ((a.id || 0) - (b.id || 0));
+      });
+      list.innerHTML = items.map(function (it) {
+        var label = it.name || it.title || ("#" + it.msg_id);
+        var stt = statusText(it) || it.status || "";
+        var pct = it.progress || 0;
+        if ((it.status === "downloading" || it.status === "optimizing") && !pct && it.size) {
+          pct = Math.round((it.received || 0) / it.size * 100);
+        }
+        var bar = (it.status === "downloading" || it.status === "optimizing" || it.status === "done")
+          ? '<div class="tga-q-bar"><i style="width:' + pct + '%"></i></div>' : "";
+        return '<li class="' + statusClass(it.status) + '"><span class="tga-q-name">' + esc(label) +
+          '</span><span>' + esc(stt) + "</span>" + bar + "</li>";
+      }).join("");
+    }
+  }
+  function paintBatch(st) {
+    var b = (st && (st.queue || st.batch)) || {};
+    var items = b.items || [];
+    paintQueue(st);
     Array.prototype.forEach.call(root.querySelectorAll("#tgaRows tr[data-msg-id]"), paintRowStatus);
     if (window.DJOpt && window.DJOpt.watch) {
       items.forEach(function (it) { if (it.job_id) window.DJOpt.watch(it.job_id); });
@@ -230,7 +271,7 @@
   // config
   $("[data-tga-cfg-save]").addEventListener("click", function () {
     var f = $("#tgaCfgForm");
-    var body = { api_id: f.api_id.value.trim(), api_hash: f.api_hash.value.trim(), daily_cap: f.daily_cap.value.trim() };
+    var body = { api_id: f.api_id.value.trim(), api_hash: f.api_hash.value.trim() };
     act(this, "POST", "/admin/tg-audio/config", body, "保存中…").then(function () {
       f.api_id.value = ""; f.api_hash.value = "";
     }).catch(function () {});
@@ -314,11 +355,10 @@
   function download(it, btn) {
     var tsel = document.getElementById("djoptTarget");
     busy(btn, true, "准备中…");
-    api("POST", "/admin/tg-audio/download", { chat: chatRef, msg_id: it.id, target: tsel ? tsel.value : "-9" }).then(function (d) {
-      btn.textContent = "已加入"; btn.disabled = true;
-      say("开始下载：" + d.name + "，完成后自动进入「上传优化」。", "ok");
+    api("POST", "/admin/tg-audio/download", { chat: chatRef, msg_id: it.id, title: it.title || "", target: tsel ? tsel.value : "-9" }).then(function (d) {
+      btn.textContent = "已加入队列"; btn.disabled = true;
+      say(d.message || "已加入下载队列，将在后台下载并优化。", "ok");
       apply(d);
-      if (window.DJOpt && window.DJOpt.watch) window.DJOpt.watch(d.job_id);
     }).catch(function (e) { busy(btn, false); say(e.message, "err"); });
   }
   $("[data-tga-open]").addEventListener("click", function () {
@@ -366,6 +406,26 @@
     api("POST", "/admin/tg-audio/batch/cancel", {}).then(function (d) {
       busy(btn, false);
       say(d.message || "已取消剩余排队", "ok");
+      apply(d);
+    }).catch(function (e) { busy(btn, false); say(e.message, "err"); });
+  });
+  var retryBtn = $("#tgaQueueRetry");
+  if (retryBtn) retryBtn.addEventListener("click", function () {
+    var btn = this;
+    busy(btn, true, "重试中…");
+    api("POST", "/admin/tg-audio/queue/retry", {}).then(function (d) {
+      busy(btn, false);
+      say(d.message || "已重新加入失败条目", "ok");
+      apply(d);
+    }).catch(function (e) { busy(btn, false); say(e.message, "err"); });
+  });
+  var clearBtn = $("#tgaQueueClearDone");
+  if (clearBtn) clearBtn.addEventListener("click", function () {
+    var btn = this;
+    busy(btn, true, "移除中…");
+    api("POST", "/admin/tg-audio/queue/clear-done", {}).then(function (d) {
+      busy(btn, false);
+      say(d.message || "已移除完成条目", "ok");
       apply(d);
     }).catch(function (e) { busy(btn, false); say(e.message, "err"); });
   });

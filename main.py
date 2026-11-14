@@ -578,8 +578,40 @@ class AnnouncementComment(Base):
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
 
+
     user: Mapped[User] = relationship()
     announcement: Mapped[Announcement] = relationship()
+
+
+class TgAudioQueueItem(Base):
+    """Persistent Telegram music import queue (survives restarts)."""
+
+    __tablename__ = "tga_queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_ref: Mapped[str] = mapped_column(String(200), default="")
+    chat_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    chat_title: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    msg_id: Mapped[int] = mapped_column(Integer, index=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    name: Mapped[str] = mapped_column(String(255), default="")
+    force: Mapped[bool] = mapped_column(Boolean, default=False)
+    target: Mapped[str] = mapped_column(String(20), default="-9")
+    user_id: Mapped[int] = mapped_column(Integer, default=0)
+    job_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    received: Mapped[int] = mapped_column(Integer, default=0)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    error: Mapped[str] = mapped_column(String(300), default="")
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 ANN_COMMENT_MAX_LEN = 300
@@ -8942,11 +8974,14 @@ TGA_KEY_PATH = DATA_DIR / "tg_session.key"
 TGA_SESSION_PATH = DATA_DIR / "tg_session.enc"
 TGA_STATE_PATH = DATA_DIR / "tga_state.json"
 TGA_BATCH_PATH = DATA_DIR / "tga_batch.json"
-TGA_DAILY_DEFAULT = 30
+TGA_DAILY_DEFAULT = 30          # kept for status compat; the daily cap is no longer enforced
 TGA_DAILY_MAX = 200
-TGA_LIST_MIN_GAP = 5.0          # seconds between Telegram list/search/resolve calls
+TGA_LIST_MIN_GAP = 5.0          # seconds between Telegram list/search/resolve/download starts
 TGA_PAGE = 50
-TGA_FLOOD_AUTO_WAIT = 120       # a FloodWait shorter than this during a download is slept through
+TGA_FLOOD_AUTO_WAIT = 120       # interactive FloodWait shorter than this is slept through
+TGA_Q_RETRY_MAX = 2             # extra attempts after a failed TG download
+TGA_Q_RETRY_BACKOFF = (8, 20)   # seconds before retry 1 and retry 2
+TGA_Q_ACTIVE = ("queued", "downloading", "optimizing")
 TGA_RATE = {"send": (5, 3600), "signin": (10, 3600)}
 TGA_PHONE_RE = re.compile(r"^\+?[0-9]{6,16}$")
 
@@ -8958,7 +8993,8 @@ _tga = {
     "me": None, "authorized": None, "checked": 0.0,
     "flood_until": 0.0, "last_api": 0.0,
     "download": None,         # {"job_id", "name", "size", "received", "state", "error"}
-    "batch": None,            # persisted queue in data/tga_batch.json
+    "batch": None,            # legacy; live queue is the tga_queue table
+    "queue_running": False,
     "attempts": {"send": [], "signin": []},
     "entities": {},
 }
@@ -9217,18 +9253,21 @@ def tga_status(force: bool = False) -> dict:
         if job:
             dl = dict(dl, received=job.get("received") or 0, size=job.get("size") or dl.get("size"))
     flood = max(0, int(_tga["flood_until"] - time.time()))
+    q = _tga_queue_public()
     return {
         "configured": configured,
         "logged_in": bool(configured and has_session and _tga["authorized"]),
         "me": _tga["me"] if _tga["authorized"] else None,
         "login_stage": (login or {}).get("stage") if login and time.time() - login.get("ts", 0) < 900 else None,
-        "daily_cap": tga_daily_cap(cfg),
+        "daily_cap": 0,
+        "daily_unlimited": True,
         "today": _tga_count_today(),
         "flood_wait": flood,
         "download": dl,
         "error": err,
         "recent": tga_recent_public(),
-        "batch": _tga_batch_public(),
+        "batch": q,
+        "queue": q,
     }
 
 
@@ -9290,7 +9329,6 @@ async def tga_config_ep(request: Request, db: Session = Depends(get_db)):
         return {"ok": True, "message": "已清除 api_id / api_hash 并退出登录", **tga_status()}
     api_id = str(data.get("api_id") or "").strip()
     api_hash = str(data.get("api_hash") or "").strip()
-    cap_raw = str(data.get("daily_cap") or "").strip()
     if api_id or api_hash:
         if not re.fullmatch(r"[0-9]{3,12}", api_id):
             raise HTTPException(status_code=400, detail="api_id 应为纯数字")
@@ -9299,14 +9337,10 @@ async def tga_config_ep(request: Request, db: Session = Depends(get_db)):
         if (str(cfg.get("api_id")), str(cfg.get("api_hash"))) != (api_id, api_hash):
             await asyncio.to_thread(_tga_run, _tga_drop_client(False), 30)
         cfg["api_id"], cfg["api_hash"] = int(api_id), api_hash.lower()
-    elif not tga_configured(cfg) and not cap_raw:
+    elif not tga_configured(cfg):
         raise HTTPException(status_code=400, detail="请填写 api_id 和 api_hash")
-    if cap_raw:
-        try:
-            cap = int(cap_raw)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="每日下载上限应为数字")
-        cfg["daily_cap"] = max(1, min(TGA_DAILY_MAX, cap))
+    # daily download cap has been removed; ignore any leftover daily_cap field
+    cfg.pop("daily_cap", None)
     tga_cfg_save(cfg)
     return {"ok": True, "message": "已保存", **tga_status()}
 
@@ -9935,8 +9969,6 @@ async def _tga_download_async(job_id: str, ref: str, msg_id: int) -> None:
             except errors.FloodWaitError as exc:
                 secs = int(exc.seconds or 0)
                 _tga["flood_until"] = time.time() + secs
-                if secs > TGA_FLOOD_AUTO_WAIT:
-                    raise RuntimeError(f"Telegram 限流：需等待 {secs} 秒，请稍后重新下载")
                 _opt_update(job_id, stage=f"Telegram 限流，{secs} 秒后自动继续")
                 dl["state"] = f"限流等待 {secs} 秒"
                 await asyncio.sleep(secs + 1)
@@ -9947,6 +9979,7 @@ async def _tga_download_async(job_id: str, ref: str, msg_id: int) -> None:
         job = _opt_update(job_id, received=got, size=got, state="queued", stage="排队中", progress=0, error=None)
         if job:
             _opt_queue.put(job_id)
+        _tga_bump_today()
         dl["state"] = "done"
         try:
             j2 = _opt_load(job_id) or {}
@@ -9991,89 +10024,163 @@ async def tga_download_ep(request: Request, db: Session = Depends(get_db)):
     if target not in OPT_TARGETS:
         target = OPT_DEFAULT_TARGET
     await asyncio.to_thread(_tga_need_login)
-    _tga_check_flood()
+    title = str(data.get("title") or "")[:200]
+    result = await asyncio.to_thread(
+        _tga_enqueue, user.id, ref, [{"msg_id": msg_id, "force": True, "title": title}], target
+    )
+    return {"ok": True, **result}
+
+
+def _tga_q_dict(item: "TgAudioQueueItem") -> dict:
+    return {
+        "id": item.id,
+        "chat_ref": item.chat_ref or "",
+        "chat_id": item.chat_id,
+        "chat_title": item.chat_title or "",
+        "msg_id": item.msg_id,
+        "title": item.title or "",
+        "name": item.name or item.title or "",
+        "force": bool(item.force),
+        "target": item.target or OPT_DEFAULT_TARGET,
+        "user_id": item.user_id or 0,
+        "job_id": item.job_id,
+        "size": int(item.size or 0),
+        "received": int(item.received or 0),
+        "progress": int(item.progress or 0),
+        "status": item.status or "queued",
+        "error": item.error or "",
+        "retries": int(item.retries or 0),
+    }
+
+
+def _tga_q_enrich(it: dict) -> dict:
+    """Overlay live optimize-job progress onto a queue row and persist terminal states."""
+    jid = it.get("job_id")
+    st = it.get("status")
+    if not jid or st in ("cancelled", "queued"):
+        return it
+    job = _opt_load(str(jid))
+    if not job:
+        if st in ("optimizing", "downloading") and it.get("id"):
+            it["status"] = "failed"
+            it["error"] = "任务记录已不在，请重试"
+            _tga_q_update(int(it["id"]), status="failed", error=it["error"])
+        return it
+    it["received"] = job.get("received") or it.get("received") or 0
+    it["size"] = job.get("size") or it.get("size") or 0
+    it["name"] = job.get("name") or it.get("name") or ""
+    js = job.get("state")
+    new_status = st
+    error = it.get("error") or ""
+    progress = int(it.get("progress") or 0)
+    if js == "downloading":
+        new_status = "downloading"
+        progress = int(round(100 * (it["received"] or 0) / it["size"])) if it.get("size") else 0
+    elif js in ("queued", "running"):
+        new_status = "optimizing"
+        progress = int(job.get("progress") or 0)
+    elif js == "done":
+        new_status = "done"
+        progress = 100
+        error = ""
+    elif js == "failed" and st != "cancelled":
+        new_status = "failed"
+        error = job.get("error") or error or "失败"
+        progress = int(job.get("progress") or progress or 0)
+    prev_progress = int(it.get("progress") or 0)
+    prev_error = it.get("error") or ""
+    it["status"] = new_status
+    it["error"] = error
+    it["progress"] = progress
+    if it.get("id") and (new_status != st or progress != prev_progress or error != prev_error):
+        _tga_q_update(int(it["id"]), status=new_status, error=error, progress=progress,
+                      received=int(it["received"] or 0), size=int(it["size"] or 0),
+                      name=it.get("name") or "")
+    return it
+
+
+def _tga_q_update(item_id: int, **fields) -> Optional[dict]:
+    db = SessionLocal()
+    try:
+        item = db.get(TgAudioQueueItem, item_id)
+        if not item:
+            return None
+        for key, value in fields.items():
+            if hasattr(item, key):
+                setattr(item, key, value)
+        item.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(item)
+        return _tga_q_dict(item)
+    finally:
+        db.close()
+
+
+def _tga_q_claim_next() -> Optional[dict]:
     with _tga_lock:
-        if _tga_batch_busy():
-            raise HTTPException(status_code=429, detail="批量下载进行中，请等它完成或先取消剩余排队")
-        cur = _tga["download"]
-        if cur and cur.get("active"):
-            raise HTTPException(status_code=429, detail="已有一个下载在进行中，请等它完成（全站一次只下载一个）")
-        cap = tga_daily_cap()
-        if _tga_count_today() >= cap:
-            raise HTTPException(status_code=429, detail=f"今天已下载 {cap} 个，达到每日上限（可在配置里调整）")
-        _tga["download"] = {"active": True, "job_id": None, "name": "", "size": 0, "received": 0, "state": "preparing", "error": ""}
+        db = SessionLocal()
+        try:
+            item = db.scalar(
+                select(TgAudioQueueItem)
+                .where(TgAudioQueueItem.status == "queued")
+                .order_by(TgAudioQueueItem.id.asc())
+            )
+            if not item:
+                return None
+            item.status = "downloading"
+            item.error = ""
+            item.progress = 0
+            item.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            db.refresh(item)
+            return _tga_q_dict(item)
+        finally:
+            db.close()
+
+
+def _tga_q_has_queued() -> bool:
+    db = SessionLocal()
     try:
-        await asyncio.to_thread(_tga_throttle)
-        job_id, name, _sz = await asyncio.to_thread(_tga_run, _tga_prepare_job(user.id, ref, msg_id, target), 40)
-        asyncio.run_coroutine_threadsafe(_tga_download_async(job_id, ref, msg_id), _tga_loop())
-    except BaseException:
-        if _tga["download"] and not _tga["download"].get("job_id"):
-            _tga["download"]["active"] = False
-            _tga["download"]["state"] = "idle"
-        raise
-    return {"ok": True, "job_id": job_id, "name": name, **tga_status()}
+        return bool(db.scalar(
+            select(TgAudioQueueItem.id).where(TgAudioQueueItem.status == "queued").limit(1)
+        ))
+    finally:
+        db.close()
 
 
-def _tga_batch_empty() -> dict:
-    return {"items": [], "active": False, "cancel": False, "message": "", "chat": "", "chat_title": ""}
-
-
-def _tga_batch_persist() -> None:
-    data = _tga.get("batch") or _tga_batch_empty()
+def _tga_queue_public() -> dict:
+    db = SessionLocal()
     try:
-        _tga_write_private(TGA_BATCH_PATH, json.dumps(data, ensure_ascii=False).encode("utf-8"))
-    except OSError:
-        pass
-
-
-def _tga_batch_busy() -> bool:
-    b = _tga.get("batch") or {}
-    if b.get("active"):
-        return True
-    return any((it or {}).get("status") in ("queued", "downloading") for it in (b.get("items") or []))
+        rows = db.scalars(select(TgAudioQueueItem).order_by(TgAudioQueueItem.id.asc())).all()
+        items = [_tga_q_dict(r) for r in rows]
+    finally:
+        db.close()
+    out_items = [_tga_q_enrich(it) for it in items]
+    counts = {"queued": 0, "downloading": 0, "optimizing": 0, "done": 0, "failed": 0, "cancelled": 0}
+    for it in out_items:
+        if it["status"] in counts:
+            counts[it["status"]] += 1
+    active = any(it["status"] in TGA_Q_ACTIVE for it in out_items)
+    return {
+        "items": out_items,
+        "counts": counts,
+        "active": active or bool(_tga.get("queue_running")),
+        "cancel": False,
+        "message": "",
+        "today": _tga_count_today(),
+    }
 
 
 def _tga_batch_public() -> dict:
-    with _tga_lock:
-        raw = _tga.get("batch") or _tga_batch_empty()
-        items = [dict(it) for it in (raw.get("items") or []) if isinstance(it, dict)]
-        out = {
-            "items": items,
-            "active": bool(raw.get("active")),
-            "cancel": bool(raw.get("cancel")),
-            "message": raw.get("message") or "",
-            "chat": raw.get("chat") or "",
-            "chat_title": raw.get("chat_title") or "",
-        }
-    for it in out["items"]:
-        jid = it.get("job_id")
-        st = it.get("status")
-        if not jid or st in ("cancelled", "skipped"):
-            continue
-        job = _opt_load(str(jid))
-        if not job:
-            continue
-        it["received"] = job.get("received") or it.get("received") or 0
-        it["size"] = job.get("size") or it.get("size") or 0
-        it["name"] = job.get("name") or it.get("name") or ""
-        js = job.get("state")
-        if js == "downloading":
-            it["status"] = "downloading"
-            it["progress"] = int(round(100 * (it["received"] or 0) / it["size"])) if it.get("size") else 0
-        elif js in ("queued", "running"):
-            it["status"] = "optimizing"
-            it["progress"] = int(job.get("progress") or 0)
-        elif js == "done":
-            it["status"] = "done"
-            it["progress"] = 100
-        elif js == "failed" and st != "cancelled":
-            it["status"] = "failed"
-            it["error"] = job.get("error") or it.get("error") or "失败"
-        if it["status"] == "downloading" and it.get("size"):
-            it["progress"] = int(round(100 * (it["received"] or 0) / it["size"]))
-    out["active"] = bool(out["active"] or any(
-        it.get("status") in ("queued", "downloading") for it in out["items"]))
-    return out
+    """Back-compat alias used by older status consumers."""
+    return _tga_queue_public()
+
+
+def _tga_batch_busy() -> bool:
+    return bool(_tga.get("queue_running")) or any(
+        it.get("status") in ("queued", "downloading")
+        for it in (_tga_queue_public().get("items") or [])
+    )
 
 
 async def _tga_throttle_async(wait_flood: bool = False) -> None:
@@ -10127,121 +10234,140 @@ async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str) -> 
     }
     with _opt_lock:
         _opt_save(job)
-    _tga_bump_today()
     with _tga_lock:
         if _tga["download"]:
             _tga["download"].update(job_id=job_id, name=name, size=item["size"], state="downloading")
     return job_id, name, item["size"]
 
 
-async def _tga_batch_worker(user_id: int, ref: str, target: str) -> None:
-    """Process the persisted queue sequentially on the Telethon loop (do not call _tga_run here)."""
+def _tga_q_retryable(msg: str) -> bool:
+    text = (msg or "").lower()
+    fatal = ("消息不存在", "不是音频", "不支持", "超过", "文件大小超出", "cancelled", "已取消", "无权限", "需要管理员")
+    if any(s in (msg or "") or s in text for s in fatal):
+        return False
+    return True
+
+
+def _tga_queue_kick() -> None:
+    with _tga_lock:
+        if _tga.get("queue_running"):
+            return
+        _tga["queue_running"] = True
+    asyncio.run_coroutine_threadsafe(_tga_queue_worker(), _tga_loop())
+
+
+async def _tga_queue_worker() -> None:
+    """Process the DB-backed queue: one TG download at a time, then hand off to ffmpeg."""
     try:
         while True:
-            with _tga_lock:
-                batch = _tga.get("batch") or _tga_batch_empty()
-                if batch.get("cancel"):
-                    for it in batch.get("items") or []:
-                        if (it or {}).get("status") == "queued":
-                            it["status"] = "cancelled"
-                            it["error"] = "已取消"
-                    batch["active"] = False
-                    batch["cancel"] = False
-                    _tga["batch"] = batch
-                    _tga_batch_persist()
-                    return
-                nxt = next((it for it in (batch.get("items") or []) if (it or {}).get("status") == "queued"), None)
-                if not nxt:
-                    batch["active"] = False
-                    _tga["batch"] = batch
-                    _tga_batch_persist()
-                    return
-                nxt["status"] = "downloading"
-                nxt["error"] = ""
-                nxt["progress"] = 0
-                _tga["batch"] = batch
-                _tga_batch_persist()
-                msg_id = int(nxt["msg_id"])
-            while True:
-                with _tga_lock:
-                    cur = _tga.get("download")
-                    if not (cur and cur.get("active")):
-                        _tga["download"] = {
-                            "active": True, "job_id": None, "name": nxt.get("title") or nxt.get("name") or "",
-                            "size": 0, "received": 0, "state": "preparing", "error": "",
-                        }
-                        break
-                await asyncio.sleep(0.4)
-            cap = tga_daily_cap()
-            if _tga_count_today() >= cap:
-                with _tga_lock:
-                    nxt["status"] = "failed"
-                    nxt["error"] = f"今天已下载 {cap} 个，达到每日上限"
-                    if _tga["download"] and not _tga["download"].get("job_id"):
-                        _tga["download"]["active"] = False
-                        _tga["download"]["state"] = "idle"
-                    _tga_batch_persist()
-                continue
+            nxt = await asyncio.to_thread(_tga_q_claim_next)
+            if not nxt:
+                return
+            await _tga_q_run_item(nxt)
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("queue-worker", exc)
+    finally:
+        with _tga_lock:
+            _tga["queue_running"] = False
+        try:
+            if await asyncio.to_thread(_tga_q_has_queued):
+                _tga_queue_kick()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _tga_q_run_item(nxt: dict) -> None:
+    item_id = int(nxt["id"])
+    ref = nxt.get("chat_ref") or ""
+    msg_id = int(nxt["msg_id"])
+    target = nxt.get("target") or OPT_DEFAULT_TARGET
+    user_id = int(nxt.get("user_id") or 0)
+    while True:
+        with _tga_lock:
+            cur = _tga.get("download")
+            if not (cur and cur.get("active")):
+                _tga["download"] = {
+                    "active": True, "job_id": None,
+                    "name": nxt.get("title") or nxt.get("name") or "",
+                    "size": 0, "received": 0, "state": "preparing", "error": "",
+                }
+                break
+        await asyncio.sleep(0.4)
+    last_err = ""
+    try:
+        while True:
             try:
                 await _tga_throttle_async(wait_flood=True)
                 job_id, name, size = await _tga_prepare_job(user_id, ref, msg_id, target)
-                with _tga_lock:
-                    nxt["job_id"] = job_id
-                    nxt["name"] = name
-                    nxt["size"] = size
-                    _tga_batch_persist()
+                await asyncio.to_thread(
+                    _tga_q_update, item_id, job_id=job_id, name=name, size=size, status="downloading", error=""
+                )
                 await _tga_download_async(job_id, ref, msg_id)
                 job = _opt_load(job_id) or {}
-                with _tga_lock:
-                    if job.get("state") in ("queued", "running"):
-                        nxt["status"] = "optimizing"
-                        nxt["error"] = ""
-                    elif job.get("state") == "done":
-                        nxt["status"] = "done"
-                        nxt["progress"] = 100
-                    else:
-                        nxt["status"] = "failed"
-                        nxt["error"] = job.get("error") or ((_tga.get("download") or {}).get("error")) or "下载失败"
-                    _tga_batch_persist()
+                js = job.get("state")
+                if js in ("queued", "running"):
+                    await asyncio.to_thread(_tga_q_update, item_id, status="optimizing", error="", name=name, size=size)
+                    return
+                if js == "done":
+                    await asyncio.to_thread(_tga_q_update, item_id, status="done", progress=100, error="", name=name, size=size)
+                    return
+                last_err = job.get("error") or ((_tga.get("download") or {}).get("error")) or "下载失败"
+                if not _tga_q_retryable(last_err):
+                    await asyncio.to_thread(_tga_q_update, item_id, status="failed", error=(last_err or "下载失败")[:300])
+                    return
             except Exception as exc:  # noqa: BLE001
                 with _tga_lock:
                     if _tga["download"] and not _tga["download"].get("job_id"):
                         _tga["download"]["active"] = False
                         _tga["download"]["state"] = "idle"
-                    if isinstance(exc, HTTPException):
-                        msg_txt = str(exc.detail)
-                    else:
-                        _tga_log("batch", exc)
-                        msg_txt = f"下载失败（{type(exc).__name__}）"
-                    nxt["status"] = "failed"
-                    nxt["error"] = (msg_txt or "下载失败")[:300]
-                    _tga_batch_persist()
-    except Exception as exc:  # noqa: BLE001
-        _tga_log("batch-worker", exc)
+                if isinstance(exc, HTTPException) and "限流" in str(exc.detail):
+                    # FloodWait raised by prepare: sleep then retry without consuming a retry slot
+                    left = int(_tga["flood_until"] - time.time())
+                    if left < 1:
+                        left = int(getattr(getattr(exc, "detail", None), "seconds", 0) or 5)
+                    await asyncio.to_thread(
+                        _tga_q_update, item_id, status="downloading",
+                        error=f"Telegram 限流，{left} 秒后自动继续",
+                    )
+                    await asyncio.sleep(max(1, left) + 1)
+                    continue
+                if isinstance(exc, HTTPException):
+                    last_err = str(exc.detail)
+                else:
+                    _tga_log("queue-item", exc)
+                    last_err = f"下载失败（{type(exc).__name__}）"
+                if not _tga_q_retryable(last_err):
+                    await asyncio.to_thread(_tga_q_update, item_id, status="failed", error=(last_err or "下载失败")[:300])
+                    return
+            row = await asyncio.to_thread(_tga_q_update, item_id) or nxt
+            used = int((row or {}).get("retries") or 0)
+            if used >= TGA_Q_RETRY_MAX:
+                await asyncio.to_thread(
+                    _tga_q_update, item_id, status="failed",
+                    error=((last_err or "下载失败") + f"（已重试 {used} 次）")[:300],
+                )
+                return
+            used += 1
+            delay = TGA_Q_RETRY_BACKOFF[min(used - 1, len(TGA_Q_RETRY_BACKOFF) - 1)]
+            await asyncio.to_thread(
+                _tga_q_update, item_id, retries=used, status="downloading",
+                error=f"将在 {delay} 秒后重试（第 {used}/{TGA_Q_RETRY_MAX} 次）",
+            )
+            await asyncio.sleep(delay)
+            nxt = row or nxt
+    finally:
         with _tga_lock:
-            batch = _tga.get("batch") or _tga_batch_empty()
-            for it in batch.get("items") or []:
-                if (it or {}).get("status") in ("queued", "downloading"):
-                    it["status"] = "failed"
-                    it["error"] = it.get("error") or "批量任务中断"
-            batch["active"] = False
-            _tga["batch"] = batch
-            _tga_batch_persist()
+            if _tga["download"] and _tga["download"].get("active"):
+                # only release if this item still owns the slot and is not mid-transfer
+                if not _tga["download"].get("job_id") or _tga["download"].get("state") in ("done", "failed", "cancelled", "idle"):
+                    _tga["download"]["active"] = False
 
 
-@app.post("/admin/tg-audio/batch")
-async def tga_batch_ep(request: Request, db: Session = Depends(get_db)):
-    _opt_csrf(request)
-    user = _tga_admin(request, db)
-    data = await _tga_json(request)
-    ref = _tga_chat_ref(str(data.get("chat") or ""))
-    target = str(data.get("target") or OPT_DEFAULT_TARGET)
-    if target not in OPT_TARGETS:
-        target = OPT_DEFAULT_TARGET
-    raw_items = data.get("items") if isinstance(data.get("items"), list) else []
+def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
+    """Append items to the persistent queue and start the worker if needed. Never rejects for a daily cap."""
     parsed = []
-    seen = set()
-    for raw in raw_items[:100]:
+    seen: set[int] = set()
+    for raw in (raw_items or [])[:200]:
         if not isinstance(raw, dict):
             continue
         try:
@@ -10258,14 +10384,6 @@ async def tga_batch_ep(request: Request, db: Session = Depends(get_db)):
         })
     if not parsed:
         raise HTTPException(status_code=400, detail="请先勾选要下载的音频")
-    await asyncio.to_thread(_tga_need_login)
-    _tga_check_flood()
-    with _tga_lock:
-        if _tga_batch_busy():
-            raise HTTPException(status_code=429, detail="已有批量任务在进行中，请等它完成或先取消剩余排队")
-        cur = _tga["download"]
-        if cur and cur.get("active"):
-            raise HTTPException(status_code=429, detail="已有一个下载在进行中，请等它完成后再开始批量")
 
     def _marks():
         try:
@@ -10273,6 +10391,7 @@ async def tga_batch_ep(request: Request, db: Session = Depends(get_db)):
         except Exception as exc:  # noqa: BLE001
             _tga_log("sync-marks", exc)
         chat_id = None
+        chat_title = ""
         if ref.startswith("id:"):
             try:
                 chat_id = int(ref[3:])
@@ -10282,71 +10401,105 @@ async def tga_batch_ep(request: Request, db: Session = Depends(get_db)):
             async def resolve():
                 cl = await _tga_client_async()
                 ent = await _tga_entity(cl, ref)
-                return int(ent.id)
+                pub = _tga_chat_public(ent)
+                return int(ent.id), pub.get("title") or ""
             _tga_throttle()
-            chat_id = _tga_run(resolve(), 40)
-        return tga_done_map(chat_id), chat_id
+            chat_id, chat_title = _tga_run(resolve(), 40)
+        else:
+            try:
+                rec = [r for r in tga_recent_load() if int(r.get("id") or 0) == chat_id]
+                if rec:
+                    chat_title = rec[0].get("title") or ""
+            except Exception:  # noqa: BLE001
+                pass
+        return tga_done_map(chat_id), chat_id, chat_title
 
-    done_map, chat_id = await asyncio.to_thread(_marks)
-    skipped, queued, capped_n = [], [], 0
-    remain = max(0, tga_daily_cap() - _tga_count_today())
-    if remain <= 0:
-        raise HTTPException(status_code=429, detail=f"今天已下载 {tga_daily_cap()} 个，达到每日上限（可在配置里调整）")
-    for it in parsed:
-        mark = done_map.get(it["msg_id"]) or {}
-        already = bool(mark.get("downloaded") or mark.get("track_id"))
-        if already and not it["force"]:
-            skipped.append(it)
-            continue
-        if len(queued) >= remain:
-            capped_n += 1
-            continue
-        queued.append({
-            "msg_id": it["msg_id"],
-            "title": it["title"],
-            "name": it["title"],
-            "force": it["force"],
-            "job_id": None,
-            "size": 0,
-            "received": 0,
-            "progress": 0,
-            "status": "queued",
-            "error": "",
-            "chat_id": chat_id,
-        })
+    done_map, chat_id, chat_title = _marks()
+    skipped, already, queued_n, revived_n = [], [], 0, 0
+    db = SessionLocal()
+    try:
+        open_rows = db.scalars(
+            select(TgAudioQueueItem).where(
+                TgAudioQueueItem.chat_id == chat_id,
+                TgAudioQueueItem.msg_id.in_([it["msg_id"] for it in parsed]),
+                TgAudioQueueItem.status.in_(list(TGA_Q_ACTIVE) + ["failed"]),
+            )
+        ).all()
+        by_msg = {}
+        for row in open_rows:
+            prev = by_msg.get(row.msg_id)
+            if prev is None or (prev.status == "failed" and row.status in TGA_Q_ACTIVE):
+                by_msg[row.msg_id] = row
+        now = datetime.now(timezone.utc)
+        for it in parsed:
+            mark = done_map.get(it["msg_id"]) or {}
+            was_done = bool(mark.get("downloaded") or mark.get("track_id"))
+            if was_done and not it["force"]:
+                skipped.append(it)
+                continue
+            existing = by_msg.get(it["msg_id"])
+            if existing and existing.status in TGA_Q_ACTIVE:
+                already.append(it)
+                continue
+            if existing and existing.status == "failed":
+                existing.status = "queued"
+                existing.error = ""
+                existing.retries = 0
+                existing.progress = 0
+                existing.force = bool(it["force"])
+                existing.target = target
+                existing.user_id = user_id
+                existing.chat_ref = ref
+                existing.title = it["title"] or existing.title
+                existing.updated_at = now
+                revived_n += 1
+                queued_n += 1
+                continue
+            db.add(TgAudioQueueItem(
+                chat_ref=ref, chat_id=chat_id, chat_title=chat_title or "",
+                msg_id=it["msg_id"], title=it["title"], name=it["title"],
+                force=bool(it["force"]), target=target, user_id=user_id,
+                status="queued", error="", created_at=now, updated_at=now,
+            ))
+            queued_n += 1
+        db.commit()
+    finally:
+        db.close()
     parts = []
-    if queued:
-        parts.append(f"已加入 {len(queued)} 首到下载队列")
+    if queued_n:
+        parts.append(f"已加入 {queued_n} 首到下载队列，将在后台依次下载并优化")
+    if already:
+        parts.append(f"跳过 {len(already)} 首已在队列中")
     if skipped:
         parts.append(f"跳过 {len(skipped)} 首已下载/已导入（如需重新下载请单独勾选）")
-    if capped_n:
-        parts.append(f"另有 {capped_n} 首因今日额度已满未加入（今日剩余 {remain} / {tga_daily_cap()}）")
     message = "；".join(parts) + "。" if parts else ""
-    if not queued:
+    if not queued_n:
         raise HTTPException(status_code=400, detail=message or "没有可加入队列的条目")
-    batch = {
-        "items": queued,
-        "active": True,
-        "cancel": False,
-        "message": message,
-        "chat": ref,
-        "chat_title": "",
-        "chat_id": chat_id,
-    }
-    with _tga_lock:
-        if _tga_batch_busy() or (_tga["download"] and _tga["download"].get("active")):
-            raise HTTPException(status_code=429, detail="已有下载在进行中，请稍后再试")
-        _tga["batch"] = batch
-        _tga_batch_persist()
-    asyncio.run_coroutine_threadsafe(_tga_batch_worker(user.id, ref, target), _tga_loop())
+    _tga_queue_kick()
+    status = tga_status()
     return {
-        "ok": True,
-        "queued": len(queued),
+        "queued": queued_n,
         "skipped": len(skipped),
-        "capped": capped_n,
+        "already": len(already),
+        "capped": 0,
         "message": message,
-        **tga_status(),
+        **status,
     }
+
+
+@app.post("/admin/tg-audio/batch")
+async def tga_batch_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    user = _tga_admin(request, db)
+    data = await _tga_json(request)
+    ref = _tga_chat_ref(str(data.get("chat") or ""))
+    target = str(data.get("target") or OPT_DEFAULT_TARGET)
+    if target not in OPT_TARGETS:
+        target = OPT_DEFAULT_TARGET
+    raw_items = data.get("items") if isinstance(data.get("items"), list) else []
+    await asyncio.to_thread(_tga_need_login)
+    result = await asyncio.to_thread(_tga_enqueue, user.id, ref, raw_items, target)
+    return {"ok": True, **result}
 
 
 @app.post("/admin/tg-audio/batch/cancel")
@@ -10354,47 +10507,154 @@ async def tga_batch_cancel_ep(request: Request, db: Session = Depends(get_db)):
     _opt_csrf(request)
     _tga_admin(request, db)
     n = 0
-    with _tga_lock:
-        batch = _tga.get("batch") or _tga_batch_empty()
-        for it in batch.get("items") or []:
-            if (it or {}).get("status") == "queued":
-                it["status"] = "cancelled"
-                it["error"] = "已取消"
-                n += 1
-        batch["cancel"] = True
-        if n == 0 and not any((it or {}).get("status") == "downloading" for it in (batch.get("items") or [])):
-            batch["active"] = False
-            batch["cancel"] = False
-        batch["message"] = f"已取消 {n} 首排队中的条目" + ("（当前正在下载的会继续完成）" if any(
-            (it or {}).get("status") == "downloading" for it in (batch.get("items") or [])) else "")
-        _tga["batch"] = batch
-        _tga_batch_persist()
-    return {"ok": True, "cancelled": n, "message": batch["message"], **tga_status()}
+    session = SessionLocal()
+    try:
+        rows = session.scalars(select(TgAudioQueueItem).where(TgAudioQueueItem.status == "queued")).all()
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            row.status = "cancelled"
+            row.error = "已取消"
+            row.updated_at = now
+            n += 1
+        session.commit()
+    finally:
+        session.close()
+    msg = f"已取消 {n} 首排队中的条目" + ("（当前正在下载或优化的会继续完成）" if n or True else "")
+    if n == 0:
+        msg = "没有等待中的条目可取消。"
+    else:
+        msg = f"已取消 {n} 首排队中的条目（当前正在下载或优化的会继续完成）"
+    return {"ok": True, "cancelled": n, "message": msg, **tga_status()}
+
+
+@app.post("/admin/tg-audio/queue/retry")
+async def tga_queue_retry_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    _tga_admin(request, db)
+    n = 0
+    session = SessionLocal()
+    try:
+        rows = session.scalars(select(TgAudioQueueItem).where(TgAudioQueueItem.status == "failed")).all()
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            row.status = "queued"
+            row.error = ""
+            row.retries = 0
+            row.progress = 0
+            row.updated_at = now
+            n += 1
+        session.commit()
+    finally:
+        session.close()
+    if n:
+        _tga_queue_kick()
+    msg = f"已将 {n} 首失败条目重新加入队列。" if n else "没有失败的条目可重试。"
+    return {"ok": True, "retried": n, "message": msg, **tga_status()}
+
+
+@app.post("/admin/tg-audio/queue/clear-done")
+async def tga_queue_clear_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    _tga_admin(request, db)
+    session = SessionLocal()
+    try:
+        rows = session.scalars(
+            select(TgAudioQueueItem).where(TgAudioQueueItem.status.in_(("done", "cancelled")))
+        ).all()
+        n = len(rows)
+        for row in rows:
+            session.delete(row)
+        session.commit()
+    finally:
+        session.close()
+    msg = f"已移除 {n} 首已完成/已取消的条目。" if n else "没有已完成的条目可移除。"
+    return {"ok": True, "removed": n, "message": msg, **tga_status()}
 
 
 def tga_start() -> None:
-    """After a restart, any Telegram download that was in flight is marked failed (re-download to retry)."""
+    """Recover the persistent TG import queue after a restart and resume work."""
     for job in _opt_all_jobs():
         if job.get("state") == "downloading":
-            _opt_update(job["id"], state="failed", stage="失败", error="服务重启，Telegram 下载中断，请重新下载",
+            _opt_update(job["id"], state="failed", stage="失败",
+                        error="服务重启，Telegram 下载中断，将自动重新排队",
                         finished=time.time())
+    # Import leftover JSON queue (pre-DB) once.
     try:
         raw = json.loads(TGA_BATCH_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = {}
     if isinstance(raw, dict) and raw.get("items"):
-        for it in raw.get("items") or []:
-            if isinstance(it, dict) and it.get("status") in ("queued", "downloading"):
-                it["status"] = "failed"
-                it["error"] = "服务重启，批量任务中断，请重新排队"
-        raw["active"] = False
-        raw["cancel"] = False
-        _tga["batch"] = raw
-        _tga_batch_persist()
+        db = SessionLocal()
+        try:
+            existing = {
+                (r.chat_id, r.msg_id, r.status)
+                for r in db.scalars(select(TgAudioQueueItem)).all()
+            }
+            now = datetime.now(timezone.utc)
+            chat_ref = raw.get("chat") or ""
+            chat_id = raw.get("chat_id")
+            chat_title = raw.get("chat_title") or ""
+            for it in raw.get("items") or []:
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    mid = int(it.get("msg_id") or 0)
+                except (TypeError, ValueError):
+                    mid = 0
+                if mid <= 0:
+                    continue
+                st = it.get("status") or "queued"
+                if st in ("downloading", "queued"):
+                    st = "queued"
+                cid = it.get("chat_id") if it.get("chat_id") is not None else chat_id
+                if any((cid, mid, s) in existing for s in TGA_Q_ACTIVE):
+                    continue
+                db.add(TgAudioQueueItem(
+                    chat_ref=it.get("chat_ref") or chat_ref,
+                    chat_id=cid, chat_title=chat_title,
+                    msg_id=mid, title=str(it.get("title") or "")[:200],
+                    name=str(it.get("name") or it.get("title") or "")[:255],
+                    force=bool(it.get("force")), target=it.get("target") or OPT_DEFAULT_TARGET,
+                    user_id=int(it.get("user_id") or 0), job_id=it.get("job_id"),
+                    size=int(it.get("size") or 0), received=int(it.get("received") or 0),
+                    progress=int(it.get("progress") or 0), status=st,
+                    error="" if st != "failed" else (it.get("error") or "")[:300],
+                    created_at=now, updated_at=now,
+                ))
+            db.commit()
+        except Exception:  # noqa: BLE001
+            logging.exception("migrate tga_batch.json into tga_queue")
+            db.rollback()
+        finally:
+            db.close()
+        try:
+            TGA_BATCH_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    # Reset in-flight downloads so the worker will retry them.
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        for item in db.scalars(select(TgAudioQueueItem).where(TgAudioQueueItem.status == "downloading")).all():
+            item.status = "queued"
+            item.error = "服务重启，已重新排队"
+            item.job_id = None
+            item.progress = 0
+            item.received = 0
+            item.updated_at = now
+        # Leave optimizing rows in place; opt_start_worker already re-queued ffmpeg jobs.
+        db.commit()
+        has_work = bool(db.scalar(
+            select(TgAudioQueueItem.id).where(TgAudioQueueItem.status == "queued").limit(1)
+        ))
+    finally:
+        db.close()
     try:
         tga_sync_marks_from_jobs()
     except Exception:  # noqa: BLE001
         pass
+    if has_work:
+        _tga_queue_kick()
 
 
 @app.get("/uploads/{filename}")
