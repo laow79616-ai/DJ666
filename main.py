@@ -2722,9 +2722,89 @@ def tg_gamble_hit(ctx_data: dict, raw: str) -> Optional[tuple[list, int]]:
     return hits, score
 
 
+# Promo fragments the user asked to strip (not whole-post ignore):
+# 1) #网友投稿 hashtag and its t.me ?q= search links (encoded or decoded)
+# 2) t.me/tx188 (and telegram.me / @tx188) in all common URL shapes, plus HTML anchors.
+_TG_WANGYOU_ENC = r"%E7%BD%91%E5%8F%8B%E6%8A%95%E7%A8%BF"
+_TG_WANGYOU_Q = r"(?:%23|#)(?:网友投稿|" + _TG_WANGYOU_ENC + r")"
+_TG_WANGYOU_LINK_RE = re.compile(
+    r"(?i)(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.me)/[^\s<>'\"?#]+"
+    r"\?q=" + _TG_WANGYOU_Q + r"(?:&[^\s<>'\"]*)?"
+    r"|(?:[?&]q=" + _TG_WANGYOU_Q + r"(?:&[^\s<>'\"]*)?)"
+    r"|" + _TG_WANGYOU_ENC
+)
+_TG_WANGYOU_TAG_RE = re.compile(r"#网友投稿(?:\s*[：:]\s*)?")
+_TG_TX188_RE = re.compile(
+    r"(?i)(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.me)/(?:s/)?tx188(?:/\d+)?/?(?:[?#][^\s<>'\"]*)?"
+    r"|(?<![A-Za-z0-9_])@tx188(?![A-Za-z0-9_])"
+)
+_TG_ANCHOR_RE = re.compile(r"(?is)<a\b([^>]*)>(.*?)</a>")
+_TG_HREF_RE = re.compile(r"""(?is)\bhref\s*=\s*['"]([^'"]+)['"]""")
+
+
+def _tg_is_wangyou_or_tx188(value: str) -> bool:
+    s = value or ""
+    if not s:
+        return False
+    if _TG_WANGYOU_LINK_RE.search(s) or _TG_WANGYOU_TAG_RE.search(s) or _TG_TX188_RE.search(s):
+        return True
+    return bool(re.search(r"(?i)(?:t(?:elegram)?\.me)/tx188\b|#网友投稿|" + _TG_WANGYOU_ENC, s))
+
+
+def _tg_drop_matching_anchors(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        attrs, inner = m.group(1) or "", m.group(2) or ""
+        href_m = _TG_HREF_RE.search(attrs)
+        href = href_m.group(1) if href_m else ""
+        if _tg_is_wangyou_or_tx188(href) or _tg_is_wangyou_or_tx188(inner):
+            return " "
+        return m.group(0)
+    return _TG_ANCHOR_RE.sub(repl, text or "")
+
+
+def tidy_stripped_text(text: str) -> str:
+    """Collapse leftover blank lines and dangling separators after a promo strip."""
+    lines: list[str] = []
+    for line in (text or "").split("\n"):
+        work = re.sub(r"[ \t\u00a0]{2,}", " ", line).strip()
+        work = re.sub(r"^[：:|·•\-—]+\s*", "", work)
+        work = work.rstrip(" \t,，、;；:：|·•-—")
+        lines.append(work)
+    txt = "\n".join(lines)
+    txt = re.sub(r"[ \t\u00a0]+\n", "\n", txt)
+    txt = re.sub(r"\n[ \t\u00a0]*(?=\n)", "\n", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+def strip_wangyou_tx188(text: str) -> str:
+    """Remove only #网友投稿 / tx188 promo fragments; keep the rest of the post."""
+    s = _tg_drop_matching_anchors(text or "")
+    s = _TG_WANGYOU_LINK_RE.sub(" ", s)
+    s = _TG_WANGYOU_TAG_RE.sub(" ", s)
+    s = _TG_TX188_RE.sub(" ", s)
+    return tidy_stripped_text(s)
+
+
+def strip_wangyou_tx188_links(items: list[dict]) -> list[dict]:
+    """Drop or clean structured announcement links that only point at these targets."""
+    out: list[dict] = []
+    for item in items or []:
+        url = (item.get("url") or "").strip()
+        label = (item.get("text") or "").strip()
+        if _tg_is_wangyou_or_tx188(url):
+            continue
+        new_label = strip_wangyou_tx188(label) if label else label
+        if not new_label and _tg_is_wangyou_or_tx188(label):
+            continue
+        rest = {k: v for k, v in item.items() if k not in ("text", "url")}
+        out.append({"text": new_label or label, "url": url, **rest})
+    return out
+
+
 def tg_strip_text(ctx_data: dict, raw: str) -> tuple[str, list[TgFilterRule]]:
     hits: dict[int, TgFilterRule] = {}
     out: list[str] = []
+    raw = strip_wangyou_tx188(raw or "")
     for line in (raw or "").split("\n"):
         work = line
         matched = False
@@ -2739,10 +2819,7 @@ def tg_strip_text(ctx_data: dict, raw: str) -> tuple[str, list[TgFilterRule]]:
         if tg_promo_residue(work):
             continue
         out.append(re.sub(r"[ \t]{2,}", " ", work).strip().rstrip(" \t,，、;；:：|-—➡️➞→👉"))
-    txt = "\n".join(out)
-    txt = re.sub(r"[ \t\u00a0]+\n", "\n", txt)
-    txt = re.sub(r"\n[ \t\u00a0]*(?=\n)", "\n", txt)
-    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    txt = tidy_stripped_text("\n".join(out))
     return txt, list(hits.values())
 
 
@@ -3118,6 +3195,108 @@ def seed_tg_filter_rules_v3(db: Session) -> None:
     seed_tg_offender_phash(db)
 
 
+
+DEFAULT_TG_STRIP_RULES_V4 = (
+    ("strip", "?q=%23%E7%BD%91%E5%8F%8B%E6%8A%95%E7%A8%BF", "网友投稿话题链接"),
+    ("strip", "#网友投稿", "网友投稿话题标签"),
+    ("strip", "https://t.me/tx188", "投稿联系 tx188"),
+)
+
+
+def backfill_wangyou_tx188(db: Session) -> dict:
+    """Strip #网友投稿 / tx188 fragments from published announcements and pending posts.
+
+    Does not delete, hide, or change media / engagement fields.
+    """
+    ann_ids: list[int] = []
+    pending_ids: list[int] = []
+    for ann in db.scalars(select(Announcement).order_by(Announcement.id)).all():
+        changed = False
+        original = ann.content or ""
+        if _tg_is_wangyou_or_tx188(original):
+            new_content = strip_wangyou_tx188(original)
+            if new_content != original:
+                ann.content = new_content
+                changed = True
+        if ann.links_json:
+            old_links = ann_links(ann)
+            new_links = strip_wangyou_tx188_links(old_links)
+            if new_links != old_links:
+                ann.links_json = dump_links(new_links)
+                changed = True
+        if changed:
+            ann_ids.append(ann.id)
+    for post in db.scalars(select(TgPost).where(TgPost.status == TG_STATUS_NEW).order_by(TgPost.id)).all():
+        pchanged = False
+        original = post.text or ""
+        if _TG_WANGYOU_LINK_RE.search(original) or _TG_WANGYOU_TAG_RE.search(original) or _TG_TX188_RE.search(original) or _tg_is_wangyou_or_tx188(original):
+            new_text = strip_wangyou_tx188(original)
+            if new_text != original:
+                post.text = new_text
+                pchanged = True
+        if getattr(post, "edit_links_json", None):
+            old_links = ann_links(post_links_obj(post))
+            new_links = strip_wangyou_tx188_links(old_links)
+            if new_links != old_links:
+                post.edit_links_json = dump_links(new_links)
+                pchanged = True
+        if pchanged:
+            pending_ids.append(post.id)
+    if ann_ids or pending_ids:
+        db.commit()
+    logging.info("wangyou/tx188 backfill announcements=%s pending=%s", len(ann_ids), len(pending_ids))
+    return {"announcements": ann_ids, "pending": pending_ids}
+
+
+def seed_tg_filter_rules_v4(db: Session) -> None:
+    """Visible strip rules for #网友投稿 search links and t.me/tx188; backfill published posts once."""
+    if get_setting(db, "tg_filter_seeded_v4", "") == "1":
+        return
+    # User may have added the same strings as manual *block* rules; convert those to strip
+    # so they do not ignore the whole post, and they show under 「去除推广语」.
+    targets = {tg_norm(p) for _, p, _ in DEFAULT_TG_STRIP_RULES_V4}
+    for rule in db.scalars(select(TgFilterRule)).all():
+        if not (rule.pattern or "").strip():
+            continue
+        if tg_norm(rule.pattern) in targets and rule.mode == "block":
+            rule.mode = "strip"
+            if rule.source == "manual":
+                rule.source = "seed"
+            if not (rule.label or "").strip():
+                for _m, pat, lab in DEFAULT_TG_STRIP_RULES_V4:
+                    if tg_norm(pat) == tg_norm(rule.pattern):
+                        rule.label = lab
+                        break
+    db.commit()
+    taken = {(r.mode, tg_norm(r.pattern)) for r in db.scalars(select(TgFilterRule)).all()}
+    for mode, pattern, label in DEFAULT_TG_STRIP_RULES_V4:
+        key = (mode, tg_norm(pattern))
+        if key[1] and key not in taken:
+            db.add(TgFilterRule(mode=mode, pattern=pattern, label=label, source="seed"))
+            taken.add(key)
+        else:
+            # If already present as strip, ensure a visible label.
+            for row in db.scalars(select(TgFilterRule).where(TgFilterRule.mode == "strip")).all():
+                if tg_norm(row.pattern) == key[1] and not (row.label or "").strip():
+                    row.label = label
+                    if row.source == "manual":
+                        row.source = "seed"
+    db.commit()
+    try:
+        result = backfill_wangyou_tx188(db)
+        try:
+            (DATA_DIR / "wangyou_tx188_backfill.json").write_text(
+                json.dumps(result, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            logging.exception("could not write backfill report")
+    except Exception:  # noqa: BLE001
+        logging.exception("wangyou/tx188 backfill failed")
+        db.rollback()
+    set_setting(db, "tg_filter_seeded_v4", "1")
+    db.commit()
+
+
 def seed_tg_offender_phash(db: Session) -> None:
     """Add perceptual hashes of known offending post images (not user screenshots)."""
     if get_setting(db, "tg_filter_phash_offenders", "") == "1":
@@ -3486,6 +3665,7 @@ def init_db() -> None:
         seed_tg_filter_rules(db)
         seed_tg_filter_rules_v2(db)
         seed_tg_filter_rules_v3(db)
+        seed_tg_filter_rules_v4(db)
         try:
             apply_tg_filters(db)
         except Exception:  # noqa: BLE001
