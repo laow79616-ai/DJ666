@@ -25,6 +25,7 @@
     var audio = new Audio();
     audio.preload = "metadata";
     audio.playsInline = true;
+    audio.crossOrigin = "anonymous";
     return {
       id: id,
       audio: audio,

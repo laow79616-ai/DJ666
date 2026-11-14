@@ -33,8 +33,9 @@
   function sameSrc(a, b) {
     try { return new URL(a, location.href).pathname === new URL(b, location.href).pathname; } catch (e) { return a === b; }
   }
-  // The player bar is hidden by default; only the float menu's 「音乐」 shows it.
-  // Hiding the bar never stops playback.
+  // The player bar is hidden until a track is played (or the user opens it).
+  // Closing the bar still stops playback. Navigating via the float menu must
+  // not hide a bar that is already playing.
   var barWanted = false;
   var fabBtn = document.getElementById("fabBtn");
   function syncPlayerH() {
@@ -175,7 +176,7 @@
     save(true);
   }
   function playQueue(items, index) {
-    st.queue = items; load(index, true, 0);
+    st.queue = items; load(index, true, 0); setBar(true);
   }
   function step(dir, auto) {
     if (!st.queue.length) return;
@@ -379,7 +380,7 @@
     var els = Array.prototype.slice.call(list.querySelectorAll(".track-item[data-src]:not([hidden])"));
     var t = cur();
     if (t && sameSrc(item.dataset.src, t.src)) {  // same track: toggle
-      if (audio.paused) audio.play().catch(function () {}); else audio.pause();
+      if (audio.paused) { audio.play().catch(function () {}); setBar(true); } else audio.pause();
       return;
     }
     playQueue(listItems(list), els.indexOf(item));
@@ -420,6 +421,7 @@
   audio.muted = !!st.muted;
   if (st.queue.length && st.index >= 0) {
     load(st.index, !!st.playing, st.time || 0);
+    setBar(true);
   } else {
     render();
   }
@@ -544,7 +546,7 @@
     fabMenu.addEventListener("click", function (e) {
       var a = e.target.closest("a[data-fab]");
       if (!a) return;
-      setBar(a.dataset.fab === "music");
+      if (a.dataset.fab === "music") setBar(true);
       fabOpen(false);
       if (new URL(a.href, location.href).pathname === location.pathname) e.preventDefault();  // already here
     });

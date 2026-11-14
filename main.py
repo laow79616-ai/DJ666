@@ -3551,7 +3551,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="DJ666", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="DJ666", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -5437,7 +5437,92 @@ def api_chat(request: Request, db: Session = Depends(get_db)):
     return JSONResponse({"messages": items})
 
 
+
+def _looks_like_ip(value: str) -> bool:
+    v = (value or "").strip()
+    if not v or v in (".", "?") or len(v) > 64:
+        return False
+    try:
+        import ipaddress
+        ipaddress.ip_address(v)
+        return True
+    except ValueError:
+        return False
+
+
+def client_ip(request: Request) -> str:
+    """Client IP as seen by the app behind local nginx + Cloudflare.
+
+    Forwarded headers are trusted only when the peer is localhost (uvicorn
+    binds 127.0.0.1 and nginx sits in front). Prefer CF-Connecting-IP;
+    fall back to the first X-Forwarded-For hop only if it is a valid IP.
+    """
+    peer = (request.client.host if request.client else "") or ""
+    trusted_peer = peer in ("127.0.0.1", "::1") or peer.startswith("127.")
+    if trusted_peer:
+        cf = (request.headers.get("cf-connecting-ip") or "").strip()
+        if _looks_like_ip(cf):
+            return cf[:64]
+        xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if _looks_like_ip(xff):
+            return xff[:64]
+    return (peer or "?").strip()[:64] or "?"
+
+
+def admin_ip_allowed(request: Request) -> bool:
+    """Optional allowlist from ADMIN_IP_ALLOWLIST (comma-separated). Empty = disabled."""
+    raw = (os.environ.get("ADMIN_IP_ALLOWLIST") or "").strip()
+    if not raw:
+        return True
+    allowed = {part.strip() for part in raw.split(",") if part.strip()}
+    return client_ip(request) in allowed
+
+
+# Failed admin-login limiter: 5 failures in 15 minutes -> 20 minute lockout, per IP.
+ADMIN_LOGIN_FAIL_WINDOW = 15 * 60
+ADMIN_LOGIN_FAIL_MAX = 5
+ADMIN_LOGIN_LOCK_SECONDS = 20 * 60
+_admin_login_lock = threading.Lock()
+_admin_login_fails: dict[str, list[float]] = {}
+_admin_login_until: dict[str, float] = {}
+
+
+def admin_login_lock_remaining(ip: str) -> int:
+    now = time.time()
+    with _admin_login_lock:
+        until = _admin_login_until.get(ip) or 0
+        if until <= now:
+            _admin_login_until.pop(ip, None)
+            return 0
+        return int(until - now)
+
+
+def record_admin_login_failure(ip: str) -> int:
+    """Record a failed attempt and return remaining lockout seconds (0 if not locked)."""
+    now = time.time()
+    with _admin_login_lock:
+        until = _admin_login_until.get(ip) or 0
+        if until > now:
+            return int(until - now)
+        recent = [ts for ts in _admin_login_fails.get(ip, []) if now - ts <= ADMIN_LOGIN_FAIL_WINDOW]
+        recent.append(now)
+        _admin_login_fails[ip] = recent
+        if len(recent) >= ADMIN_LOGIN_FAIL_MAX:
+            _admin_login_until[ip] = now + ADMIN_LOGIN_LOCK_SECONDS
+            _admin_login_fails.pop(ip, None)
+            return ADMIN_LOGIN_LOCK_SECONDS
+        return 0
+
+
+def clear_admin_login_failures(ip: str) -> None:
+    with _admin_login_lock:
+        _admin_login_fails.pop(ip, None)
+        _admin_login_until.pop(ip, None)
+
+
 def require_admin(request: Request, db: Session) -> User:
+    if not admin_ip_allowed(request):
+        raise HTTPException(status_code=403, detail="禁止访问")
     user = current_user(request, db)
     if not user:
         raise HTTPException(status_code=303, headers={"Location": "/admin"})
@@ -5653,6 +5738,19 @@ def admin_login_submit(
 ):
     require_csrf(request, csrf_token)
     ident = (account or "").strip()
+    ip = client_ip(request)
+    if not admin_ip_allowed(request):
+        logging.warning("admin login blocked by allowlist ip=%s account=%s", ip, ident[:80])
+        return admin_login_form(request, db, error="禁止访问。", account=ident[:80])
+    locked = admin_login_lock_remaining(ip)
+    if locked > 0:
+        mins = max(1, (locked + 59) // 60)
+        logging.warning("admin login rejected, locked ip=%s remain=%ss account=%s", ip, locked, ident[:80])
+        return admin_login_form(
+            request, db,
+            error=f"尝试次数过多，请在 {mins} 分钟后再试。",
+            account=ident[:80],
+        )
     user = None
     if "@" in ident:
         user = db.scalar(select(User).where(User.email == ident.lower()))
@@ -5661,7 +5759,16 @@ def admin_login_submit(
     # Wrong password, unknown account, or a non-admin: stay on this form with a short error.
     # Do not flash (would leak onto frontend pages) and do not reveal whether the account is admin.
     if not user or not verify_password(password, user.password_hash) or not user.is_admin:
-        return admin_login_form(request, db, error="账号或密码不正确。", account=ident[:80])
+        remain = record_admin_login_failure(ip)
+        logging.warning("admin login failed ip=%s account=%s lock=%ss", ip, ident[:80], remain)
+        if remain > 0:
+            mins = max(1, (remain + 59) // 60)
+            err = f"尝试次数过多，请在 {mins} 分钟后再试。"
+        else:
+            err = "账号或密码不正确。"
+        return admin_login_form(request, db, error=err, account=ident[:80])
+    clear_admin_login_failures(ip)
+    logging.info("admin login ok ip=%s account=%s", ip, ident[:80])
     request.session["user_id"] = user.id
     return RedirectResponse("/admin", status_code=303)
 

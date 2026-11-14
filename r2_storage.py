@@ -176,3 +176,22 @@ def usage_bytes(prefix: str = "") -> Optional[int]:
     except Exception:  # noqa: BLE001
         log.exception("r2 usage listing failed")
         return None
+
+
+def put_cors(origins=None) -> None:
+    """Allow browser GET/HEAD of public objects from the site origins (needed for Web Audio / mixer)."""
+    origins = list(origins or ("https://www.dj666.pw", "https://dj666.pw"))
+    _client().put_bucket_cors(
+        Bucket=bucket(),
+        CORSConfiguration={
+            "CORSRules": [
+                {
+                    "AllowedOrigins": origins,
+                    "AllowedMethods": ["GET", "HEAD"],
+                    "AllowedHeaders": ["Range", "Content-Type", "Authorization", "*"],
+                    "ExposeHeaders": ["ETag", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"],
+                    "MaxAgeSeconds": 86400,
+                }
+            ]
+        },
+    )
