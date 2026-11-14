@@ -303,6 +303,7 @@ DEFAULT_CHAT_BLOCK_KEYWORDS = (
     "代充",
 )
 PASSWORD_MIN = 8
+ADMIN_PASSWORD_MIN = 12
 DEFAULT_ADMIN_EMAIL = "admin@dj666.pw"
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 USERNAME_RE = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9_]{2,20}$")
@@ -363,6 +364,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     username: Mapped[str] = mapped_column(String(20), unique=True, index=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    session_ver: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
@@ -821,6 +823,11 @@ def migrate_schema(db: Session) -> None:
     if "username" not in names:
         db.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(20)"))
         db.commit()
+    if "session_ver" not in names:
+        db.execute(text("ALTER TABLE users ADD COLUMN session_ver INTEGER DEFAULT 0"))
+        db.commit()
+    db.execute(text("UPDATE users SET session_ver = 0 WHERE session_ver IS NULL"))
+    db.commit()
     taken: set[str] = set()
     users = db.scalars(select(User).order_by(User.id)).all()
     changed = False
@@ -3720,11 +3727,41 @@ def require_csrf(request: Request, token: Optional[str]) -> None:
         raise HTTPException(status_code=400, detail="无效请求，请刷新页面后重试")
 
 
+def establish_session(request: Request, user: User) -> None:
+    """Mark this browser session as the current login for the user."""
+    request.session["user_id"] = user.id
+    request.session["session_ver"] = int(getattr(user, "session_ver", 0) or 0)
+
+
 def current_user(request: Request, db: Session) -> Optional[User]:
     uid = request.session.get("user_id")
     if not uid:
         return None
-    return db.get(User, int(uid))
+    try:
+        user = db.get(User, int(uid))
+    except (TypeError, ValueError):
+        return None
+    if not user:
+        return None
+    ver = int(getattr(user, "session_ver", 0) or 0)
+    sess_ver = request.session.get("session_ver")
+    if sess_ver is None:
+        # Pre-upgrade cookies: still valid only until the password is changed.
+        if ver != 0:
+            request.session.pop("user_id", None)
+            request.session.pop("session_ver", None)
+            return None
+        return user
+    try:
+        if int(sess_ver) != ver:
+            request.session.pop("user_id", None)
+            request.session.pop("session_ver", None)
+            return None
+    except (TypeError, ValueError):
+        request.session.pop("user_id", None)
+        request.session.pop("session_ver", None)
+        return None
+    return user
 
 
 def flash(request: Request, message: str, category: str = "info") -> None:
@@ -3985,7 +4022,7 @@ def register_submit(
     db.add(user)
     db.commit()
     db.refresh(user)
-    request.session["user_id"] = user.id
+    establish_session(request, user)
     flash(request, "注册成功，欢迎来到 DJ666！", "success")
     return RedirectResponse("/", status_code=303)
 
@@ -4018,7 +4055,7 @@ def login_submit(
     if not user or not verify_password(password, user.password_hash):
         flash(request, "账号或密码不正确。", "error")
         return RedirectResponse("/login", status_code=303)
-    request.session["user_id"] = user.id
+    establish_session(request, user)
     flash(request, "登录成功。", "success")
     return RedirectResponse(safe_next_path(next, user), status_code=303)
 
@@ -5769,7 +5806,7 @@ def admin_login_submit(
         return admin_login_form(request, db, error=err, account=ident[:80])
     clear_admin_login_failures(ip)
     logging.info("admin login ok ip=%s account=%s", ip, ident[:80])
-    request.session["user_id"] = user.id
+    establish_session(request, user)
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -7166,6 +7203,55 @@ def admin_flac_settings(request: Request, csrf_token: str = Form(""), quota_gb: 
         msg += f" 因超出配额或磁盘空间，已清理 {len(pruned)} 个未保留的旧 FLAC。"
     flash(request, msg, "success")
     return RedirectResponse("/admin#tracks", status_code=303)
+
+
+@app.post("/admin/password")
+def admin_change_password(
+    request: Request,
+    old_password: str = Form(""),
+    new_password: str = Form(""),
+    new_password2: str = Form(""),
+    csrf_token: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    require_csrf(request, csrf_token)
+    user = require_admin(request, db)
+    ip = client_ip(request)
+    locked = admin_login_lock_remaining(ip)
+    if locked > 0:
+        mins = max(1, (locked + 59) // 60)
+        logging.warning("admin password change rejected, locked ip=%s remain=%ss user_id=%s", ip, locked, user.id)
+        flash(request, f"尝试次数过多，请在 {mins} 分钟后再试。", "error")
+        return RedirectResponse("/admin#account", status_code=303)
+    if not verify_password(old_password, user.password_hash):
+        remain = record_admin_login_failure(ip)
+        logging.warning(
+            "admin password change failed, bad old password ip=%s user_id=%s lock=%ss",
+            ip, user.id, remain,
+        )
+        if remain > 0:
+            mins = max(1, (remain + 59) // 60)
+            flash(request, f"尝试次数过多，请在 {mins} 分钟后再试。", "error")
+        else:
+            flash(request, "旧密码不正确。", "error")
+        return RedirectResponse("/admin#account", status_code=303)
+    if new_password != new_password2:
+        flash(request, "两次输入的新密码不一致。", "error")
+        return RedirectResponse("/admin#account", status_code=303)
+    if len(new_password) < ADMIN_PASSWORD_MIN:
+        flash(request, f"新密码至少需要 {ADMIN_PASSWORD_MIN} 位。", "error")
+        return RedirectResponse("/admin#account", status_code=303)
+    if new_password == old_password or verify_password(new_password, user.password_hash):
+        flash(request, "新密码不能与当前密码相同。", "error")
+        return RedirectResponse("/admin#account", status_code=303)
+    user.password_hash = hash_password(new_password)
+    user.session_ver = int(getattr(user, "session_ver", 0) or 0) + 1
+    db.commit()
+    establish_session(request, user)
+    clear_admin_login_failures(ip)
+    logging.info("admin password changed user_id=%s ip=%s", user.id, ip)
+    flash(request, "密码已更新。其他后台登录已失效，当前会话仍保持登录。", "success")
+    return RedirectResponse("/admin#account", status_code=303)
 
 
 @app.get("/admin/r2/status")

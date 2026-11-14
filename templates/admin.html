@@ -74,6 +74,7 @@ a.admin-dj-entry {
     <a class="admin-tab" role="tab" href="#users" data-tab="users" aria-controls="users" aria-selected="false">用户</a>
     <a class="admin-tab" role="tab" href="#chat" data-tab="chat" aria-controls="chat" aria-selected="false">公屏</a>
     <a class="admin-tab" role="tab" href="#keywords" data-tab="keywords" aria-controls="keywords" aria-selected="false">关键词屏蔽</a>
+    <a class="admin-tab" role="tab" href="#account" data-tab="account" aria-controls="account" aria-selected="false">账号安全</a>
     <a class="admin-tab" role="tab" href="#backups" data-tab="backups" aria-controls="backups" aria-selected="false">备份记录</a>
   </div>
   <a class="btn btn-sm admin-dj-entry admin-tab admin-tab-dj" role="tab" href="#djmix" data-tab="djmix" aria-controls="djmix" aria-selected="false">🎚 DJ 混音</a>
@@ -1146,6 +1147,31 @@ a.admin-dj-entry {
           <button type="submit" class="btn btn-danger">清空拦截记录</button>
         </form>
       </div>
+    </div>
+  </div>
+</section>
+
+
+<section class="panel admin-pane" role="tabpanel" id="account">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>账号安全</h2>
+    </div>
+    <div class="admin-pane-body">
+      <p class="hint">在这里修改当前管理员的登录密码。新密码至少 12 位，不能与旧密码相同。修改成功后，其他已登录的后台会话会立即失效，本窗口保持登录。</p>
+      <form class="stack-form" action="/admin/password" method="post" autocomplete="off" style="max-width:420px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label>旧密码
+          <input type="password" name="old_password" required autocomplete="current-password">
+        </label>
+        <label>新密码
+          <input type="password" name="new_password" required minlength="12" autocomplete="new-password">
+        </label>
+        <label>确认新密码
+          <input type="password" name="new_password2" required minlength="12" autocomplete="new-password">
+        </label>
+        <button type="submit" class="btn">更新密码</button>
+      </form>
     </div>
   </div>
 </section>
