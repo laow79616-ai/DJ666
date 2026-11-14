@@ -34,8 +34,8 @@
     try { return new URL(a, location.href).pathname === new URL(b, location.href).pathname; } catch (e) { return a === b; }
   }
   // The player bar is hidden until a track is played (or the user opens it).
-  // Closing the bar still stops playback. Navigating via the float menu must
-  // not hide a bar that is already playing.
+  // Closing / collapsing the bar hides the UI only — playback continues.
+  // The green FAB toggles the bar when a track is loaded (long-press opens nav).
   var barWanted = false;
   var fabBtn = document.getElementById("fabBtn");
   function syncPlayerH() {
@@ -119,7 +119,15 @@
     syncChromeH(); markFab();
   }
   function markFab() {
-    if (fabBtn) fabBtn.classList.toggle("is-playing", !audio.paused && bar.hidden);
+    if (!fabBtn) return;
+    fabBtn.classList.toggle("is-playing", !audio.paused && bar.hidden);
+    if (cur()) {
+      fabBtn.setAttribute("aria-label", bar.hidden ? "展开播放器" : "收起播放器");
+      fabBtn.setAttribute("title", bar.hidden ? "展开播放器（长按打开导航）" : "收起播放器（长按打开导航）");
+    } else {
+      fabBtn.setAttribute("aria-label", "页面导航");
+      fabBtn.setAttribute("title", "页面导航");
+    }
   }
   window.addEventListener("resize", syncChromeH);
   syncChromeH();
@@ -396,9 +404,9 @@
     st.mode = MODES[(i + 1) % MODES.length][0]; render(); save(true);
   });
   btnClose.addEventListener("click", function () {
-    audio.pause(); audio.removeAttribute("src"); audio.load();
-    st = { queue: [], index: -1, time: 0, playing: false, volume: audio.volume, muted: audio.muted, mode: st.mode };
-    save(true); setBar(false); render();
+    // Hide the player UI only; do not pause or clear the queue.
+    setBar(false);
+    render();
   });
   audio.addEventListener("play", function () { st.playing = true; render(); save(true); });
   audio.addEventListener("pause", function () { if (!audio.ended) { st.playing = false; } render(); save(true); });
@@ -506,12 +514,26 @@
   if (fabNav) {
     loadFabPos();
     applyFabPos();
+    var fabLongTimer = null;
+    function clearFabLong() {
+      if (fabLongTimer) { clearTimeout(fabLongTimer); fabLongTimer = null; }
+    }
     fabBtn.addEventListener("pointerdown", function (e) {
       if (!fabBtn || e.button) return;
       e.stopPropagation();
       try { fabBtn.setPointerCapture(e.pointerId); } catch (err) {}
       var r = fabNav.getBoundingClientRect();
       fabDrag = { id: e.pointerId, x: e.clientX, y: e.clientY, sl: r.left, st: r.top, moved: false };
+      clearFabLong();
+      if (cur()) {
+        fabLongTimer = setTimeout(function () {
+          fabLongTimer = null;
+          if (fabDrag && !fabDrag.moved) {
+            fabOpen(true);
+            fabSuppressClick = true;
+          }
+        }, 480);
+      }
     });
     fabBtn.addEventListener("pointermove", function (e) {
       if (!fabDrag || e.pointerId !== fabDrag.id) return;
@@ -519,6 +541,7 @@
       if (!fabDrag.moved && Math.abs(dx) + Math.abs(dy) < FAB_DRAG_THRESHOLD) return;
       if (!fabDrag.moved) {
         fabDrag.moved = true;
+        clearFabLong();
         fabOpen(false);
         fabNav.classList.add("is-dragging");
       }
@@ -528,6 +551,7 @@
     });
     function endFabDrag(e) {
       if (!fabDrag || (e && e.pointerId !== fabDrag.id)) return;
+      clearFabLong();
       var wasDrag = fabDrag.moved;
       fabNav.classList.remove("is-dragging");
       fabDrag = null;
@@ -541,6 +565,11 @@
     fabBtn.addEventListener("click", function (e) {
       e.stopPropagation();
       if (fabSuppressClick) { fabSuppressClick = false; e.preventDefault(); return; }
+      if (cur()) {
+        fabOpen(false);
+        setBar(!!bar.hidden);
+        return;
+      }
       fabOpen(fabMenu.hidden);
     });
     fabMenu.addEventListener("click", function (e) {

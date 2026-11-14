@@ -79,7 +79,6 @@
     <div class="fab-menu" id="fabMenu" role="menu" hidden>
       <a href="/" data-fab="home" role="menuitem"{% if p == '/' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">⌂</span>首页</a>
       <a href="/music" data-fab="music" role="menuitem"{% if p == '/music' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">♪</span>音乐</a>
-      <a href="/dj" data-fab="dj" data-no-pjax role="menuitem"{% if p == '/dj' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">🎚</span>打碟</a>
       <a href="/chat" data-fab="chat" role="menuitem"{% if p == '/chat' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">💬</span>公屏</a>
     </div>
     <button type="button" class="fab-btn" id="fabBtn" aria-label="页面导航" aria-haspopup="menu" aria-expanded="false" aria-controls="fabMenu">
@@ -104,11 +103,11 @@
       <button type="button" class="player-btn" id="plMute" title="静音" aria-label="静音" aria-pressed="false">🔊</button>
     </div>
     <audio id="audio" controls preload="none"></audio>
-    <button type="button" class="player-btn player-close" id="plClose" title="关闭播放器" aria-label="关闭播放器">×</button>
+    <button type="button" class="player-btn player-close" id="plClose" title="收起播放器（继续播放）" aria-label="收起播放器">×</button>
   </div>
 
   <script src="/static/tg.js?v=1" defer></script>
-  <script src="/static/app.js?v=pbar1" defer></script>
+  <script src="/static/app.js?v=pclose1" defer></script>
   <script src="/static/ann_interact.js?v=tgc1" defer></script>
   <div id="pageScripts">{% block scripts %}{% endblock %}</div>
 </body>

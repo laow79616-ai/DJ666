@@ -4263,11 +4263,10 @@ def dj_mixer_ctx(db: Session, user=None) -> dict:
     return {"library": library, "opt_cfg": opt_cfg}
 
 
-@app.get("/dj", response_class=HTMLResponse)
-def dj_mixer_page(request: Request, db: Session = Depends(get_db)):
-    return templates.TemplateResponse(
-        request, "dj.html", ctx(request, db, nav="dj", **dj_mixer_ctx(db, current_user(request, db)))
-    )
+@app.get("/dj")
+def dj_mixer_page():
+    # Public simple DJ deck removed; the mixer remains on the admin DJ tab.
+    return RedirectResponse("/", status_code=302)
 
 
 @app.get("/chat", response_class=HTMLResponse)

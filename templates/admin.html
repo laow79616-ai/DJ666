@@ -1212,8 +1212,9 @@ a.admin-dj-entry {
     <div class="admin-pane-body">
       <link rel="stylesheet" href="/static/mixer.css?v=tgaq1">
       {% set mixer_embedded = True %}
-      {% set hide_mixer = True %}
+      {% set hide_mixer = False %}
       {% include "_mixer.html" %}
+      <script type="application/json" id="mixerLibrary">{{ library|tojson }}</script>
       {% if user and user.is_admin %}
       <section class="tga" id="tgaPanel" data-csrf="{{ csrf }}" aria-labelledby="tgaTitle">
         <header class="tga-head">
@@ -1309,7 +1310,6 @@ a.admin-dj-entry {
       <script src="/static/tg_audio.js?v=tgaq3" defer></script>
       <script src="/static/admin_backup.js?v=bak3" defer></script>
       {% endif %}
-      <p class="hint">本页只保留「上传优化」和 Telegram 音乐导入。前台 <a href="/dj" target="_blank" rel="noopener">/dj</a> 仍提供简易打碟台和录音。</p>
     </div>
   </div>
 </section>
@@ -1406,6 +1406,8 @@ a.admin-dj-entry {
 <script type="application/json" id="tgData">{{ tg_data|tojson }}</script>
 <script src="/static/admin_tg_status.js?v=tgtitle1" defer></script>
 <script src="/static/dj_optimize.js?v=r2stor1" defer></script>
+<script src="/static/dj_repeat.js?v=t108" defer></script>
+<script src="/static/mixer.js?v=pbar1" defer></script>
 <script src="/static/admin_ann.js?v=tgtitle1" defer></script>
 <script src="/static/admin_upload.js?v=cat1" defer></script>
 <script src="/static/admin_tracks.js?v=catfix1" defer></script>
