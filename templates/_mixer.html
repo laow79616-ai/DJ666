@@ -87,11 +87,11 @@
 </section>
 {% endif %}
 
-<section class="djopt" id="djopt" data-csrf="{{ csrf }}" data-logged-in="{{ 1 if user else 0 }}" data-admin="{{ 1 if user and user.is_admin else 0 }}" data-max-mb="{{ opt_cfg.maxMB }}" data-max-hours="{{ opt_cfg.maxHours }}">
+<section class="djopt" id="djopt" data-csrf="{{ csrf }}" data-logged-in="{{ 1 if user else 0 }}" data-admin="{{ 1 if user and user.is_admin else 0 }}" data-keep-flac="{{ 1 if opt_cfg.keepFlacDefault else 0 }}" data-max-mb="{{ opt_cfg.maxMB }}" data-max-hours="{{ opt_cfg.maxHours }}">
   <header class="djopt-head">
     <p class="eyebrow">DJ MASTERING</p>
     <h2>上传优化</h2>
-    <p class="lead">上传别人做好的 DJ 曲目或你的混音录音，服务器自动做：去超低频杂音（25Hz 高通）→ 轻度均衡（低频更扎实、人声/高频更通透）→ 两遍 EBU R128 响度测量并统一到俱乐部响度 → 真峰值限幅防爆音。完成后可 A/B 对比试听、下载 FLAC 无损 / MP3 320k，或一键导入曲库。</p>
+    <p class="lead">上传别人做好的 DJ 曲目或你的混音录音，服务器自动做：去超低频杂音（25Hz 高通）→ 轻度均衡（低频更扎实、人声/高频更通透）→ 两遍 EBU R128 响度测量并统一到俱乐部响度 → 真峰值限幅防爆音。完成后可 A/B 对比试听、下载 FLAC 无损或 MP3 320k。导入曲库默认保存为 MP3 320k；管理员导入时可勾选「同时保留 FLAC 无损」，供后期下载，播放仍用 MP3。</p>
     <p class="djopt-warn">⚠️ 说明：MP3 等有损文件转成 FLAC/WAV 只是换成无损格式保存，<b>已丢失的音质不会恢复</b>；优化主要改善的是响度、动态和均衡。FLAC 适合下一步再加工或存档，日常播放选 MP3 320k 即可。请只上传你有权使用的音频。</p>
   </header>
   {% if user %}
@@ -110,7 +110,7 @@
     </label>
     <button type="button" class="btn" id="djoptGo" disabled>开始优化</button>
   </form>
-  <p class="muted djopt-limits">单个文件最大 {{ opt_cfg.maxMB }}MB、时长不超过 {{ opt_cfg.maxHours }} 小时；30 分钟的曲目大约需要 1–2 分钟处理。任务排队依次处理，结果保留 24 小时，导入曲库的不会被清理。</p>
+  <p class="muted djopt-limits">单个文件最大 {{ opt_cfg.maxMB }}MB、时长不超过 {{ opt_cfg.maxHours }} 小时；30 分钟的曲目大约需要 1–2 分钟处理。任务排队依次处理。未导入的结果约保留 12 小时；导入曲库后任务文件会立即删除；曲库播放为 MP3 320k，勾选保留时另存一份 FLAC。</p>
   {% else %}
   <p class="djopt-login">上传优化需要登录。<a class="btn btn-sm" href="/login?next=/dj" data-no-pjax>登录</a> <a class="btn btn-sm btn-ghost" href="/register" data-no-pjax>注册</a></p>
   {% endif %}

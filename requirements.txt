@@ -8,7 +8,4 @@ bcrypt
 python-jose[cryptography]
 itsdangerous
 Pillow
-python-dotenv
-Telethon==1.45.0
-requests
-cryptography
+boto3

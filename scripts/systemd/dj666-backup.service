@@ -8,4 +8,5 @@ User=root
 Nice=15
 IOSchedulingClass=idle
 TimeoutStartSec=30min
+ExecStartPre=/usr/bin/python3 /opt/dj666/scripts/dj666_cleanup.py
 ExecStart=/usr/bin/python3 /opt/dj666/scripts/dj666_backup.py

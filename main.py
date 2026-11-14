@@ -31,6 +31,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import dj_flac
+import r2_storage
+import tg_filter_v3 as tgf3
+import queue as queue_mod
+
 # Raise Starlette multipart part limit before form parsers are used.
 # Starlette 1.10 defaults to 1MB, which would reject music packs.
 os.environ.setdefault("STARLETTE_MAX_FORM_PART_SIZE", str(210 * 1024 * 1024))
@@ -86,6 +91,8 @@ except Exception:  # noqa: BLE001
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = BASE_DIR / "uploads"
+FLAC_DIR = UPLOAD_DIR / "flac"
+FLAC_SNAP_ROOTS = [Path("/opt/dj666_backups/auto")]
 TEMPLATE_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 ENV_FILE = BASE_DIR / ".env"
@@ -379,6 +386,9 @@ class Announcement(Base):
     tg_comment_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     tg_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     site_views: Mapped[int] = mapped_column(Integer, default=0)
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    hidden_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    hidden_reason: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
@@ -456,6 +466,13 @@ class Track(Base):
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     file_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    flac_path: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    flac_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    flac_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    flac_added_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    storage: Mapped[str] = mapped_column(String(10), default="local")
+    r2_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    flac_r2_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
@@ -845,6 +862,7 @@ def migrate_announcements_schema(db: Session) -> None:
         db.commit()
     db.execute(text("UPDATE announcements SET content_edited = 0 WHERE content_edited IS NULL"))
     db.commit()
+    # second pass after possible adds — re-read cols below
     cols = {row[1] for row in db.execute(text("PRAGMA table_info(announcements)")).fetchall()}
     for col, ddl in (
         ("tg_reactions_json", "TEXT"),
@@ -852,10 +870,15 @@ def migrate_announcements_schema(db: Session) -> None:
         ("tg_comment_count", "INTEGER"),
         ("tg_synced_at", "DATETIME"),
         ("site_views", "INTEGER DEFAULT 0"),
+        ("hidden", "BOOLEAN DEFAULT 0"),
+        ("hidden_at", "DATETIME"),
+        ("hidden_reason", "VARCHAR(300)"),
     ):
         if col not in cols:
             db.execute(text(f"ALTER TABLE announcements ADD COLUMN {col} {ddl}"))
             db.commit()
+    db.execute(text("UPDATE announcements SET hidden = 0 WHERE hidden IS NULL"))
+    db.commit()
     chat_cols = {row[1] for row in db.execute(text("PRAGMA table_info(chat_messages)")).fetchall()}
     if "media_json" not in chat_cols:
         db.execute(text("ALTER TABLE chat_messages ADD COLUMN media_json TEXT"))
@@ -919,6 +942,22 @@ def migrate_tracks_schema(db: Session) -> None:
         db.commit()
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_tracks_content_hash ON tracks (content_hash)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_tracks_category ON tracks (category)"))
+    db.commit()
+    cols = {row[1] for row in db.execute(text("PRAGMA table_info(tracks)")).fetchall()}
+    for col, ddl in (
+        ("flac_path", "VARCHAR(64)"),
+        ("flac_size", "INTEGER"),
+        ("flac_pinned", "BOOLEAN DEFAULT 0"),
+        ("flac_added_at", "DATETIME"),
+        ("storage", "VARCHAR(10) DEFAULT 'local'"),
+        ("r2_key", "VARCHAR(200)"),
+        ("flac_r2_key", "VARCHAR(200)"),
+    ):
+        if col not in cols:
+            db.execute(text(f"ALTER TABLE tracks ADD COLUMN {col} {ddl}"))
+            db.commit()
+    db.execute(text("UPDATE tracks SET flac_pinned = 0 WHERE flac_pinned IS NULL"))
+    db.execute(text("UPDATE tracks SET storage = 'local' WHERE storage IS NULL OR storage = ''"))
     db.commit()
     db.execute(
         text(
@@ -1135,6 +1174,243 @@ def delete_track_file(filename: str) -> None:
         resolved.unlink(missing_ok=True)
 
 
+def r2_delete_key(key: str) -> None:
+    if not key or not r2_storage.r2_enabled():
+        return
+    try:
+        r2_storage.delete(key)
+    except Exception:  # noqa: BLE001
+        logging.exception("r2 delete failed")
+
+
+def track_audio_url(track) -> str:
+    if getattr(track, "storage", "local") == "r2" and getattr(track, "r2_key", None):
+        return r2_storage.public_url(track.r2_key)
+    name = Path(getattr(track, "filename", "") or "").name
+    return f"/uploads/{name}" if name else ""
+
+
+def track_has_flac(track) -> bool:
+    return bool(dj_flac.has_flac(track))
+
+
+_R2_QUEUE: "queue_mod.Queue" = queue_mod.Queue()
+_R2_THREAD = None
+_R2_LOCK = threading.Lock()
+_R2_STATUS = {
+    "state": "idle",
+    "done": 0,
+    "total": 0,
+    "failed": 0,
+    "current": "",
+    "last_error": "",
+    "enabled": False,
+}
+R2_CMD_PATH = DATA_DIR / "r2.cmd"
+
+
+def r2_status_snapshot() -> dict:
+    with _R2_LOCK:
+        snap = dict(_R2_STATUS)
+    snap["enabled"] = r2_storage.r2_enabled()
+    snap["public_base"] = r2_storage.public_base() if r2_storage.r2_enabled() else ""
+    return snap
+
+
+def _r2_set(**kwargs) -> None:
+    with _R2_LOCK:
+        _R2_STATUS.update(kwargs)
+
+
+def upload_track_to_r2(track_id: int) -> dict:
+    """Upload a track's local MP3 (and FLAC if present) to R2, verify size, then drop local copies.
+
+    On any failure the local files and 'local' storage flag are kept so playback still works.
+    """
+    if not r2_storage.r2_enabled():
+        return {"ok": False, "error": "r2_disabled"}
+    db = SessionLocal()
+    try:
+        track = db.get(Track, track_id)
+        if not track:
+            return {"ok": False, "error": "missing"}
+        fname = Path(track.filename or "").name
+        local_mp3 = UPLOAD_DIR / fname if fname else None
+        already = (getattr(track, "storage", "local") == "r2" and getattr(track, "r2_key", None))
+        if already and (not local_mp3 or not local_mp3.is_file()):
+            # Already on R2; nothing local left to move. Still try leftover FLAC.
+            if track.flac_path:
+                flac_path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
+                if flac_path and flac_path.is_file():
+                    pass  # fall through to flac-only path below via a flag
+                else:
+                    return {"ok": True, "skipped": "already_r2"}
+            else:
+                return {"ok": True, "skipped": "already_r2"}
+        if not local_mp3 or not local_mp3.is_file():
+            if already:
+                return {"ok": True, "skipped": "already_r2"}
+            logging.error("r2 upload skipped, local mp3 missing track=%s", track_id)
+            return {"ok": False, "error": "no_local"}
+        key = track.r2_key or r2_storage.mp3_key(track.id, track.title or "")
+        local_size = int(local_mp3.stat().st_size)
+        r2_storage.upload_file(local_mp3, key, content_type="audio/mpeg")
+        remote = r2_storage.object_size(key)
+        if remote != local_size:
+            logging.error("r2 mp3 size mismatch track=%s local=%s remote=%s", track_id, local_size, remote)
+            return {"ok": False, "error": "size_mismatch"}
+        flac_key = getattr(track, "flac_r2_key", None)
+        if track.flac_path:
+            flac_path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
+            if flac_path and flac_path.is_file():
+                flac_key = flac_key or r2_storage.flac_key(track.id)
+                r2_storage.upload_file(
+                    flac_path, flac_key, content_type="audio/flac",
+                    cache_control="private, max-age=0, no-store",
+                )
+                fr = r2_storage.object_size(flac_key)
+                if fr != int(flac_path.stat().st_size):
+                    logging.error("r2 flac size mismatch track=%s", track_id)
+                    return {"ok": False, "error": "flac_size_mismatch"}
+        track.storage = "r2"
+        track.r2_key = key
+        if flac_key:
+            track.flac_r2_key = flac_key
+        if local_size and not track.file_size:
+            track.file_size = local_size
+        db.commit()
+        try:
+            delete_track_file(fname)
+            if track.flac_path:
+                path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
+                if path:
+                    dj_flac.unlink_with_snapshots(path, FLAC_SNAP_ROOTS)
+                track.flac_path = None
+                db.commit()
+        except Exception:  # noqa: BLE001
+            logging.exception("r2 post-upload local delete failed track=%s", track_id)
+        logging.info("r2 upload ok track=%s", track_id)
+        return {"ok": True}
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logging.exception("r2 upload failed track=%s", track_id)
+        return {"ok": False, "error": "upload_failed"}
+    finally:
+        db.close()
+
+
+def schedule_r2_upload(track_id) -> None:
+    if not r2_storage.r2_enabled():
+        return
+    try:
+        tid = int(track_id)
+    except (TypeError, ValueError):
+        return
+    if tid > 0:
+        _R2_QUEUE.put(("upload", tid))
+
+
+def _r2_pending_ids(db) -> list[int]:
+    rows = db.scalars(select(Track).order_by(Track.id)).all()
+    out = []
+    for t in rows:
+        if (getattr(t, "storage", "local") or "local") != "r2":
+            out.append(t.id)
+        elif t.flac_path and dj_flac.resolve_flac(UPLOAD_DIR, t.flac_path):
+            out.append(t.id)
+    return out
+
+
+def _r2_run_migration() -> None:
+    if not r2_storage.r2_enabled():
+        _r2_set(state="idle", last_error="r2_disabled")
+        return
+    db = SessionLocal()
+    try:
+        ids = _r2_pending_ids(db)
+    finally:
+        db.close()
+    _r2_set(state="running", done=0, total=len(ids), failed=0, current="", last_error="")
+    failed = 0
+    done = 0
+    last_err = ""
+    for tid in ids:
+        title = ""
+        db = SessionLocal()
+        try:
+            tr = db.get(Track, tid)
+            title = (tr.title if tr else "") or f"#{tid}"
+        finally:
+            db.close()
+        _r2_set(current=f"#{tid} {title}")
+        result = upload_track_to_r2(tid)
+        done += 1
+        if not result.get("ok"):
+            failed += 1
+            last_err = f"#{tid}: {result.get('error') or 'failed'}"
+            logging.error("r2 migrate failed track=%s err=%s", tid, result.get("error"))
+        _r2_set(done=done, failed=failed, last_error=last_err)
+    _r2_set(state="done", current="", done=done, failed=failed, last_error=last_err)
+    logging.info("r2 migrate finished done=%s failed=%s", done, failed)
+
+
+def _r2_check_cmdfile() -> None:
+    path = R2_CMD_PATH
+    if not path.is_file():
+        return
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+    if not raw:
+        return
+    parts = raw.split()
+    cmd = parts[0].lower()
+    if cmd == "migrate":
+        with _R2_LOCK:
+            if _R2_STATUS.get("state") == "running":
+                return
+        _R2_QUEUE.put(("migrate",))
+    elif cmd == "upload" and len(parts) >= 2:
+        try:
+            _R2_QUEUE.put(("upload", int(parts[1])))
+        except ValueError:
+            logging.error("r2 cmd ignored: bad track id")
+
+
+def _r2_worker() -> None:
+    logging.info("r2 worker started enabled=%s", r2_storage.r2_enabled())
+    while True:
+        try:
+            try:
+                job = _R2_QUEUE.get(timeout=1)
+            except queue_mod.Empty:
+                try:
+                    _r2_check_cmdfile()
+                except Exception:  # noqa: BLE001
+                    logging.exception("r2 cmdfile check failed")
+                continue
+            try:
+                if job[0] == "upload":
+                    upload_track_to_r2(job[1])
+                elif job[0] == "migrate":
+                    _r2_run_migration()
+            finally:
+                _R2_QUEUE.task_done()
+        except Exception:  # noqa: BLE001
+            logging.exception("r2 worker loop error")
+
+
+def start_r2_worker() -> None:
+    global _R2_THREAD
+    if _R2_THREAD is not None and _R2_THREAD.is_alive():
+        return
+    t = threading.Thread(target=_r2_worker, name="r2-upload", daemon=True)
+    _R2_THREAD = t
+    t.start()
+
+
 def approved_tracks(db: Session):
     return (
         db.scalars(
@@ -1325,6 +1601,10 @@ def overwrite_track_audio(
     db.commit()
     if old_file and old_file != stored_name:
         delete_track_file(old_file)
+    if getattr(track, "storage", "local") == "r2" or getattr(track, "r2_key", None):
+        track.storage = "local"
+        db.commit()
+    schedule_r2_upload(track.id)
 
 
 def can_overwrite_track(user: User, match: dict) -> bool:
@@ -1781,7 +2061,10 @@ class _TgPreviewParser(HTMLParser):
                 "notes": [],
                 "date": None,
                 "depth": self.depth,
+                "buttons": [],
+                "_links": [],
             }
+            self.btn_depth = None
             self.posts.append(self.cur)
             return
         if self.cur is None:
@@ -1823,6 +2106,11 @@ class _TgPreviewParser(HTMLParser):
             self.pending_poster = None
         elif tag == "time" and attrs.get("datetime") and self.cur.get("date") is None:
             self.cur["date"] = attrs.get("datetime")
+        elif "tgme_widget_message_inline_btn" in cls and attrs.get("href"):
+            self.cur.setdefault("buttons", []).append(
+                {"url": attrs.get("href") or "", "text": ""}
+            )
+            self.btn_depth = self.depth
 
     def handle_endtag(self, tag):
         if tag in {"br", "img", "input", "meta", "link", "source", "hr"}:
@@ -1831,9 +2119,15 @@ class _TgPreviewParser(HTMLParser):
             self.text_depth = None
         if self.video_wrap_depth is not None and self.depth == self.video_wrap_depth:
             self.video_wrap_depth = None
+        if getattr(self, "btn_depth", None) is not None and self.depth == self.btn_depth:
+            self.btn_depth = None
         self.depth -= 1
 
     def handle_data(self, data):
+        if self.cur is not None and getattr(self, "btn_depth", None) is not None:
+            btns = self.cur.get("buttons") or []
+            if btns:
+                btns[-1]["text"] = (btns[-1].get("text") or "") + data
         if self.cur is not None and self.text_depth is not None:
             self.cur["text_parts"].append(data)
 
@@ -1853,6 +2147,14 @@ def parse_tg_preview(html_text: str) -> list[dict]:
         txt = "".join(raw["text_parts"])
         txt = re.sub(r"[ \t]+\n", "\n", txt)
         txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+        extra = tgf3.collect_extra_text(links=raw.get("_links"), buttons=raw.get("buttons"))
+        if extra:
+            # Keep button labels and hrefs in the stored text so filters see them.
+            missing = "\n".join(
+                line for line in extra.splitlines() if line and line not in txt
+            )
+            if missing:
+                txt = (txt + "\n" + missing).strip()
         posted = None
         if raw.get("date"):
             try:
@@ -2506,41 +2808,153 @@ def tg_learn_from_media(db: Session, ctx_data: Optional[dict], media: list[dict]
     return added
 
 
+
+def tg_media_paths(media: list[dict]) -> list[Path]:
+    """Image (or video poster) paths for hashing / OCR."""
+    paths: list[Path] = []
+    for m in media or []:
+        name = m.get("poster_file") or (m.get("poster") if m.get("type") == "video" else None) or m.get("file")
+        if m.get("type") == "video" and m.get("poster"):
+            name = m.get("poster")
+        if not name or not ANN_MEDIA_NAME_RE.match(str(name)):
+            continue
+        path = ANN_MEDIA_DIR / name
+        if path.is_file():
+            paths.append(path)
+    return paths
+
+
+def tg_post_haystack(post: "TgPost", raw: str, ocr_text: str = "") -> str:
+    parts = [raw or "", post.text or ""]
+    links: list[str] = []
+    for item in ann_links(post_links_obj(post)):
+        if item.get("url"):
+            links.append(item["url"])
+        if item.get("text"):
+            links.append(item["text"])
+    extra = tgf3.collect_extra_text(links=links)
+    if extra:
+        parts.append(extra)
+    if ocr_text:
+        parts.append(ocr_text)
+    return "\n".join(parts)
+
+
+def tg_maybe_ocr(raw: str, media: list[dict]) -> str:
+    """OCR images of short or lottery/venue-ish posts; empty if tesseract missing."""
+    if not tgf3.ocr_available():
+        return ""
+    if not media:
+        return ""
+    norm = tgf3.tg_norm(raw or "")
+    interesting = bool(
+        tgf3.VENUE_WORD_RE.search(raw or "")
+        or tgf3.LOTTERY_HARD_RE.search(raw or "")
+        or re.search(r"开奖|彩票|开出|特码|期号|赌|豹子", raw or "")
+        or len(norm) < 400
+    )
+    if not interesting:
+        return ""
+    return tgf3.ocr_media_files(tg_media_paths(media))
+
+
+def tg_manual_rules(ctx_data: dict) -> list:
+    """User-added 过滤池 terms (any text mode) — honoured as hard blocks."""
+    out = []
+    for key in ("strip", "block", "gamble"):
+        for item in ctx_data.get(key) or []:
+            rule = item[0]
+            if getattr(rule, "source", "") == "manual" and (rule.pattern or "").strip():
+                out.append(item)
+    return out
+
+
+def tg_manual_hit(ctx_data: dict, raw: str) -> Optional["TgFilterRule"]:
+    hay = tgf3.tg_norm(raw)
+    if not hay:
+        return None
+    for item in tg_manual_rules(ctx_data):
+        rule = item[0]
+        rx = item[1] if len(item) > 1 else None
+        norm = tgf3.tg_norm(rule.pattern)
+        ok = bool(norm and norm in hay)
+        if not ok and rx is not None:
+            try:
+                ok = bool(rx.search(raw))
+            except Exception:  # noqa: BLE001
+                ok = False
+        if ok:
+            return rule
+    return None
+
+
+def hide_announcement(ann: "Announcement", reason: str) -> None:
+    ann.hidden = True
+    ann.hidden_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    ann.hidden_reason = (reason or "广告")[:300]
+
+
+def unhide_announcement(ann: "Announcement") -> None:
+    ann.hidden = False
+    ann.hidden_at = None
+    ann.hidden_reason = None
+
+
 def tg_filter_post(db: Session, post: TgPost, ctx_data: dict) -> tuple[Optional[str], list[str]]:
     """Apply filters to one unpublished post. Returns (action, media names to delete)."""
     if post.status != TG_STATUS_NEW:
-        return None, []
-    if post.content_edited:
-        # User's saved pending text is final; do not re-strip or auto-ignore on rescan.
         return None, []
     raw = post.raw_text if post.raw_text is not None else (post.text or "")
     if post.raw_text is None:
         post.raw_text = raw
     media = parse_media_json(post.media_json)
+    ocr_text = ""
+    hay = tg_post_haystack(post, raw, "")
     if not post.filter_override:
-        rule = tg_block_hit(ctx_data, raw)
-        if rule:
+        # OCR when text alone is inconclusive; captions/buttons already in hay.
+        if not tgf3.adv_block_reason(hay) and not tg_block_hit(ctx_data, hay) and not tg_manual_hit(ctx_data, hay):
+            ocr_text = tg_maybe_ocr(hay, media)
+            if ocr_text:
+                hay = tg_post_haystack(post, raw, ocr_text)
+
+        def _ignore(rule_label: str, learn_label: str) -> tuple[str, list[str]]:
             if ctx_data["autolearn"] and media:
-                tg_learn_from_media(db, ctx_data, media, f"自动：{rule.pattern} #{post.post_id}", "auto")
-            rule.hits = (rule.hits or 0) + 1
+                tg_learn_from_media(db, ctx_data, media, f"{learn_label} #{post.post_id}", "auto")
             post.status = TG_STATUS_IGNORED
             post.media_json = None
             post.text = raw
-            post.filter_info = f"整条忽略：命中「{rule.pattern}」"[:300]
+            post.filter_info = rule_label[:300]
             return "ignored", media_names(media)
-        ghit = tg_gamble_hit(ctx_data, raw)
+
+        # User-added 过滤池 terms are hard blocks (normalized). News exemption still applies
+        # unless an ad CTA / contact pitch is present.
+        man = tg_manual_hit(ctx_data, hay)
+        if man and not tgf3.news_exempt(hay):
+            man.hits = (man.hits or 0) + 1
+            return _ignore(f"整条忽略：过滤池「{man.pattern}」", f"自动：{man.pattern}")
+
+        adv = tgf3.adv_block_reason(hay)
+        if adv:
+            return _ignore(f"整条忽略：{adv}", "自动：广告规则")
+
+        rule = tg_block_hit(ctx_data, hay) or tg_block_hit(ctx_data, raw)
+        if rule:
+            # Bare keyword blocks (e.g. 六合彩) respect news exemption; ad tags never do.
+            pat = rule.pattern or ""
+            if pat.startswith("#") or not tgf3.news_exempt(hay):
+                rule.hits = (rule.hits or 0) + 1
+                return _ignore(f"整条忽略：命中「{rule.pattern}」", f"自动：{rule.pattern}")
+        ghit = tg_gamble_hit(ctx_data, hay) or tg_gamble_hit(ctx_data, raw)
         if ghit:
             rules, score = ghit
-            if ctx_data["autolearn"] and media:
-                tg_learn_from_media(db, ctx_data, media, f"自动：赌博广告 #{post.post_id}", "auto")
+            # tg_gamble_hit already applies news exemption (unless CTA).
             for r in rules:
                 r.hits = (r.hits or 0) + 1
             names = "、".join(f"「{r.pattern}」" for r in rules[:8])
-            post.status = TG_STATUS_IGNORED
-            post.media_json = None
-            post.text = raw
-            post.filter_info = f"整条忽略：赌博广告（命中{names}，分{score}）"[:300]
-            return "ignored", media_names(media)
+            return _ignore(f"整条忽略：赌博广告（命中{names}，分{score}）", "自动：赌博广告")
+    # User's saved pending text is final for strip/mutation, but hard blocks above still apply at rescan and publish.
+    if post.content_edited:
+        return None, []
     new_text, strip_hits = tg_strip_text(ctx_data, raw)
     kept: list[dict] = []
     removed: list[dict] = []
@@ -2552,6 +2966,23 @@ def tg_filter_post(db: Session, post: TgPost, ctx_data: dict) -> tuple[Optional[
             removed.append(m)
         else:
             kept.append(m)
+    # Ad-image match on a non-news post: ignore the whole item (do not leave a
+    # caption that auto-publish would then put on the homepage).
+    if removed and not post.filter_override and not tgf3.news_exempt(raw or new_text or ""):
+        labels = "、".join(
+            f"「{(r.label or r.pattern or '广告图')}」"
+            for r in [
+                tg_image_rule_hit(ctx_data, tg_media_hash(m.get("poster_file") if m.get("type")=="video" else m.get("file")))
+                for m in removed
+            ] if r
+        ) or "广告图"
+        if ctx_data["autolearn"] and media:
+            tg_learn_from_media(db, ctx_data, media, f"自动：广告图片 #{post.post_id}", "auto")
+        post.status = TG_STATUS_IGNORED
+        post.media_json = None
+        post.text = raw
+        post.filter_info = f"整条忽略：命中广告图片{labels}"[:300]
+        return "ignored", media_names(media)
     if new_text != (post.text or ""):
         for rule in strip_hits:
             rule.hits = (rule.hits or 0) + 1
@@ -2586,7 +3017,11 @@ def apply_tg_filters(db: Session) -> tuple[int, int]:
     ignored = changed = 0
     names: list[str] = []
     for post in db.scalars(select(TgPost).where(TgPost.status == TG_STATUS_NEW)).all():
-        action, dropped = tg_filter_post(db, post, ctx_data)
+        try:
+            action, dropped = tg_filter_post(db, post, ctx_data)
+        except Exception:  # noqa: BLE001
+            logging.exception("tg filter failed on post %s (tg#%s)", post.id, post.post_id)
+            continue
         names += dropped
         if action == "ignored":
             ignored += 1
@@ -2638,6 +3073,67 @@ def seed_tg_filter_rules_v2(db: Session) -> None:
     if get_setting(db, "tg_filter_gamble", "") == "":
         set_setting(db, "tg_filter_gamble", "1")
 
+
+
+def seed_tg_filter_rules_v3(db: Session) -> None:
+    """Stronger lottery/venue/sponsor/domain rules, plus pHash seeds of known ad images."""
+    if get_setting(db, "tg_filter_seeded_v3", "") != "1":
+        taken = {(r.mode, tg_norm(r.pattern)) for r in db.scalars(select(TgFilterRule)).all()}
+        for pattern in tgf3.SEED_V3_BLOCK:
+            key = ("block", tg_norm(pattern))
+            if key[1] and key not in taken:
+                db.add(TgFilterRule(
+                    mode="block", pattern=pattern, label="广告强化", source="seed",
+                ))
+                taken.add(key)
+        for pattern, weight in tgf3.SEED_V3_GAMBLE:
+            key = ("gamble", tg_norm(pattern))
+            if key[1] and key not in taken:
+                db.add(TgFilterRule(
+                    mode="gamble", pattern=pattern, label="彩票/开奖强化", source="seed", weight=weight,
+                ))
+                taken.add(key)
+            elif key in taken:
+                row = db.scalar(
+                    select(TgFilterRule).where(
+                        TgFilterRule.mode == "gamble", TgFilterRule.pattern == pattern
+                    )
+                )
+                if row and (row.weight or 0) < weight:
+                    row.weight = weight
+        # Strengthen existing weak 开奖/彩票 scores if still at the old default.
+        for pattern, weight in (("开奖", 3), ("彩票", 3)):
+            for row in db.scalars(select(TgFilterRule).where(TgFilterRule.mode == "gamble")).all():
+                if tg_norm(row.pattern) == tg_norm(pattern) and (row.weight or 0) < weight:
+                    row.weight = weight
+        db.commit()
+        set_setting(db, "tg_filter_seeded_v3", "1")
+    seed_tg_offender_phash(db)
+
+
+def seed_tg_offender_phash(db: Session) -> None:
+    """Add perceptual hashes of known offending post images (not user screenshots)."""
+    if get_setting(db, "tg_filter_phash_offenders", "") == "1":
+        return
+    samples = (
+        ("4f59ebcbce8b4b65bf4ceb2cd54be2b9.jpg", "彩票开奖图 #81875"),
+        ("526a762234594426a394846721a1e23c.jpg", "会所广告图 #81900"),
+        ("2c18197eefaa45b6ac37de6e59a0cc65.jpg", "会所广告图 #81900-2"),
+    )
+    ctx_data = tg_rules_ctx(db)
+    added = 0
+    for name, label in samples:
+        path = ANN_MEDIA_DIR / name
+        if not path.is_file():
+            continue
+        value = tg_image_hash_file(path)
+        if not value:
+            continue
+        if tg_add_image_rule(db, ctx_data, path, value, label, "seed") == "added":
+            added += 1
+    db.commit()
+    set_setting(db, "tg_filter_phash_offenders", "1")
+    logging.info("seeded %s offender pHash rules", added)
 
 
 def tg_collect_cutoff() -> datetime:
@@ -2797,7 +3293,7 @@ def collect_telegram(trigger: str = "manual") -> str:
                 if not post["text"] and not post["media"]:
                     continue
                 stored = []
-                pre_block = tg_block_hit(fctx, post["text"]) or tg_gamble_hit(fctx, post["text"])
+                pre_block = tg_block_hit(fctx, post["text"]) or tg_gamble_hit(fctx, post["text"]) or tgf3.adv_block_reason(post["text"])
                 disk_ok = tg_disk_free() >= TG_DISK_MIN_FREE
                 for media in post["media"]:
                     if pre_block:
@@ -2982,9 +3478,11 @@ def init_db() -> None:
         seed_default_block_keywords(db)
         seed_tg_filter_rules(db)
         seed_tg_filter_rules_v2(db)
+        seed_tg_filter_rules_v3(db)
         try:
             apply_tg_filters(db)
         except Exception:  # noqa: BLE001
+            logging.exception("apply_tg_filters during init_db")
             db.rollback()
         user_count = db.scalar(select(func.count()).select_from(User)) or 0
         if user_count == 0:
@@ -3003,6 +3501,10 @@ def init_db() -> None:
                     content="站点已上线，欢迎来到 DJ666。注册后即可播放音乐并参与公屏聊天。管理员请尽快修改默认密码。",
                 )
             )
+        if r2_storage.r2_enabled():
+            current = (get_setting(db, "flac_quota_gb", "10") or "10").strip()
+            if current in ("10", "10.0"):
+                set_setting(db, "flac_quota_gb", "1000")
         db.commit()
     finally:
         db.close()
@@ -3028,6 +3530,11 @@ async def lifespan(app: FastAPI):
         opt_start_worker()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        r2_storage.load_env_file(ENV_FILE)
+        start_r2_worker()
+    except Exception:  # noqa: BLE001
+        logging.exception("r2 worker failed to start")
     try:
         tgc_start()
     except Exception:  # noqa: BLE001
@@ -3146,10 +3653,13 @@ app.add_middleware(CanonicalHostMiddleware)
 
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 templates.env.filters["fmt_time"] = fmt_time
+templates.env.filters["fmt_bytes"] = dj_flac.fmt_bytes
 templates.env.filters["epoch"] = lambda v: int((v if v.tzinfo else v.replace(tzinfo=timezone.utc)).timestamp()) if v else 0
 templates.env.filters["chat_created_ms"] = chat_created_ms
 templates.env.filters["fmt_date"] = fmt_date
 templates.env.globals["track_categories"] = TRACK_CATEGORY_CHOICES
+templates.env.globals["track_audio_url"] = track_audio_url
+templates.env.globals["track_has_flac"] = track_has_flac
 templates.env.globals["display_name"] = display_name
 templates.env.globals["ann_media"] = ann_media
 templates.env.globals["ann_links"] = ann_links
@@ -3282,8 +3792,10 @@ def ann_day_bounds_utc(day: str) -> Optional[tuple[datetime, datetime]]:
     return start, start + timedelta(days=1)
 
 
-def announcements_filtered(q: str = "", day: str = ""):
+def announcements_filtered(q: str = "", day: str = "", include_hidden: bool = False):
     stmt = select(Announcement)
+    if not include_hidden:
+        stmt = stmt.where(or_(Announcement.hidden == False, Announcement.hidden.is_(None)))  # noqa: E712
     needle = (q or "").strip()
     if needle:
         like = f"%{needle}%"
@@ -3309,13 +3821,17 @@ def paginate_announcements(
     page: int = 1,
     page_size: int = ANN_PAGE_SIZE,
     highlight_id: Optional[int] = None,
+    include_hidden: bool = False,
 ) -> tuple[list, int, int, int]:
-    stmt = announcements_filtered(q, day)
+    stmt = announcements_filtered(q, day, include_hidden=include_hidden)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     page_size = max(1, page_size)
     pages = max(1, (total + page_size - 1) // page_size) if total else 1
     if highlight_id and not q and not day and total:
-        ids = list(db.scalars(select(Announcement.id).order_by(Announcement.created_at.desc(), Announcement.id.desc())).all())
+        id_stmt = select(Announcement.id).order_by(Announcement.created_at.desc(), Announcement.id.desc())
+        if not include_hidden:
+            id_stmt = id_stmt.where(or_(Announcement.hidden == False, Announcement.hidden.is_(None)))  # noqa: E712
+        ids = list(db.scalars(id_stmt).all())
         try:
             page = ids.index(int(highlight_id)) // page_size + 1
         except ValueError:
@@ -3386,7 +3902,7 @@ def music_page(request: Request, db: Session = Depends(get_db)):
 def dj_mixer_ctx(db: Session, user=None) -> dict:
     tracks = approved_tracks(db)
     library = [
-        {"id": t.id, "title": t.title or t.original_name or f"曲目 {t.id}", "url": f"/uploads/{t.filename}"}
+        {"id": t.id, "title": t.title or t.original_name or f"曲目 {t.id}", "url": track_audio_url(t)}
         for t in tracks
     ]
     is_admin = bool(user and getattr(user, "is_admin", False))
@@ -3396,6 +3912,8 @@ def dj_mixer_ctx(db: Session, user=None) -> dict:
         "exts": sorted(OPT_EXTS),
         "targets": list(OPT_TARGETS.keys()),
         "defaultTarget": OPT_DEFAULT_TARGET,
+        "isAdmin": is_admin,
+        "keepFlacDefault": is_admin,
     }
     return {"library": library, "opt_cfg": opt_cfg}
 
@@ -3638,6 +4156,7 @@ async def settings_upload_pack(
     archive_path = tmp_root / f"pack{ext}"
     extract_dir = tmp_root / "extracted"
     stored_files: list[str] = []
+    new_pack_ids: list[int] = []
     try:
         size = await save_upload_limited(file, archive_path, MAX_PACK_BYTES)
         if size < 0:
@@ -3718,8 +4237,7 @@ async def settings_upload_pack(
                 continue
             stored_files.append(stored)
             title = (src.stem or rel.stem or "未命名曲目").strip() or "未命名曲目"
-            db.add(
-                Track(
+            pack_track = Track(
                     title=title[:200],
                     filename=stored,
                     original_name=entry_name,
@@ -3730,7 +4248,9 @@ async def settings_upload_pack(
                     file_size=src_size,
                     category=infer_track_category(title, pack_label, entry_name),
                 )
-            )
+            db.add(pack_track)
+            db.flush()
+            new_pack_ids.append(pack_track.id)
             added += 1
         if staged and stage_dir is not None:
             (stage_dir / "manifest.json").write_text(
@@ -3763,6 +4283,8 @@ async def settings_upload_pack(
             )
             return RedirectResponse("/settings#music", status_code=303)
         db.commit()
+        for tid in new_pack_ids:
+            schedule_r2_upload(tid)
         extra = []
         if skipped_large:
             extra.append(f"跳过 {skipped_large} 个超过 50MB 的音频")
@@ -3989,6 +4511,7 @@ async def save_admin_audio(
             return result
         stored_name = ""
         result.update(ok=True, id=track.id, title=track.title)
+        schedule_r2_upload(track.id)
         return result
     except Exception:
         db.rollback()
@@ -5153,6 +5676,31 @@ def admin_login_page(request: Request, db: Session = Depends(get_db)):
     return admin_login_form(request, db)
 
 
+def flac_admin_stats(db: Session) -> dict:
+    tracks = db.scalars(select(Track)).all()
+    count, total, pinned = dj_flac.flac_usage(tracks)
+    quota = dj_flac.flac_quota_bytes(lambda k, d="": get_setting(db, k, d))
+    raw_log = get_setting(db, "flac_prune_log", "[]") or "[]"
+    try:
+        prune_log = json.loads(raw_log)
+        if not isinstance(prune_log, list):
+            prune_log = []
+    except json.JSONDecodeError:
+        prune_log = []
+    try:
+        gb = float(get_setting(db, "flac_quota_gb", "1000") or "1000")
+    except ValueError:
+        gb = 1000.0
+    return {
+        "count": count,
+        "total": total,
+        "pinned": pinned,
+        "quota": quota,
+        "quota_gb": gb,
+        "prune_log": list(reversed(prune_log[-12:])),
+    }
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request, db: Session = Depends(get_db)):
     user = current_user(request, db)
@@ -5163,7 +5711,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
     except ValueError:
         ann_page = 1
     announcements, ann_total, ann_page, ann_pages = paginate_announcements(
-        db, page=ann_page, page_size=ADMIN_ANN_PAGE_SIZE
+        db, page=ann_page, page_size=ADMIN_ANN_PAGE_SIZE, include_hidden=True
     )
     users = db.scalars(select(User).order_by(User.created_at.desc())).all()
     tracks = (
@@ -5281,6 +5829,15 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
             },
             tg_done=tg_done,
             tg_ignored=tg_ignored,
+            hidden_anns=db.scalars(
+                select(Announcement).where(Announcement.hidden == True).order_by(  # noqa: E712
+                    Announcement.hidden_at.desc(), Announcement.id.desc()
+                )
+            ).all(),
+            flac_stats=flac_admin_stats(db),
+            r2_status=r2_status_snapshot(),
+            r2_local_count=sum(1 for tr in tracks if (getattr(tr, "storage", "local") or "local") != "r2"),
+            r2_remote_count=sum(1 for tr in tracks if (getattr(tr, "storage", "local") or "local") == "r2"),
             tgf_strip=[r for r in tgf_rules if r.mode == "strip"],
             tgf_block=[r for r in tgf_rules if r.mode == "block"],
             tgf_gamble=[r for r in tgf_rules if r.mode == "gamble"],
@@ -5829,6 +6386,22 @@ def post_links_obj(post: TgPost) -> "_LinksHolder":
 
 def publish_one_tg_post(db: Session, post: TgPost, include_source: bool) -> tuple[bool, str]:
     """Publish one pending collected post. Dedup by source_url; never overwrite manually edited content."""
+    # Final filter gate: pending posts collected before a rule was added are rechecked here
+    # (auto-publish, 一键发布, and single publish all go through this function).
+    if post.status == TG_STATUS_NEW and not post.filter_override:
+        try:
+            action, dropped = tg_filter_post(db, post, tg_rules_ctx(db))
+        except Exception:  # noqa: BLE001
+            logging.exception("publish-time filter failed on post %s", post.id)
+            action, dropped = None, []
+        if dropped:
+            # Defer file deletion to the caller commit; names may already be unlinked later.
+            try:
+                delete_unreferenced_media(db, dropped)
+            except Exception:  # noqa: BLE001
+                logging.exception("filter media cleanup failed")
+        if post.status != TG_STATUS_NEW:
+            return False, "filtered"
     if post.status == TG_STATUS_PUBLISHED and post.announcement_id:
         existing = db.get(Announcement, post.announcement_id)
         if existing:
@@ -5890,6 +6463,8 @@ def admin_tg_publish(
         flash(request, "该来源已有手动编辑的公告，已保留编辑内容，未用采集原文覆盖。", "info")
     elif reason in ("already", "dup"):
         flash(request, "这条已经发布过了，未重复发布。", "info")
+    elif reason == "filtered":
+        flash(request, "发布前复查过滤规则：该条已按广告规则忽略，未发布到首页。", "info")
     else:
         flash(request, "当前状态不可发布。", "error")
     return RedirectResponse("/admin#telegram", status_code=303)
@@ -5910,7 +6485,7 @@ def admin_tg_publish_all(
     else:
         msg = f"一键发布完成：已发布 {published} 条到公告首页"
         if skipped:
-            msg += f"，跳过 {skipped} 条（已发布或未处于待处理）"
+            msg += f"，跳过 {skipped} 条（已发布、未处于待处理或发布前被过滤）"
         msg += "。"
         flash(request, msg, "success")
     return RedirectResponse("/admin#telegram", status_code=303)
@@ -6301,6 +6876,7 @@ def admin_user_delete(
     db.query(AnnouncementLike).filter(AnnouncementLike.user_id == target.id).delete()
     db.query(AnnouncementComment).filter(AnnouncementComment.user_id == target.id).delete()
     for track in list(target.tracks):
+        dj_flac.drop_track_flac(track, UPLOAD_DIR, FLAC_SNAP_ROOTS)
         delete_track_file(track.filename)
         db.delete(track)
     db.delete(target)
@@ -6360,10 +6936,155 @@ def admin_track_delete(
     require_admin(request, db)
     track = db.get(Track, track_id)
     if track:
+        dj_flac.drop_track_flac(track, UPLOAD_DIR, FLAC_SNAP_ROOTS, remote_delete=r2_delete_key)
+        if getattr(track, "r2_key", None):
+            r2_delete_key(track.r2_key)
         delete_track_file(track.filename)
         db.delete(track)
         db.commit()
         flash(request, "曲目已删除。", "success")
+    return RedirectResponse("/admin#tracks", status_code=303)
+
+
+
+@app.post("/admin/announcements/{ann_id}/hide")
+def admin_ann_hide(ann_id: int, request: Request, csrf_token: str = Form(""), reason: str = Form(""), db: Session = Depends(get_db)):
+    require_csrf(request, csrf_token)
+    require_admin(request, db)
+    ann = db.get(Announcement, ann_id)
+    if not ann:
+        flash(request, "公告不存在。", "error")
+        return RedirectResponse("/admin#announce", status_code=303)
+    hide_announcement(ann, reason or "管理员隐藏")
+    db.commit()
+    flash(request, "已从首页隐藏（可在「过滤内容」里恢复）。", "success")
+    nxt = request.headers.get("referer") or "/admin#announce"
+    if "/admin" not in (nxt or ""):
+        nxt = "/admin#announce"
+    return RedirectResponse(nxt, status_code=303)
+
+
+@app.post("/admin/announcements/{ann_id}/unhide")
+def admin_ann_unhide(ann_id: int, request: Request, csrf_token: str = Form(""), db: Session = Depends(get_db)):
+    require_csrf(request, csrf_token)
+    require_admin(request, db)
+    ann = db.get(Announcement, ann_id)
+    if not ann:
+        flash(request, "公告不存在。", "error")
+        return RedirectResponse("/admin#tgfilter", status_code=303)
+    unhide_announcement(ann)
+    db.commit()
+    flash(request, "已恢复到首页。", "success")
+    return RedirectResponse("/admin#tgfilter", status_code=303)
+
+
+@app.get("/admin/tracks/{track_id}/flac")
+def admin_track_flac_dl(track_id: int, request: Request, db: Session = Depends(get_db)):
+    require_admin(request, db)
+    track = db.get(Track, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="FLAC 不存在")
+    stem = (track.title or Path(track.original_name or "track").stem or "track")[:80]
+    fname = f"{stem}.flac"
+    flac_key = getattr(track, "flac_r2_key", None)
+    if flac_key and r2_storage.r2_enabled():
+        try:
+            url = r2_storage.presigned_url(flac_key, expires=600, filename=fname, content_type="audio/flac")
+        except Exception:  # noqa: BLE001
+            logging.exception("r2 flac presign failed track=%s", track_id)
+            raise HTTPException(status_code=502, detail="FLAC 暂时无法下载")
+        return RedirectResponse(url, status_code=303)
+    path = dj_flac.resolve_flac(UPLOAD_DIR, getattr(track, "flac_path", None))
+    if not path:
+        raise HTTPException(status_code=404, detail="FLAC 不存在")
+    return FileResponse(
+        path, media_type="audio/flac", filename=fname, content_disposition_type="attachment",
+    )
+
+
+@app.post("/admin/tracks/{track_id}/flac/delete")
+def admin_track_flac_delete(track_id: int, request: Request, csrf_token: str = Form(""), db: Session = Depends(get_db)):
+    require_csrf(request, csrf_token)
+    require_admin(request, db)
+    track = db.get(Track, track_id)
+    if not track or not dj_flac.has_flac(track):
+        flash(request, "这首曲目没有可删除的 FLAC。", "error")
+        return RedirectResponse("/admin#tracks", status_code=303)
+    dj_flac.drop_track_flac(track, UPLOAD_DIR, FLAC_SNAP_ROOTS, remote_delete=r2_delete_key)
+    db.commit()
+    flash(request, "已删除该曲目的 FLAC（MP3 播放不受影响）。", "success")
+    return RedirectResponse("/admin#tracks", status_code=303)
+
+
+@app.post("/admin/tracks/{track_id}/flac/pin")
+def admin_track_flac_pin(track_id: int, request: Request, csrf_token: str = Form(""), pinned: str = Form(""), db: Session = Depends(get_db)):
+    require_csrf(request, csrf_token)
+    require_admin(request, db)
+    track = db.get(Track, track_id)
+    if not track or not track.flac_path:
+        flash(request, "这首曲目没有 FLAC。", "error")
+        return RedirectResponse("/admin#tracks", status_code=303)
+    track.flac_pinned = pinned == "1"
+    db.commit()
+    flash(request, "已永久保留该 FLAC。" if track.flac_pinned else "已取消永久保留。", "success")
+    return RedirectResponse("/admin#tracks", status_code=303)
+
+
+@app.post("/admin/flac/settings")
+def admin_flac_settings(request: Request, csrf_token: str = Form(""), quota_gb: str = Form("1000"), db: Session = Depends(get_db)):
+    require_csrf(request, csrf_token)
+    require_admin(request, db)
+    try:
+        gb = float((quota_gb or "1000").strip())
+    except ValueError:
+        gb = 1000.0
+    gb = max(0.5, min(gb, 10000.0))
+    set_setting(db, "flac_quota_gb", str(gb).rstrip("0").rstrip(".") if gb != int(gb) else str(int(gb)))
+    try:
+        pruned = dj_flac.enforce_flac_quota(
+            db, db.scalars(select(Track)).all(), UPLOAD_DIR, FLAC_SNAP_ROOTS,
+            dj_flac.flac_quota_bytes(lambda k, d="": get_setting(db, k, d)),
+            OPT_DISK_MIN_FREE,
+            lambda k, d="": get_setting(db, k, d),
+            lambda k, v: set_setting(db, k, v),
+            remote_delete=r2_delete_key,
+        )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logging.exception("flac quota enforce on settings failed")
+        db.rollback()
+        pruned = []
+    msg = f"FLAC 配额已设为 {gb:g} GB。"
+    if pruned:
+        msg += f" 因超出配额或磁盘空间，已清理 {len(pruned)} 个未保留的旧 FLAC。"
+    flash(request, msg, "success")
+    return RedirectResponse("/admin#tracks", status_code=303)
+
+
+@app.get("/admin/r2/status")
+def admin_r2_status(request: Request, db: Session = Depends(get_db)):
+    require_admin(request, db)
+    snap = r2_status_snapshot()
+    tracks = db.scalars(select(Track)).all()
+    snap["local_count"] = sum(1 for tr in tracks if (getattr(tr, "storage", "local") or "local") != "r2")
+    snap["remote_count"] = sum(1 for tr in tracks if (getattr(tr, "storage", "local") or "local") == "r2")
+    return snap
+
+
+@app.post("/admin/r2/migrate")
+def admin_r2_migrate(request: Request, csrf_token: str = Form(""), db: Session = Depends(get_db)):
+    require_csrf(request, csrf_token)
+    require_admin(request, db)
+    if not r2_storage.r2_enabled():
+        flash(request, "R2 未启用，无法迁移。", "error")
+        return RedirectResponse("/admin#tracks", status_code=303)
+    with _R2_LOCK:
+        running = _R2_STATUS.get("state") == "running"
+    if running:
+        flash(request, "迁移已在进行中。", "info")
+        return RedirectResponse("/admin#tracks", status_code=303)
+    _R2_QUEUE.put(("migrate",))
+    flash(request, "已开始把本地曲目迁移到 R2，可在本页查看进度。", "success")
     return RedirectResponse("/admin#tracks", status_code=303)
 
 
@@ -6485,8 +7206,9 @@ OPT_CHUNK_BYTES = 8 * 1024 * 1024          # client chunk size (stays far below 
 OPT_CHUNK_MAX = 16 * 1024 * 1024
 OPT_MAX_DURATION = 6 * 3600                # non-admin, seconds
 OPT_MAX_DURATION_ADMIN = 12 * 3600         # admin
-OPT_DISK_MIN_FREE = 3 * 1024 * 1024 * 1024
-OPT_KEEP_SECONDS = 24 * 3600
+OPT_DISK_MIN_FREE = int(1.5 * 1024 * 1024 * 1024)  # keep at least 1.5GB free after a job's estimated need
+OPT_KEEP_SECONDS = 12 * 3600                       # un-imported finished jobs
+OPT_FAILED_KEEP_SECONDS = 2 * 3600                 # failed jobs (let the user read the error first)
 OPT_UPLOAD_STALE = 6 * 3600                # large chunked uploads may take a while
 OPT_USER_ACTIVE_MAX = 2                    # non-admin: unfinished jobs at once
 OPT_USER_DAILY_MAX = 10                    # non-admin: jobs per 24h
@@ -6575,6 +7297,40 @@ def _opt_disk_free() -> int:
         return shutil.disk_usage(str(UPLOAD_DIR)).free
     except OSError:
         return 0
+
+
+def _opt_fmt_bytes(n: int) -> str:
+    return _bak_fmt_bytes(n)
+
+
+def _opt_est_need(src_size: int = 0, duration: float = 0, sample_rate: int = 44100,
+                  src_on_disk: bool = False) -> int:
+    """Download (if not already on disk) + FLAC24 + MP3 320k + 15% scratch + reserve."""
+    sr = int(sample_rate or 44100) or 44100
+    if duration and duration > 0:
+        flac = int(float(duration) * sr * 2 * 3 * 0.7)
+        mp3 = int(float(duration) * 40000)
+        outputs = int((flac + mp3) * 1.15)
+    else:
+        outputs = int(max(0, int(src_size or 0)) * 6 * 1.15)
+    incoming = 0 if src_on_disk else max(0, int(src_size or 0))
+    return incoming + outputs + OPT_DISK_MIN_FREE
+
+
+def _opt_disk_msg(need: int) -> str:
+    free = _opt_disk_free()
+    return (
+        f"服务器磁盘空间不足（剩余 {_opt_fmt_bytes(free)}，"
+        f"本次约需 {_opt_fmt_bytes(need)}，需保留 {_opt_fmt_bytes(OPT_DISK_MIN_FREE)}），请稍后再试"
+    )
+
+
+def _opt_require_disk(need: int, http: bool = True) -> None:
+    if _opt_disk_free() < need:
+        msg = _opt_disk_msg(need)
+        if http:
+            raise HTTPException(status_code=507, detail=msg)
+        raise RuntimeError(msg)
 
 
 def _opt_public(job: dict) -> dict:
@@ -6861,10 +7617,9 @@ def _opt_process(job_id: str) -> None:
         if dur > cap:
             raise RuntimeError(f"音频超过 {_opt_hours_label(cap)} 小时上限")
         sr = _opt_out_rate(info["sample_rate"])
-        # orig is already on disk. Reserve FLAC24 (~0.7× 24-bit stereo PCM) + MP3 320k + 15% scratch.
-        est = int(dur * (sr * 2 * 3 * 0.7 + 40000) * 1.15)
-        if _opt_disk_free() < OPT_DISK_MIN_FREE + est:
-            raise RuntimeError("服务器磁盘空间不足，请稍后再试")
+        # orig is already on disk. Need FLAC24 + MP3 320k + 15% scratch + reserve.
+        _opt_require_disk(_opt_est_need(src_size=src.stat().st_size, duration=dur,
+                                        sample_rate=sr, src_on_disk=True), http=False)
         _opt_update(job_id, duration=round(dur, 2), sample_rate=info["sample_rate"], channels=info["channels"],
                     codec=info["codec"], out_rate=sr, progress=3)
         # Per ffmpeg pass (not the whole pipeline). 4× resample + limiter can approach realtime;
@@ -6917,6 +7672,9 @@ def _opt_process(job_id: str) -> None:
         outputs = {"flac": flac.stat().st_size, "mp3": mp3.stat().st_size}
         _opt_update(job_id, state="done", stage="完成", progress=100, after=after, gain_db=round(gain, 2),
                     outputs=outputs, finished=time.time())
+        # Telegram originals are no longer needed once outputs exist; the library copy is created on import.
+        if (job or {}).get("source") == "telegram":
+            _opt_drop_orig(job_id)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc) if isinstance(exc, RuntimeError) else "处理失败，请换一个文件再试"
         for p in (flac, mp3):
@@ -6930,6 +7688,35 @@ def _opt_process(job_id: str) -> None:
             (d / "ffmpeg.log").unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _opt_purge_job_dir(job_id: str) -> None:
+    if not OPT_ID_RE.match(job_id or ""):
+        return
+    shutil.rmtree(_opt_job_dir(job_id), ignore_errors=True)
+
+
+def _opt_drop_orig(job_id: str) -> None:
+    d = _opt_job_dir(job_id)
+    for p in d.glob("orig.*"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _opt_library_exists(job: dict) -> bool:
+    tid = job.get("track_id") if job else None
+    if not tid:
+        return False
+    db = SessionLocal()
+    try:
+        track = db.get(Track, int(tid))
+        return bool(track and track.filename and (UPLOAD_DIR / track.filename).is_file())
+    except (TypeError, ValueError):
+        return False
+    finally:
+        db.close()
 
 
 def _opt_cleanup() -> None:
@@ -6947,15 +7734,21 @@ def _opt_cleanup() -> None:
         job = _opt_load(name)
         try:
             age_ref = float((job or {}).get("updated") or d.stat().st_mtime)
-        except OSError:
+            created = float((job or {}).get("created") or age_ref)
+        except (TypeError, ValueError, OSError):
             continue
         state = (job or {}).get("state")
-        stale_upload = state in ("uploading", "uploaded") and now - age_ref > OPT_UPLOAD_STALE
-        if job is None and now - d.stat().st_mtime > OPT_UPLOAD_STALE:
+        imported = bool(job and job.get("track_id") and _opt_library_exists(job))
+        stale_upload = state in ("uploading", "uploaded", "downloading") and now - age_ref > OPT_UPLOAD_STALE
+        if job is None and now - age_ref > OPT_UPLOAD_STALE:
             stale_upload = True
-        expired = now - float((job or {}).get("created") or age_ref) > OPT_KEEP_SECONDS and state not in ("queued", "running")
-        if stale_upload or expired:
+        failed_expired = state == "failed" and now - created > OPT_FAILED_KEEP_SECONDS
+        expired = now - created > OPT_KEEP_SECONDS and state not in ("queued", "running", "downloading")
+        if imported or stale_upload or failed_expired or expired:
             shutil.rmtree(d, ignore_errors=True)
+            continue
+        if state == "done" and (job or {}).get("source") == "telegram":
+            _opt_drop_orig(name)
 
 
 def _opt_worker() -> None:
@@ -7009,7 +7802,7 @@ def _opt_name_clean(name: str) -> str:
 @app.get("/dj/optimize/jobs")
 def opt_jobs(request: Request, db: Session = Depends(get_db)):
     user = _opt_user_or_401(request, db)
-    # Imported jobs stay on disk for the usual 24h cleanup, but are hidden from this list.
+    # Imported jobs are deleted as soon as the library copy exists; any leftover is hidden here.
     jobs = [j for j in _opt_all_jobs() if j.get("user_id") == user.id and not j.get("track_id")]
     jobs.sort(key=lambda j: float(j.get("created") or 0), reverse=True)
     return {"jobs": [_opt_public(j) for j in jobs[:20]]}
@@ -7047,8 +7840,7 @@ async def opt_init(request: Request, db: Session = Depends(get_db)):
             trim_end = round(tv, 2)
     except (TypeError, ValueError):
         trim_end = None
-    if _opt_disk_free() < OPT_DISK_MIN_FREE + size * 5:
-        raise HTTPException(status_code=507, detail="服务器磁盘空间不足（需保留 3GB），请稍后再试")
+    _opt_require_disk(_opt_est_need(src_size=size, src_on_disk=False), http=True)
     now = time.time()
     if not user.is_admin:
         mine = [j for j in _opt_all_jobs() if j.get("user_id") == user.id]
@@ -7111,8 +7903,7 @@ def opt_start(job_id: str, request: Request, db: Session = Depends(get_db)):
     path = _opt_job_dir(job_id) / f"orig{job['ext']}"
     if not path.is_file() or path.stat().st_size != int(job.get("size") or -1):
         raise HTTPException(status_code=409, detail="文件不完整，请重新上传")
-    if _opt_disk_free() < OPT_DISK_MIN_FREE:
-        raise HTTPException(status_code=507, detail="服务器磁盘空间不足（需保留 3GB），请稍后再试")
+    _opt_require_disk(_opt_est_need(src_size=int(job.get("size") or 0), src_on_disk=True), http=True)
     if not user.is_admin and _opt_queue.qsize() >= OPT_QUEUE_MAX:
         raise HTTPException(status_code=429, detail="排队任务较多，请稍后再试")
     job = _opt_update(job_id, state="queued", stage="排队中", progress=0, error=None) or job
@@ -7166,7 +7957,8 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
             raise HTTPException(status_code=409, detail="还没处理完成")
         if job.get("track_id"):
             raise HTTPException(status_code=409, detail="已经导入过曲库了")
-        fmt = "flac" if payload.get("format") == "flac" else "mp3"
+        # Library imports always store the optimized MP3 320k (FLAC remains downloadable from the job).
+        fmt = "mp3"
         src = _opt_job_dir(job_id) / f"optimized.{fmt}"
         if not src.is_file():
             raise HTTPException(status_code=404, detail="文件不存在或已过期")
@@ -7182,13 +7974,43 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
             title=title, filename=stored, original_name=(title + ext)[:255], uploader_id=user.id,
             status=status, pack_name=None, content_hash=file_sha256(dest), file_size=dest.stat().st_size,
         )
+        keep_flac = payload.get("keep_flac")
+        if keep_flac is None:
+            keep_flac = bool(user.is_admin)
+        if keep_flac:
+            flac_src = _opt_job_dir(job_id) / "optimized.flac"
+            if flac_src.is_file():
+                try:
+                    fname, fsize = dj_flac.attach_flac(flac_src, UPLOAD_DIR)
+                    track.flac_path = fname
+                    track.flac_size = fsize
+                    track.flac_pinned = False
+                    track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                except Exception:  # noqa: BLE001
+                    logging.exception("keep FLAC on import failed for job %s", job_id)
         db.add(track)
         try:
             db.commit()
         except Exception:
             db.rollback()
             dest.unlink(missing_ok=True)
+            if getattr(track, "flac_path", None):
+                dj_flac.drop_track_flac(track, UPLOAD_DIR, FLAC_SNAP_ROOTS)
             raise
+        try:
+            if track.flac_path:
+                dj_flac.enforce_flac_quota(
+                    db, db.scalars(select(Track)).all(), UPLOAD_DIR, FLAC_SNAP_ROOTS,
+                    dj_flac.flac_quota_bytes(lambda k, d="": get_setting(db, k, d)),
+                    OPT_DISK_MIN_FREE,
+                    lambda k, d="": get_setting(db, k, d),
+                    lambda k, v: set_setting(db, k, v),
+                    remote_delete=r2_delete_key,
+                )
+                db.commit()
+        except Exception:  # noqa: BLE001
+            logging.exception("flac quota enforce after import failed")
+            db.rollback()
         job["track_id"] = track.id
         job["track_status"] = status
         job["imported_format"] = fmt
@@ -7198,6 +8020,9 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
                 tga_done_mark(job.get("tg_chat_id"), job.get("tg_msg"), downloaded=True, track_id=track.id)
             except Exception:  # noqa: BLE001
                 pass
+        # Library copy is now the source of truth; drop the optimize job files immediately.
+        _opt_purge_job_dir(job_id)
+        schedule_r2_upload(track.id)
     msg = "已导入曲库并发布" if status == TRACK_STATUS_APPROVED else "已提交到曲库，管理员审核通过后显示"
     return {"ok": True, "track_id": track.id, "status": status, "message": msg}
 
@@ -8793,8 +9618,7 @@ async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str) -> 
         raise HTTPException(status_code=400, detail="不支持的音频格式")
     if not 0 < item["size"] <= OPT_MAX_BYTES_ADMIN:
         raise HTTPException(status_code=413, detail=f"文件超过 {OPT_MAX_BYTES_ADMIN // (1024 * 1024)}MB 上限")
-    if _opt_disk_free() < OPT_DISK_MIN_FREE + item["size"] * 5:
-        raise HTTPException(status_code=507, detail="服务器磁盘空间不足（需保留 3GB），请稍后再试")
+    _opt_require_disk(_opt_est_need(src_size=item["size"], src_on_disk=False), http=True)
     chat = _tga_chat_public(ent)
     base = " - ".join(x for x in [item["performer"], item["title"]] if x) or item["name"] or f"telegram-{msg_id}"
     name = _opt_name_clean(Path(base).stem + item["ext"])
@@ -9095,7 +9919,11 @@ def serve_upload(filename: str, request: Request, db: Session = Depends(get_db))
         user = current_user(request, db)
         if not user or (not user.is_admin and user.id != track.uploader_id):
             raise HTTPException(status_code=404, detail="文件不存在")
-    return FileResponse(path, filename=track.original_name or safe)
+    media = {
+        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4", ".flac": "audio/flac",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media, filename=track.original_name or safe)
 
 
 @app.get("/health")

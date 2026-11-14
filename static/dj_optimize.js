@@ -130,8 +130,9 @@
     var imported = j.track_id
       ? '<p class="djopt-ok">✅ 已导入曲库（' + (j.track_status === "approved" ? "已发布" : "待管理员审核") + "，格式 " + esc((j.imported_format || "").toUpperCase()) + "）</p>"
       : '<div class="djopt-import"><input type="text" maxlength="200" class="djopt-title" value="' + esc(stem + "（优化版）") + '" aria-label="曲名">' +
-        '<select class="djopt-fmt" aria-label="导入格式"><option value="mp3">MP3 320k</option><option value="flac">FLAC 无损</option></select>' +
-        '<button type="button" class="btn btn-sm djopt-imp">导入曲库</button></div>';
+        '<label class="djopt-keepflac"><input type="checkbox" class="djopt-keep-flac"' + (document.getElementById("djopt") && document.getElementById("djopt").getAttribute("data-keep-flac") === "1" ? " checked" : "") + '> 同时保留 FLAC 无损</label>' +
+        '<button type="button" class="btn btn-sm djopt-imp">导入曲库（MP3 320k）</button></div>' +
+        '<p class="muted">导入曲库保存优化后的 MP3 320k 用于播放。勾选后会另外保留 FLAC 24bit，供管理员/操作人后期下载；任务文件在导入后仍会立即清理。</p>';
     box.innerHTML =
       '<table class="djopt-stats"><thead><tr><th></th><th>整体响度</th><th>真峰值</th><th>动态范围</th></tr></thead><tbody>' +
       "<tr><td>原版</td><td>" + num(b.i, " LUFS") + "</td><td>" + num(b.tp, " dBTP") + "</td><td>" + num(b.lra, " LU") + "</td></tr>" +
@@ -181,9 +182,11 @@
         imp.disabled = true;
         var msg = box.querySelector(".djopt-msg");
         msg.textContent = "正在导入…";
+        var keep = box.querySelector(".djopt-keep-flac");
         api("POST", "/dj/optimize/" + j.id + "/import", {
           title: box.querySelector(".djopt-title").value,
-          format: box.querySelector(".djopt-fmt").value
+          format: "mp3",
+          keep_flac: !!(keep && keep.checked)
         }).then(function (r) {
           c.el.remove();
           delete cards[j.id];

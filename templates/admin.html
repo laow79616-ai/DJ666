@@ -115,6 +115,58 @@ a.admin-dj-entry {
       <h2>曲目{% if pending_tracks %} <span class="count">{{ pending_tracks|length }} 待审核</span>{% endif %}</h2>
     </div>
     <div class="admin-pane-body">
+      <div class="flac-panel">
+        <h3 class="ann-log-title">FLAC 无损存档 <span class="muted tgf-desc">导入优化曲目时可同时保留 FLAC 24bit；前台播放仍是 MP3 320k。仅管理员/操作人可下载。</span></h3>
+        <p class="hint">当前 {{ flac_stats.count if flac_stats is defined else 0 }} 个文件，共 {{ (flac_stats.total if flac_stats is defined else 0)|fmt_bytes }}（其中永久保留 {{ flac_stats.pinned if flac_stats is defined else 0 }} 个）。配额 {{ flac_stats.quota_gb if flac_stats is defined else 1000 }} GB；超出配额时会自动删除最旧的未保留 FLAC（含 R2 上的对象）。仅磁盘空间不足时的清理只删本地文件，不会删除已迁移到 R2 的对象。较早由 FLAC 转为 MP3 的 12 首曲目当时未保留无损文件，无法恢复。</p>
+        <form class="flac-quota-form" action="/admin/flac/settings" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <label>配额（GB） <input type="number" name="quota_gb" min="0.5" max="10000" step="0.5" value="{{ flac_stats.quota_gb if flac_stats is defined else 1000 }}"></label>
+          <button type="submit" class="btn btn-sm">保存配额</button>
+        </form>
+        {% if flac_stats is defined and flac_stats.prune_log %}
+        <details class="flac-prune-log"><summary>自动清理记录（最近 {{ flac_stats.prune_log|length }} 条）</summary>
+          <ul class="muted">
+            {% for e in flac_stats.prune_log %}
+            <li>{{ e.at }} · #{{ e.track_id }} {{ e.title }} · {{ e.size|fmt_bytes }} · {{ e.why }}</li>
+            {% endfor %}
+          </ul>
+        </details>
+        {% endif %}
+      </div>
+        {% if r2_status is defined %}
+        <div class="r2-panel">
+          <h3 class="ann-log-title">R2 对象存储 <span class="muted tgf-desc">播放用 MP3 走 cdn.dj666.pw；FLAC 仅管理员通过短时预签名链接下载。</span></h3>
+          {% if r2_status.enabled %}
+          <p class="hint">已启用。曲目 {{ r2_remote_count if r2_remote_count is defined else 0 }} 首在 R2，{{ r2_local_count if r2_local_count is defined else 0 }} 首仍在本地。{% if r2_status.state == 'running' %} 正在迁移：{{ r2_status.done }}/{{ r2_status.total }}{% if r2_status.current %}（当前 {{ r2_status.current }}）{% endif %}，失败 {{ r2_status.failed }}。{% elif r2_status.state == 'done' %} 最近一次迁移完成：{{ r2_status.done }}/{{ r2_status.total }}，失败 {{ r2_status.failed }}{% if r2_status.last_error %}（{{ r2_status.last_error }}）{% endif %}。{% endif %}</p>
+          {% if (r2_local_count if r2_local_count is defined else 0) > 0 and r2_status.state != 'running' %}
+          <form class="flac-quota-form" action="/admin/r2/migrate" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf }}">
+            <button type="submit" class="btn btn-sm" onclick="return confirm('把剩余本地曲目逐首上传到 R2，校验通过后删除本地文件？');">迁移剩余本地曲目到 R2</button>
+          </form>
+          {% endif %}
+          {% if r2_status.state == 'running' %}
+          <p class="hint" id="r2MigrateLive">迁移进行中，稍后刷新本页即可看到「R2」标记。</p>
+          <script>
+          (function(){
+            var n=0;
+            var t=setInterval(function(){
+              n++;
+              fetch("/admin/r2/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(s){
+                var el=document.getElementById("r2MigrateLive");
+                if(el){
+                  el.textContent="迁移进度 "+(s.done||0)+"/"+(s.total||0)+"，失败 "+(s.failed||0)+(s.current?("，当前 "+s.current):"");
+                }
+                if(s.state==="done"||s.state==="idle"||n>360){ clearInterval(t); if(s.state==="done") location.hash="tracks"; }
+              }).catch(function(){});
+            },3000);
+          })();
+          </script>
+          {% endif %}
+          {% else %}
+          <p class="hint">未启用（需要环境变量 R2_ENABLED=1 及完整凭证）。未启用时曲目仍保存在本机。</p>
+          {% endif %}
+        </div>
+        {% endif %}
       <div class="ann-log" style="margin-top:0;padding-top:0;border-top:0;">
         <h3 class="ann-log-title">待审核</h3>
         <div class="table-wrap">
@@ -126,7 +178,9 @@ a.admin-dj-entry {
               {% for track in pending_tracks %}
               <tr>
                 <td class="track-title-cell">
-                  <a href="/uploads/{{ track.filename }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
+                  {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
                   <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
                   <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
                     <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -139,6 +193,21 @@ a.admin-dj-entry {
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
                 <td>{{ track.created_at|fmt_time }}</td>
                 <td class="row-actions-cell">
+
+                  {% if track.flac_path or track.flac_r2_key %}
+                  <span class="flac-badge" title="已保留 FLAC 无损">FLAC{% if track.flac_pinned %} · 保留{% endif %}</span>
+                  <a class="link-btn" href="/admin/tracks/{{ track.id }}/flac">下载 FLAC（{{ (track.flac_size or 0)|fmt_bytes }}）</a>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/pin" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="hidden" name="pinned" value="{{ '0' if track.flac_pinned else '1' }}">
+                    <button type="submit" class="link-btn">{{ "取消保留" if track.flac_pinned else "永久保留" }}</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/delete" method="post" onsubmit="return confirm('删除这首的 FLAC 存档？MP3 播放不受影响。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除 FLAC</button>
+                  </form>
+                  {% endif %}
+
                   <form class="inline-form" action="/admin/tracks/{{ track.id }}/approve" method="post">
                     <input type="hidden" name="csrf_token" value="{{ csrf }}">
                     <button type="submit" class="link-btn">通过</button>
@@ -172,7 +241,9 @@ a.admin-dj-entry {
               {% for track in published_tracks %}
               <tr>
                 <td class="track-title-cell">
-                  <a href="/uploads/{{ track.filename }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
+                  {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
                   <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
                   <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
                     <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -184,7 +255,22 @@ a.admin-dj-entry {
                 <td>{{ track.pack_name or "—" }}</td>
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
                 <td>{{ track.created_at|fmt_time }}</td>
-                <td>
+                <td class="row-actions-cell">
+
+                  {% if track.flac_path or track.flac_r2_key %}
+                  <span class="flac-badge" title="已保留 FLAC 无损">FLAC{% if track.flac_pinned %} · 保留{% endif %}</span>
+                  <a class="link-btn" href="/admin/tracks/{{ track.id }}/flac">下载 FLAC（{{ (track.flac_size or 0)|fmt_bytes }}）</a>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/pin" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="hidden" name="pinned" value="{{ '0' if track.flac_pinned else '1' }}">
+                    <button type="submit" class="link-btn">{{ "取消保留" if track.flac_pinned else "永久保留" }}</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/delete" method="post" onsubmit="return confirm('删除这首的 FLAC 存档？MP3 播放不受影响。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除 FLAC</button>
+                  </form>
+                  {% endif %}
+
                   <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
                     <input type="hidden" name="csrf_token" value="{{ csrf }}">
                     <button type="submit" class="link-btn danger">删除</button>
@@ -211,7 +297,9 @@ a.admin-dj-entry {
               {% for track in rejected_tracks %}
               <tr>
                 <td class="track-title-cell">
-                  <a href="/uploads/{{ track.filename }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
+                  {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
                   <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
                   <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
                     <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -223,7 +311,22 @@ a.admin-dj-entry {
                 <td>{{ track.pack_name or "—" }}</td>
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
                 <td>{{ track.created_at|fmt_time }}</td>
-                <td>
+                <td class="row-actions-cell">
+
+                  {% if track.flac_path or track.flac_r2_key %}
+                  <span class="flac-badge" title="已保留 FLAC 无损">FLAC{% if track.flac_pinned %} · 保留{% endif %}</span>
+                  <a class="link-btn" href="/admin/tracks/{{ track.id }}/flac">下载 FLAC（{{ (track.flac_size or 0)|fmt_bytes }}）</a>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/pin" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="hidden" name="pinned" value="{{ '0' if track.flac_pinned else '1' }}">
+                    <button type="submit" class="link-btn">{{ "取消保留" if track.flac_pinned else "永久保留" }}</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/delete" method="post" onsubmit="return confirm('删除这首的 FLAC 存档？MP3 播放不受影响。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除 FLAC</button>
+                  </form>
+                  {% endif %}
+
                   <form class="inline-form" action="/admin/tracks/{{ track.id }}/approve" method="post">
                     <input type="hidden" name="csrf_token" value="{{ csrf }}">
                     <button type="submit" class="link-btn">改通过</button>
@@ -373,7 +476,7 @@ a.admin-dj-entry {
           <article class="tg-post">
             <div class="tg-avatar" aria-hidden="true">DJ</div>
             <div class="tg-bubble{% if media %} has-media{% endif %}">
-              <div class="tg-author">DJ666 公告{% if ann.source_url %} <a class="tg-src" href="{{ ann.source_url }}" target="_blank" rel="noopener">TG 来源</a>{% endif %}</div>
+              <div class="tg-author">DJ666 公告{% if ann.hidden %}<span class="ann-hidden-badge">已隐藏</span>{% endif %}{% if ann.source_url %} <a class="tg-src" href="{{ ann.source_url }}" target="_blank" rel="noopener">TG 来源</a>{% endif %}</div>
               {{ media_grid(media) }}
               {% if ann.title or ann.content %}
               <div class="tg-text">
@@ -394,6 +497,18 @@ a.admin-dj-entry {
                 {% set ast = ann_stats.get(ann.id) %}
                 <button type="button" class="btn btn-sm" data-ann-edit="{{ ann.id }}">编辑</button>
                 <span class="admin-ann-stats" title="前台显示数 = dj666 同步数据 + 本站真实数据；括号内为本站真实数">❤ {{ (ast.likes if ast else 0)|cn_count }}{% if ast and ast.tg_likes %} (本站 {{ ast.real_likes }}){% endif %} · 💬 {% if ast and ast.real_comments %}<a href="#anncomments">{{ ast.comments|cn_count }}</a>{% else %}{{ (ast.comments if ast else 0)|cn_count }}{% endif %}{% if ast and ast.tg_comments %} (本站 {{ ast.real_comments }}){% endif %} · 👁 {{ (ast.views if ast else 0)|cn_count }}</span>
+                {% if ann.hidden %}
+                <form class="inline-form" action="/admin/announcements/{{ ann.id }}/unhide" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                  <button type="submit" class="link-btn">恢复显示</button>
+                </form>
+                {% else %}
+                <form class="inline-form" action="/admin/announcements/{{ ann.id }}/hide" method="post" onsubmit="return confirm('从首页隐藏这条公告？可随时恢复，不会删除。');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                  <input type="hidden" name="reason" value="管理员隐藏">
+                  <button type="submit" class="link-btn">隐藏</button>
+                </form>
+                {% endif %}
                 <form class="inline-form" action="/admin/announcements/{{ ann.id }}/delete" method="post" onsubmit="return confirm('确定删除这条公告？');">
                   <input type="hidden" name="csrf_token" value="{{ csrf }}">
                   <button type="submit" class="link-btn danger">删除</button>
@@ -639,7 +754,7 @@ a.admin-dj-entry {
       <h2>过滤内容 <span class="count">TG采集 · 文字 {{ tgf_strip|length + tgf_block|length }} 条 · 赌博广告 {{ tgf_gamble|length }} 条 · 图片 {{ tgf_images|length }} 张</span></h2>
     </div>
     <div class="admin-pane-body">
-      <p class="hint">用于「Telegram 采集」：每次采集（手动或定时）都会先按这里的规则过滤；规则增删后会立即重新扫描「待处理」里尚未发布的条目。已发布到首页的公告不受影响。文字匹配不区分大小写，并忽略空格、表情、箭头和标点（例如「➡️」「➞」视为相同）。赌博广告采用「关键词组合打分」：弱词（如「点数」「充值」）单独出现不会忽略帖子，以免误伤曲名或新闻报道；命中「返水」「首充」「点击上桌」等广告号召语才会整条忽略。</p>
+      <p class="hint">用于「Telegram 采集」：每次采集（手动或定时）以及发布前（自动发布、一键发布、单条发布）都会按这里的规则过滤。规则增删后会立即重新扫描「待处理」。文字匹配不区分大小写，并忽略空格、表情、箭头和标点；同时检查正文、链接、按钮文字和网址。您手动添加到过滤池的词条一律作为「整条忽略」（硬拦截），并做全角/空格正规化。新闻/曝光类报道仍会保留，但出现广告号召、联系方式或「#友情广告」等标签时不再豁免。已从首页隐藏的广告可在本页下方恢复，不会被硬删除。</p>
 
       <div class="tgf-grid">
         <form class="tgf-card" action="/admin/telegram/filters/text" method="post">
@@ -647,8 +762,8 @@ a.admin-dj-entry {
           <h3>添加文字规则 <span class="muted">（每行一条，可直接粘贴多行）</span></h3>
           <textarea name="patterns" rows="5" placeholder="例如：&#10;关注大事件频道➡️ @Svip 投稿：@tx188&#10;投稿：@&#10;#付费广告" required></textarea>
           <div class="tgf-modes">
-            <label class="tg-check"><input type="radio" name="mode" value="strip" checked> 去除推广语：删掉包含该文字的那一行/片段，保留其余新闻内容</label>
-            <label class="tg-check"><input type="radio" name="mode" value="block"> 整条忽略：包含该文字的帖子视为广告，整条自动忽略（连同图片视频）</label>
+            <label class="tg-check"><input type="radio" name="mode" value="block" checked> 整条忽略：包含该文字的帖子视为广告，整条自动忽略（连同图片视频）。手动添加的词条无论选哪一项都会硬拦截</label>
+            <label class="tg-check"><input type="radio" name="mode" value="strip"> 去除推广语：删掉包含该文字的那一行/片段，保留其余新闻内容（仅对系统默认规则按此处理）</label>
             <label class="tg-check"><input type="radio" name="mode" value="gamble"> 赌博广告：加入组合打分词库（单个弱词不会整条忽略）</label>
           </div>
           <button type="submit" class="btn btn-sm">批量添加</button>
@@ -743,6 +858,26 @@ a.admin-dj-entry {
         <p class="muted">暂无图片规则。上传样本，或在待处理里勾选广告条目点「图片加入过滤并忽略」。</p>
         {% endif %}
       </form>
+
+      <div class="tgf-hidden">
+        <h3 class="ann-log-title">已隐藏的公告（{{ hidden_anns|length if hidden_anns is defined else 0 }}） <span class="muted tgf-desc">从首页软隐藏，可恢复；不会删除记录或媒体。</span></h3>
+        {% if hidden_anns %}
+        <ul class="tgf-ign-list">
+          {% for ann in hidden_anns %}
+          <li>
+            <span class="tgf-ign-text" title="{{ ann.title or ann.content }}">#{{ ann.id }} {{ (ann.title or ann.content or "（无标题）")|replace("\n", " ") }}</span>
+            <span class="tgf-reason">{{ ann.hidden_reason or "广告" }} · {{ ann.hidden_at|fmt_time if ann.hidden_at else "" }}</span>
+            <form class="inline-form" action="/admin/announcements/{{ ann.id }}/unhide" method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <button type="submit" class="link-btn">恢复到首页</button>
+            </form>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="muted">当前没有隐藏的公告。</p>
+        {% endif %}
+      </div>
     </div>
   </div>
 </section>
@@ -1061,7 +1196,7 @@ a.admin-dj-entry {
           </div>
           <span class="tga-badge" id="tgaBadge">检查中…</span>
         </header>
-        <p class="tga-note">用一个 Telegram 账号读取频道里的音频，服务器下载原文件后自动进入下方「上传优化」（FLAC + MP3、A/B 对比、导入曲库）。<b>仅处理自有或已授权频道的音频。</b></p>
+        <p class="tga-note">用一个 Telegram 账号读取频道里的音频，服务器下载原文件后自动进入下方「上传优化」（输出 FLAC 与 MP3、A/B 对比；导入曲库保存为 MP3 320k）。<b>仅处理自有或已授权频道的音频。</b></p>
         <p class="tga-msg" id="tgaMsg" role="status" hidden></p>
 
         <details class="tga-box" id="tgaCfgBox">
@@ -1232,7 +1367,7 @@ a.admin-dj-entry {
 <script type="application/json" id="annData">{{ ann_data|tojson }}</script>
 <script type="application/json" id="tgData">{{ tg_data|tojson }}</script>
 <script src="/static/admin_tg_status.js?v=tgtitle1" defer></script>
-<script src="/static/dj_optimize.js?v=optlim1" defer></script>
+<script src="/static/dj_optimize.js?v=r2stor1" defer></script>
 <script src="/static/admin_ann.js?v=tgtitle1" defer></script>
 <script src="/static/admin_upload.js?v=cat1" defer></script>
 <script src="/static/admin_bot.js?v=adsup2" defer></script>
