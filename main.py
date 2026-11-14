@@ -2723,16 +2723,20 @@ def tg_gamble_hit(ctx_data: dict, raw: str) -> Optional[tuple[list, int]]:
 
 
 # Promo fragments the user asked to strip (not whole-post ignore):
-# 1) #网友投稿 hashtag and its t.me ?q= search links (encoded or decoded)
+# 1) Any Telegram hashtag-search query (?q=%23... encoded, or ?q=#... decoded),
+#    including t.me/<channel>?q=... and t.me/s/<channel>?q=... links, bare query
+#    strings, bare percent-encoded hashtags, and HTML anchors whose href is a
+#    hashtag search. Visible #tags in sentence text are kept; only #网友投稿
+#    (a previously requested tag) is stripped as visible text.
 # 2) t.me/tx188 (and telegram.me / @tx188) in all common URL shapes, plus HTML anchors.
-_TG_WANGYOU_ENC = r"%E7%BD%91%E5%8F%8B%E6%8A%95%E7%A8%BF"
-_TG_WANGYOU_Q = r"(?:%23|#)(?:网友投稿|" + _TG_WANGYOU_ENC + r")"
-_TG_WANGYOU_LINK_RE = re.compile(
-    r"(?i)(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.me)/[^\s<>'\"?#]+"
-    r"\?q=" + _TG_WANGYOU_Q + r"(?:&[^\s<>'\"]*)?"
-    r"|(?:[?&]q=" + _TG_WANGYOU_Q + r"(?:&[^\s<>'\"]*)?)"
-    r"|" + _TG_WANGYOU_ENC
+_TG_Q_HASH_VAL = r"(?:%23|#)(?:%[0-9A-Fa-f]{2}|[^\s<>\"'&#?])+"
+_TG_Q_HASH_RE = re.compile(
+    r"(?i)(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.me)/(?:s/)?"
+    r"[^\s<>'\"?#]+\?q=" + _TG_Q_HASH_VAL + r"(?:&[^\s<>'\"]*)?"
+    r"|(?:[?&]q=" + _TG_Q_HASH_VAL + r"(?:&[^\s<>'\"]*)?)"
 )
+_TG_BARE_ENC_HASH_RE = re.compile(r"%23(?:%[0-9A-Fa-f]{2})+")
+_TG_Q_HREF_RE = re.compile(r"(?i)[?&]q=(?:%23|#)")
 _TG_WANGYOU_TAG_RE = re.compile(r"#网友投稿(?:\s*[：:]\s*)?")
 _TG_TX188_RE = re.compile(
     r"(?i)(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.me)/(?:s/)?tx188(?:/\d+)?/?(?:[?#][^\s<>'\"]*)?"
@@ -2742,13 +2746,20 @@ _TG_ANCHOR_RE = re.compile(r"(?is)<a\b([^>]*)>(.*?)</a>")
 _TG_HREF_RE = re.compile(r"""(?is)\bhref\s*=\s*['"]([^'"]+)['"]""")
 
 
+def _tg_is_hashtag_query(value: str) -> bool:
+    s = value or ""
+    if not s:
+        return False
+    return bool(_TG_Q_HASH_RE.search(s) or _TG_BARE_ENC_HASH_RE.search(s) or _TG_Q_HREF_RE.search(s))
+
+
 def _tg_is_wangyou_or_tx188(value: str) -> bool:
     s = value or ""
     if not s:
         return False
-    if _TG_WANGYOU_LINK_RE.search(s) or _TG_WANGYOU_TAG_RE.search(s) or _TG_TX188_RE.search(s):
+    if _tg_is_hashtag_query(s) or _TG_WANGYOU_TAG_RE.search(s) or _TG_TX188_RE.search(s):
         return True
-    return bool(re.search(r"(?i)(?:t(?:elegram)?\.me)/tx188\b|#网友投稿|" + _TG_WANGYOU_ENC, s))
+    return bool(re.search(r"(?i)(?:t(?:elegram)?\.me)/tx188\b|#网友投稿", s))
 
 
 def _tg_drop_matching_anchors(text: str) -> str:
@@ -2756,7 +2767,7 @@ def _tg_drop_matching_anchors(text: str) -> str:
         attrs, inner = m.group(1) or "", m.group(2) or ""
         href_m = _TG_HREF_RE.search(attrs)
         href = href_m.group(1) if href_m else ""
-        if _tg_is_wangyou_or_tx188(href) or _tg_is_wangyou_or_tx188(inner):
+        if _TG_Q_HREF_RE.search(href) or _tg_is_wangyou_or_tx188(href) or _tg_is_wangyou_or_tx188(inner):
             return " "
         return m.group(0)
     return _TG_ANCHOR_RE.sub(repl, text or "")
@@ -2777,9 +2788,10 @@ def tidy_stripped_text(text: str) -> str:
 
 
 def strip_wangyou_tx188(text: str) -> str:
-    """Remove only #网友投稿 / tx188 promo fragments; keep the rest of the post."""
+    """Remove hashtag-search queries, the #网友投稿 tag, and tx188 fragments; keep the rest."""
     s = _tg_drop_matching_anchors(text or "")
-    s = _TG_WANGYOU_LINK_RE.sub(" ", s)
+    s = _TG_Q_HASH_RE.sub(" ", s)
+    s = _TG_BARE_ENC_HASH_RE.sub(" ", s)
     s = _TG_WANGYOU_TAG_RE.sub(" ", s)
     s = _TG_TX188_RE.sub(" ", s)
     return tidy_stripped_text(s)
@@ -2799,7 +2811,6 @@ def strip_wangyou_tx188_links(items: list[dict]) -> list[dict]:
         rest = {k: v for k, v in item.items() if k not in ("text", "url")}
         out.append({"text": new_label or label, "url": url, **rest})
     return out
-
 
 def tg_strip_text(ctx_data: dict, raw: str) -> tuple[str, list[TgFilterRule]]:
     hits: dict[int, TgFilterRule] = {}
@@ -3229,7 +3240,7 @@ def backfill_wangyou_tx188(db: Session) -> dict:
     for post in db.scalars(select(TgPost).where(TgPost.status == TG_STATUS_NEW).order_by(TgPost.id)).all():
         pchanged = False
         original = post.text or ""
-        if _TG_WANGYOU_LINK_RE.search(original) or _TG_WANGYOU_TAG_RE.search(original) or _TG_TX188_RE.search(original) or _tg_is_wangyou_or_tx188(original):
+        if _tg_is_wangyou_or_tx188(original):
             new_text = strip_wangyou_tx188(original)
             if new_text != original:
                 post.text = new_text
@@ -3294,6 +3305,90 @@ def seed_tg_filter_rules_v4(db: Session) -> None:
         logging.exception("wangyou/tx188 backfill failed")
         db.rollback()
     set_setting(db, "tg_filter_seeded_v4", "1")
+    db.commit()
+
+
+
+
+DEFAULT_TG_STRIP_RULES_V5 = (
+    ("strip", "?q=%23（所有话题链接）", "所有话题链接"),
+)
+
+
+def backfill_hashtag_q(db: Session) -> dict:
+    """Strip any ?q=%23 / ?q=# hashtag-search fragments from announcements and pending posts.
+
+    Does not delete, hide, or change media / engagement fields.
+    """
+    ann_ids: list[int] = []
+    pending_ids: list[int] = []
+    for ann in db.scalars(select(Announcement).order_by(Announcement.id)).all():
+        changed = False
+        original = ann.content or ""
+        if _tg_is_wangyou_or_tx188(original):
+            new_content = strip_wangyou_tx188(original)
+            if new_content != original:
+                ann.content = new_content
+                changed = True
+        if ann.links_json:
+            old_links = ann_links(ann)
+            new_links = strip_wangyou_tx188_links(old_links)
+            if new_links != old_links:
+                ann.links_json = dump_links(new_links)
+                changed = True
+        if changed:
+            ann_ids.append(ann.id)
+    for post in db.scalars(select(TgPost).where(TgPost.status == TG_STATUS_NEW).order_by(TgPost.id)).all():
+        pchanged = False
+        original = post.text or ""
+        if _tg_is_wangyou_or_tx188(original):
+            new_text = strip_wangyou_tx188(original)
+            if new_text != original:
+                post.text = new_text
+                pchanged = True
+        if getattr(post, "edit_links_json", None):
+            old_links = ann_links(post_links_obj(post))
+            new_links = strip_wangyou_tx188_links(old_links)
+            if new_links != old_links:
+                post.edit_links_json = dump_links(new_links)
+                pchanged = True
+        if pchanged:
+            pending_ids.append(post.id)
+    if ann_ids or pending_ids:
+        db.commit()
+    logging.info("hashtag-q backfill announcements=%s pending=%s", len(ann_ids), len(pending_ids))
+    return {"announcements": ann_ids, "pending": pending_ids}
+
+
+def seed_tg_filter_rules_v5(db: Session) -> None:
+    """Visible strip rule for any ?q=%23 hashtag-search link; backfill published posts once."""
+    if get_setting(db, "tg_filter_seeded_v5", "") == "1":
+        return
+    taken = {(r.mode, tg_norm(r.pattern)) for r in db.scalars(select(TgFilterRule)).all()}
+    for mode, pattern, label in DEFAULT_TG_STRIP_RULES_V5:
+        key = (mode, tg_norm(pattern))
+        if key[1] and key not in taken:
+            db.add(TgFilterRule(mode=mode, pattern=pattern, label=label, source="seed"))
+            taken.add(key)
+        else:
+            for row in db.scalars(select(TgFilterRule).where(TgFilterRule.mode == "strip")).all():
+                if tg_norm(row.pattern) == key[1] and not (row.label or "").strip():
+                    row.label = label
+                    if row.source == "manual":
+                        row.source = "seed"
+    db.commit()
+    try:
+        result = backfill_hashtag_q(db)
+        try:
+            (DATA_DIR / "hashtag_q_backfill.json").write_text(
+                json.dumps(result, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            logging.exception("could not write hashtag-q backfill report")
+    except Exception:  # noqa: BLE001
+        logging.exception("hashtag-q backfill failed")
+        db.rollback()
+    set_setting(db, "tg_filter_seeded_v5", "1")
     db.commit()
 
 
@@ -3666,6 +3761,7 @@ def init_db() -> None:
         seed_tg_filter_rules_v2(db)
         seed_tg_filter_rules_v3(db)
         seed_tg_filter_rules_v4(db)
+        seed_tg_filter_rules_v5(db)
         try:
             apply_tg_filters(db)
         except Exception:  # noqa: BLE001
