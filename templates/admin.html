@@ -1,14 +1,15 @@
 {% extends "base.html" %}
 {% from "_tg_media.html" import media_grid %}
 {% macro track_cat_select(track) -%}
-<form class="inline-form" action="/admin/tracks/{{ track.id }}/category" method="post">
+<form class="inline-form track-cat-form" action="/admin/tracks/{{ track.id }}/category" method="post">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <select name="category" class="track-cat-select" onchange="this.form.submit()" aria-label="曲目分类">
+  <select name="category" class="track-cat-select" onchange="this.form.submit()" aria-label="曲目分类" data-prev="{{ track.category or '' }}">
     <option value=""{% if not track.category %} selected{% endif %}>未分类</option>
     {% for key, label in track_categories %}
     <option value="{{ key }}"{% if track.category == key %} selected{% endif %}>{{ label }}</option>
     {% endfor %}
   </select>
+  <span class="track-cat-status" aria-live="polite"></span>
 </form>
 {%- endmacro %}
 {% block title %}管理后台 · DJ666{% endblock %}
@@ -1396,6 +1397,7 @@ a.admin-dj-entry {
 <script src="/static/dj_optimize.js?v=r2stor1" defer></script>
 <script src="/static/admin_ann.js?v=tgtitle1" defer></script>
 <script src="/static/admin_upload.js?v=cat1" defer></script>
+<script src="/static/admin_tracks.js?v=catfix1" defer></script>
 <script src="/static/admin_bot.js?v=adsup2" defer></script>
 <script>
 (function () {

@@ -155,6 +155,19 @@ h1 { font-size: clamp(1.8rem, 4vw, 3rem); letter-spacing: 0.02em; }
 }
 .track-cat-select { width: auto; min-width: 8.2rem; padding: 6px 8px; border-radius: 8px; cursor: pointer; }
 .track-cat-select option, .upload-form select option { background: #120c1c; color: var(--text); }
+.track-cat-form { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
+.track-cat-status {
+  display: inline-block;
+  min-width: 3.6em;
+  font-size: 12px;
+  line-height: 1;
+  color: transparent;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.track-cat-status.is-ok { color: #7dffa6; }
+.track-cat-status.is-err { color: #ff8aa0; }
+.track-cat-select.is-saving { opacity: 0.7; }
 
 input[type="text"], input[type="email"], input[type="password"], input[type="file"], textarea {
   width: 100%;

@@ -5597,15 +5597,39 @@ def admin_track_set_category(
     csrf_token: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    require_csrf(request, csrf_token)
-    require_admin(request, db)
+    ajax = wants_json(request)
+    try:
+        require_csrf(request, csrf_token)
+    except HTTPException:
+        if ajax:
+            return JSONResponse({"ok": False, "error": "页面已过期，请刷新后重试"}, status_code=400)
+        raise
+    try:
+        require_admin(request, db)
+    except HTTPException as exc:
+        if ajax:
+            status = 401 if exc.status_code in (303, 401) else exc.status_code
+            detail = exc.detail if isinstance(exc.detail, str) else "无权限"
+            if exc.status_code == 303:
+                detail = "请先登录"
+            return JSONResponse({"ok": False, "error": detail}, status_code=status)
+        raise
     track = db.get(Track, track_id)
     if not track:
+        if ajax:
+            return JSONResponse({"ok": False, "error": "曲目不存在。"}, status_code=404)
         flash(request, "曲目不存在。", "error")
         return RedirectResponse("/admin#tracks", status_code=303)
     track.category = normalize_track_category(category)
     db.commit()
     label = TRACK_CATEGORY_LABELS.get(track.category or "", "未分类")
+    if ajax:
+        return JSONResponse({
+            "ok": True,
+            "track_id": track.id,
+            "category": track.category or "",
+            "label": label,
+        })
     flash(request, f"已将「{track.title}」设为{label}。", "success")
     return RedirectResponse("/admin#tracks", status_code=303)
 
