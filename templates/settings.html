@@ -74,11 +74,7 @@
         <button type="button" class="play-btn" disabled aria-label="正在导入，暂不可播放">…</button>
         {% endif %}
         <div class="track-meta my-track-meta">
-          <form class="track-rename-form" action="/settings/tracks/{{ track.id }}/rename" method="post">
-            <input type="hidden" name="csrf_token" value="{{ csrf }}">
-            <input type="text" name="title" value="{{ track.title }}" maxlength="200" required aria-label="曲目名称">
-            <button type="submit" class="btn btn-sm">保存名称</button>
-          </form>
+          <strong class="track-title"><span class="track-title-text">{{ track.title }}</span></strong>
           <span class="muted my-track-sub">
             <span class="status-badge status-{{ track.status }}">
               {% if track.status == 'approved' %}已发布

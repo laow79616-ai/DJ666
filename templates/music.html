@@ -4,73 +4,18 @@
 {% block page_id %}music{% endblock %}
 {% block extra_head %}
 <style>
-/* Critical 「改名」 rules so a stale style.css cannot hide the button. */
 #music, #music .track-list, #music .track-item { overflow: visible !important; }
 #music .track-list { padding-right: 8px; padding-bottom: 108px; }
-#music .track-item.is-editable {
-  display: -webkit-flex;
-  display: flex;
+#music .track-item {
   display: grid;
-  -webkit-grid-template-columns: 42px minmax(0, 1fr) auto;
-  grid-template-columns: 42px minmax(0, 1fr) auto;
-  -webkit-column-gap: 8px;
+  grid-template-columns: 42px minmax(0, 1fr) 44px;
   column-gap: 8px;
-  -webkit-align-items: center;
   align-items: center;
-  position: relative;
   overflow: visible !important;
 }
-#music .track-item.is-editable .play-btn { grid-column: 1; grid-row: 1; }
-#music .track-item.is-editable .track-meta { grid-column: 2; grid-row: 1; min-width: 0; }
-#music .track-rename-btn {
-  display: -webkit-inline-flex !important;
-  display: inline-flex !important;
-  visibility: visible !important;
-  opacity: 1 !important;
-  -webkit-appearance: none;
-  appearance: none;
-  position: relative;
-  z-index: 6;
-  flex: 0 0 auto;
-  -webkit-align-items: center;
-  align-items: center;
-  -webkit-justify-content: center;
-  justify-content: center;
-  min-width: 64px;
-  min-height: 44px;
-  padding: 11px 14px;
-  border: 0;
-  border-radius: 999px;
-  background: #3cefff;
-  color: #071016;
-  font-weight: 800;
-  font-size: 1.05rem;
-  line-height: 1;
-  white-space: nowrap;
-  pointer-events: auto;
-}
-#music .track-item.is-editable .track-rename-btn { grid-column: 3; grid-row: 1; }
-#music .track-item.is-editable .track-flac-dl { grid-column: 2 / 4; grid-row: 2; }
-#music .track-rename-btn[hidden] { display: none !important; }
-#music .track-rename-entry {
-  display: inline-flex !important;
-  visibility: visible !important;
-  opacity: 1 !important;
-  align-items: center;
-  min-height: 44px;
-  padding: 6px 12px;
-  color: #3cefff;
-  font-weight: 700;
-  font-size: 0.9rem;
-  border: 1px solid rgba(60,239,255,.45);
-  border-radius: 999px;
-  background: rgba(60,239,255,.08);
-  white-space: nowrap;
-  cursor: pointer;
-  -webkit-tap-highlight-color: rgba(60,239,255,.18);
-  touch-action: manipulation;
-}
-#music .track-item.is-renaming .track-rename-entry { display: none !important; }
+#music .play-btn { grid-column: 1; grid-row: 1; }
+#music .track-meta { grid-column: 2; grid-row: 1; min-width: 0; }
+#music .track-fav { grid-column: 3; grid-row: 1; }
 </style>
 {% endblock %}
 {% block content %}
@@ -88,6 +33,7 @@
       <button type="button" class="btn btn-sm" data-play-all="music">▶ 全部播放</button>
       <button type="button" class="btn btn-sm btn-ghost" data-play-all="music" data-shuffle="1">🔀 随机播放</button>
       {% endif %}
+      <a class="btn btn-sm btn-ghost music-ann-link" href="/" title="返回首页公告">📢 公告</a>
     </span>
   </div>
   {% if tracks %}

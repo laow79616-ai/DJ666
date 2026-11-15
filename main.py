@@ -242,10 +242,14 @@ TRACK_STATUS_IMPORTING = "importing"
 TRACK_CATEGORY_CHOICES = (
     ("latest_dj", "最新DJ列表"),
     ("ktv_dj", "KTV-DJ"),
-    ("note", "备注曲"),
 )
 TRACK_CATEGORY_LABELS = dict(TRACK_CATEGORY_CHOICES)
 TRACK_CATEGORY_KEYS = {k for k, _ in TRACK_CATEGORY_CHOICES}
+# 收藏 is a per-user virtual list (user_favorites), not a stored track.category.
+TRACK_FAVORITE_KEY = "fav"
+TRACK_FAVORITE_LABEL = "收藏"
+TRACK_FILTER_TABS = TRACK_CATEGORY_CHOICES + ((TRACK_FAVORITE_KEY, TRACK_FAVORITE_LABEL),)
+TRACK_LEGACY_NOTE_KEY = "note"  # former 「备注曲」 category key
 CHAT_LIMIT = 80
 CHAT_MAX_LEN = 300
 KEYWORD_MAX_LEN = 80
@@ -481,6 +485,17 @@ class Track(Base):
     )
 
     uploader: Mapped[Optional[User]] = relationship(back_populates="tracks")
+
+
+class UserFavorite(Base):
+    """Per-user favorites; 收藏 is not a global track category."""
+    __tablename__ = "user_favorites"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc)
+    )
 
 
 class ChatMessage(Base):
@@ -1014,6 +1029,24 @@ def migrate_tracks_schema(db: Session) -> None:
             if guess:
                 track.category = guess
         db.commit()
+    # 收藏 is now per-user. Move leftover 「备注曲」(note) tracks to uncategorized; do not delete them.
+    note_n = db.scalar(select(func.count()).select_from(Track).where(Track.category == TRACK_LEGACY_NOTE_KEY)) or 0
+    if note_n:
+        db.execute(text("UPDATE tracks SET category = NULL WHERE category = :k"), {"k": TRACK_LEGACY_NOTE_KEY})
+        db.commit()
+        logging.info("cleared %s tracks from legacy category 'note' (备注曲) to uncategorized", note_n)
+    db.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS user_favorites ("
+            "user_id INTEGER NOT NULL, "
+            "track_id INTEGER NOT NULL, "
+            "created_at DATETIME, "
+            "PRIMARY KEY (user_id, track_id)"
+            ")"
+        )
+    )
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_user_favorites_track_id ON user_favorites (track_id)"))
+    db.commit()
 
 
 def patch_multipart_limits() -> None:
@@ -1523,6 +1556,9 @@ def normalize_track_category(value: Optional[str]) -> Optional[str]:
     v = (value or "").strip()
     if not v:
         return None
+    # 收藏 / legacy 备注曲 are not assignable categories.
+    if v in {TRACK_FAVORITE_KEY, TRACK_FAVORITE_LABEL, TRACK_LEGACY_NOTE_KEY, "备注曲"}:
+        return None
     if v in TRACK_CATEGORY_KEYS:
         return v
     for key, label in TRACK_CATEGORY_CHOICES:
@@ -1552,8 +1588,6 @@ def infer_track_category(
     blob = re.sub(r"\s+", " ", blob)
     if "ktv" in blob:
         return "ktv_dj"
-    if "备注曲" in parts:
-        return "note"
     if "最新dj列表" in blob:
         return "latest_dj"
     return None
@@ -3987,6 +4021,8 @@ templates.env.filters["epoch"] = lambda v: int((v if v.tzinfo else v.replace(tzi
 templates.env.filters["chat_created_ms"] = chat_created_ms
 templates.env.filters["fmt_date"] = fmt_date
 templates.env.globals["track_categories"] = TRACK_CATEGORY_CHOICES
+templates.env.globals["track_filter_tabs"] = TRACK_FILTER_TABS
+templates.env.globals["track_favorite_key"] = TRACK_FAVORITE_KEY
 templates.env.globals["track_audio_url"] = track_audio_url
 templates.env.globals["track_has_flac"] = track_has_flac
 templates.env.globals["display_name"] = display_name
@@ -4113,11 +4149,17 @@ def pop_flashes(request: Request) -> list:
 
 def ctx(request: Request, db: Session, **extra):
     user = current_user(request, db)
+    favorite_ids: set[int] = set()
+    if user:
+        favorite_ids = set(
+            db.scalars(select(UserFavorite.track_id).where(UserFavorite.user_id == user.id)).all()
+        )
     data = {
         "request": request,
         "user": user,
         "csrf": get_csrf(request),
         "flashes": pop_flashes(request),
+        "favorite_ids": favorite_ids,
     }
     data.update(extra)
     return data
@@ -4231,14 +4273,12 @@ def home(request: Request, db: Session = Depends(get_db)):
             # The batch UPDATE ran in SQL; reflect it on the loaded rows without marking them dirty.
             set_committed_value(a, "site_views", int(a.site_views or 0) + 1)
     ann_stats = ann_interactions(db, [a.id for a in announcements], current_user(request, db), announcements)
-    tracks = approved_tracks(db)
     return templates.TemplateResponse(
         request,
         "index.html",
         ctx(
             request,
             db,
-            tracks=tracks,
             announcements=announcements,
             ann_stats=ann_stats,
             ann_comment_max=ANN_COMMENT_MAX_LEN,
@@ -4263,6 +4303,39 @@ def home_alias():
 def music_page(request: Request, db: Session = Depends(get_db)):
     tracks = approved_tracks(db)
     return templates.TemplateResponse(request, "music.html", ctx(request, db, tracks=tracks, nav="music"))
+
+
+@app.post("/favorites/{track_id}/toggle")
+def favorite_toggle(track_id: int, request: Request, csrf_token: str = Form(""), db: Session = Depends(get_db)):
+    """Add or remove a track from the current user's 收藏 list."""
+    try:
+        require_csrf(request, csrf_token)
+    except HTTPException:
+        return JSONResponse({"ok": False, "error": "页面已过期，请刷新后重试"}, status_code=400)
+    user = current_user(request, db)
+    if not user:
+        nxt = request.headers.get("referer") or "/music"
+        try:
+            path = urllib.parse.urlparse(nxt).path or "/music"
+        except Exception:
+            path = "/music"
+        if not path.startswith("/") or path.startswith("//"):
+            path = "/music"
+        return JSONResponse(
+            {"ok": False, "error": "请先登录后再收藏", "login": f"/login?next={path}"},
+            status_code=401,
+        )
+    track = db.get(Track, track_id)
+    if not track or track.status != TRACK_STATUS_APPROVED:
+        return JSONResponse({"ok": False, "error": "曲目不存在"}, status_code=404)
+    row = db.get(UserFavorite, (user.id, track_id))
+    if row:
+        db.delete(row)
+        db.commit()
+        return JSONResponse({"ok": True, "favorited": False, "track_id": track_id})
+    db.add(UserFavorite(user_id=user.id, track_id=track_id))
+    db.commit()
+    return JSONResponse({"ok": True, "favorited": True, "track_id": track_id})
 
 
 def dj_mixer_ctx(db: Session, user=None) -> dict:
@@ -4779,11 +4852,16 @@ def settings_rename_track(
         if wants_json:
             return JSONResponse({"ok": False, "error": "请先登录"}, status_code=401)
         return login_redirect("/settings")
-    track = db.get(Track, track_id)
-    if not track or (track.uploader_id != user.id and not user.is_admin):
+    if not user.is_admin:
         if wants_json:
-            return JSONResponse({"ok": False, "error": "只能修改自己上传的曲目名称"}, status_code=403)
-        flash(request, "不能修改这首曲目的名称。", "error")
+            return JSONResponse({"ok": False, "error": "只有管理员可以修改歌曲名称"}, status_code=403)
+        flash(request, "只有管理员可以修改歌曲名称。", "error")
+        return RedirectResponse("/settings#music", status_code=303)
+    track = db.get(Track, track_id)
+    if not track:
+        if wants_json:
+            return JSONResponse({"ok": False, "error": "曲目不存在"}, status_code=404)
+        flash(request, "曲目不存在。", "error")
         return RedirectResponse("/settings#music", status_code=303)
     display = (title or "").strip()
     if not display:

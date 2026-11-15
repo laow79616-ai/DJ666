@@ -212,8 +212,9 @@ label { display: grid; gap: 6px; font-size: 0.92rem; }
 
 .track-list { list-style: none; margin: 16px 0 0; padding: 0; }
 .track-item {
-  display: flex;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 44px;
+  column-gap: 8px;
   align-items: center;
   padding: 12px;
   border-radius: 14px;
@@ -1907,3 +1908,46 @@ body[data-page="chat"] .fab-nav {
 @media (prefers-reduced-motion: reduce) {
   .track-eq b { animation: none; }
 }
+
+/* t173: per-user 收藏 toggle (public lists). */
+.track-fav {
+  display: inline-flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  width: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: rgba(255, 47, 155, 0.08);
+  color: #ff7ab8;
+  font: inherit;
+  font-size: 0.62rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: rgba(255, 47, 155, 0.25);
+  touch-action: manipulation;
+  text-decoration: none;
+  grid-column: 3;
+  grid-row: 1;
+}
+.track-fav-ico { font-size: 1.15rem; line-height: 1; }
+.track-fav:hover, .track-fav:focus-visible {
+  background: rgba(255, 47, 155, 0.2);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(255, 47, 155, 0.4);
+  color: #ff9dcb;
+}
+.track-fav.is-on { color: #ff2f9b; background: rgba(255, 47, 155, 0.18); }
+.track-fav.is-on .track-fav-ico { color: #ff2f9b; }
+.track-fav-label { letter-spacing: 0; color: inherit; }
+.track-fav-prompt { margin: 8px 0; }
+.track-fav-prompt[hidden], .track-fav-empty[hidden], .track-fav-login[hidden] { display: none !important; }
+.track-item .track-meta { min-width: 0; }

@@ -229,14 +229,21 @@
     listEl.querySelectorAll(".track-item").forEach(function (el) {
       total++;
       var textHit = !q || norm(el.dataset.title).indexOf(q) !== -1;
-      var catHit = !cat || (el.getAttribute("data-track-cat") || "") === cat;
+      var catHit;
+      if (cat === "fav") catHit = el.getAttribute("data-fav") === "1";
+      else catHit = !cat || (el.getAttribute("data-track-cat") || "") === cat;
       var hit = textHit && catHit;
       el.hidden = !hit; if (hit) shown++;
     });
     var cnt = document.querySelector('[data-track-search-count="' + id + '"]');
     if (cnt) { cnt.hidden = !q && !cat; cnt.textContent = shown + " / " + total; }
     var empty = document.querySelector('[data-track-search-empty="' + id + '"]');
-    if (empty) empty.hidden = shown > 0 || (!q && !cat);
+    var favEmpty = document.querySelector('[data-fav-empty="' + id + '"]');
+    var favLogin = document.querySelector('[data-fav-login-empty="' + id + '"]');
+    var logged = !!(catRoot && catRoot.getAttribute("data-logged-in") === "1");
+    if (favLogin) favLogin.hidden = !(cat === "fav" && !logged);
+    if (favEmpty) favEmpty.hidden = !(cat === "fav" && logged && shown === 0);
+    if (empty) empty.hidden = (cat === "fav") || shown > 0 || (!q && !cat);
   }
   function annFilterUrl() {
     var textInput = document.querySelector("[data-ann-search]");
@@ -328,60 +335,66 @@
     if (e.key === "Escape" && e.target.matches && e.target.matches("[data-ann-date-filter]")) { e.target.value = ""; applyAnnSearch(true); }
   });
 
-  // Rename my own uploads inline (server checks ownership + CSRF).
-  function renameUi(item, open) {
-    var f = item.querySelector(".track-rename-inline"), b = item.querySelector(".track-rename-btn");
-    if (!f) return;
-    f.hidden = !open; item.classList.toggle("is-renaming", open);
-    if (b) b.hidden = open;
-    var msg = f.querySelector(".track-rename-msg"); if (msg) msg.textContent = "";
-    var inp = f.querySelector('input[name="title"]');
-    if (open) { inp.value = item.dataset.title || inp.value; inp.focus(); inp.select(); }
+  function csrfToken() {
+    var el = document.querySelector('input[name="csrf_token"]');
+    return el ? el.value : "";
+  }
+  function markFav(id, on) {
+    document.querySelectorAll('.track-item[data-track-id="' + id + '"]').forEach(function (el) {
+      el.setAttribute("data-fav", on ? "1" : "0");
+      var btn = el.querySelector("[data-fav-toggle]");
+      if (!btn) return;
+      btn.classList.toggle("is-on", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      var title = el.dataset.title || "";
+      btn.setAttribute("aria-label", (on ? "取消收藏 " : "收藏 ") + title);
+      btn.setAttribute("title", on ? "取消收藏" : "收藏");
+      var ico = btn.querySelector(".track-fav-ico");
+      if (ico) ico.textContent = on ? "♥" : "♡";
+    });
+    document.querySelectorAll("[data-track-cats]").forEach(function (root) {
+      applySearch(root.getAttribute("data-track-cats"));
+    });
   }
   document.addEventListener("click", function (e) {
-    var b = e.target.closest("[data-track-rename]");
-    if (b) { e.preventDefault(); e.stopPropagation(); var it = b.closest(".track-item"); if (it && !it.classList.contains("is-renaming")) renameUi(it, true); return; }
-    var c = e.target.closest("[data-track-rename-cancel]");
-    if (c) { e.preventDefault(); e.stopPropagation(); renameUi(c.closest(".track-item"), false); return; }
-    if (e.target.closest(".track-rename-inline")) e.stopPropagation();
-  }, true);
-  document.addEventListener("keydown", function (e) {
-    var t = e.target;
-    if ((e.key === "Enter" || e.key === " ") && t.matches && t.matches("[data-track-rename]")) { e.preventDefault(); renameUi(t.closest(".track-item"), true); }
-    if (e.key === "Escape" && t.closest && t.closest(".track-rename-inline")) { renameUi(t.closest(".track-item"), false); }
-  });
-  document.addEventListener("submit", function (e) {
-    var f = e.target;
-    if (!(f instanceof HTMLFormElement) || !f.classList.contains("track-rename-inline")) return;
+    var loginBtn = e.target.closest && e.target.closest("[data-fav-login]");
+    if (loginBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      var list = loginBtn.closest("[data-playlist]");
+      var id = list && list.id;
+      var box = (id && document.querySelector('[data-fav-login-prompt="' + id + '"]')) || document.querySelector("[data-fav-login-prompt]");
+      if (box) {
+        box.hidden = false;
+        var a = box.querySelector("a");
+        if (a) a.focus();
+      }
+      return;
+    }
+    var btn = e.target.closest && e.target.closest("[data-fav-toggle]");
+    if (!btn) return;
     e.preventDefault();
-    var item = f.closest(".track-item"), msg = f.querySelector(".track-rename-msg");
-    var inp = f.querySelector('input[name="title"]'), title = inp.value.trim();
-    if (!title) { msg.textContent = "曲目名称不能为空"; return; }
-    var btn = f.querySelector('button[type="submit"]'); btn.disabled = true;
-    fetch(f.action, { method: "POST", body: new FormData(f), credentials: "same-origin", headers: { "X-Requested-With": "dj666-rename", "Accept": "application/json" } })
-      .then(function (r) { return r.json().catch(function () { return { ok: false, error: r.status === 400 ? "页面已过期，请刷新后重试" : "保存失败（" + r.status + "）" }; }); })
-      .then(function (d) {
-        btn.disabled = false;
-        if (!d || !d.ok) { msg.textContent = (d && d.error) || "保存失败"; return; }
-        var src = item.dataset.src, nt = d.title;
-        document.querySelectorAll(".track-item[data-src]").forEach(function (el) {
-          if (!sameSrc(el.dataset.src, src)) return;
-          el.dataset.title = nt;
-          var s = el.querySelector(".track-title-text") || el.querySelector(".track-title, .track-meta strong"); if (s) s.textContent = nt;
-          el.querySelectorAll("[data-track-rename][aria-label]").forEach(function (tt) { if (tt.getAttribute("role") === "button") tt.setAttribute("aria-label", "修改曲名：" + nt); });
-          var pb = el.querySelector(".play-btn"); if (pb) pb.setAttribute("aria-label", "播放 " + nt);
-          var ti = el.querySelector('.track-rename-inline input[name="title"]'); if (ti) ti.value = nt;
-        });
-        var changed = false;
-        st.queue.forEach(function (q) { if (sameSrc(q.src, src)) { q.title = nt; changed = true; } });
-        if (changed) { render(); save(true); }
-        renameUi(item, false);
-        var ok = item.querySelector(".track-rename-ok");
-        if (ok) { ok.hidden = false; clearTimeout(ok._t); ok._t = setTimeout(function () { ok.hidden = true; }, 2200); }
-        var sInput = document.querySelector("[data-track-search]"); if (sInput) applySearch(sInput);
-      })
-      .catch(function () { btn.disabled = false; msg.textContent = "网络错误，请重试"; });
-  });
+    e.stopPropagation();
+    if (btn.disabled) return;
+    var tid = btn.getAttribute("data-fav-toggle");
+    if (!tid) return;
+    btn.disabled = true;
+    var fd = new FormData();
+    fd.append("csrf_token", csrfToken());
+    fetch("/favorites/" + tid + "/toggle", {
+      method: "POST",
+      body: fd,
+      credentials: "same-origin",
+      headers: { "X-Requested-With": "dj666-fav", "Accept": "application/json" }
+    }).then(function (r) {
+      return r.json().catch(function () { return { ok: false, error: "收藏失败（" + r.status + "）" }; });
+    }).then(function (d) {
+      btn.disabled = false;
+      if (d && d.login) { location.href = d.login; return; }
+      if (!d || !d.ok) { alert((d && d.error) || "收藏失败"); return; }
+      markFav(String(d.track_id), !!d.favorited);
+    }).catch(function () { btn.disabled = false; alert("网络错误，请重试"); });
+  }, true);
 
   // Track clicks anywhere (music page, home "最新音乐", settings "我的曲目").
   document.addEventListener("click", function (e) {
@@ -397,7 +410,7 @@
     }
     var item = e.target.closest("[data-playlist] .track-item[data-src]");
     if (!item) return;
-    if (e.target.closest("form, input, textarea, select, a, button.btn, [data-track-rename]")) return;
+    if (e.target.closest("form, input, textarea, select, a, button.btn, .track-fav, [data-fav-toggle], [data-fav-login]")) return;
     var list = item.closest("[data-playlist]");
     var els = Array.prototype.slice.call(list.querySelectorAll(".track-item[data-src]:not([hidden])"));
     var t = cur();
