@@ -152,6 +152,36 @@ def flac_key(track_id: int) -> str:
     return f"flac/{int(track_id)}-{secrets.token_hex(16)}.flac"
 
 
+def optimize_mp3_key(job_id: str) -> str:
+    return f"optimize/{job_id}/optimized.mp3"
+
+
+def optimize_flac_key(job_id: str) -> str:
+    # Unguessable suffix: the public bucket should not make pending FLACs easy to list-guess.
+    return f"optimize/{job_id}/optimized-{secrets.token_hex(16)}.flac"
+
+
+def copy_object(src_key: str, dst_key: str, content_type: Optional[str] = None, cache_control: Optional[str] = None) -> None:
+    """Server-side copy inside the same bucket (no local download)."""
+    src_key = str(src_key).lstrip("/")
+    dst_key = str(dst_key).lstrip("/")
+    if not src_key or not dst_key or src_key == dst_key:
+        return
+    extra = {
+        "Bucket": bucket(),
+        "Key": dst_key,
+        "CopySource": {"Bucket": bucket(), "Key": src_key},
+    }
+    if content_type or cache_control:
+        extra["MetadataDirective"] = "REPLACE"
+        if content_type:
+            extra["ContentType"] = content_type
+        extra["CacheControl"] = cache_control or "public, max-age=31536000, immutable"
+    else:
+        extra["MetadataDirective"] = "COPY"
+    _client().copy_object(**extra)
+
+
 def usage_bytes(prefix: str = "") -> Optional[int]:
     """Sum ContentLength under an optional prefix. Returns None on failure."""
     try:

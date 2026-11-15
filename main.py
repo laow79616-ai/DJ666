@@ -1643,7 +1643,7 @@ def overwrite_track_audio(
     if getattr(track, "storage", "local") == "r2" or getattr(track, "r2_key", None):
         track.storage = "local"
         db.commit()
-    schedule_r2_upload(track.id)
+    upload_track_to_r2(track.id)
 
 
 def can_overwrite_track(user: User, match: dict) -> bool:
@@ -4628,7 +4628,7 @@ async def settings_upload_pack(
             return RedirectResponse("/settings#music", status_code=303)
         db.commit()
         for tid in new_pack_ids:
-            schedule_r2_upload(tid)
+            upload_track_to_r2(tid)
         extra = []
         if skipped_large:
             extra.append(f"跳过 {skipped_large} 个超过 50MB 的音频")
@@ -4855,7 +4855,7 @@ async def save_admin_audio(
             return result
         stored_name = ""
         result.update(ok=True, id=track.id, title=track.title)
-        schedule_r2_upload(track.id)
+        upload_track_to_r2(track.id)
         return result
     except Exception:
         db.rollback()
@@ -5605,17 +5605,34 @@ def admin_track_rename(
     csrf_token: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    require_csrf(request, csrf_token)
-    require_admin(request, db)
+    wants_json = request.headers.get("x-requested-with") == "dj666-rename"
+    try:
+        require_csrf(request, csrf_token)
+    except HTTPException:
+        if wants_json:
+            return JSONResponse({"ok": False, "error": "页面已过期，请刷新后重试"}, status_code=400)
+        raise
+    try:
+        require_admin(request, db)
+    except HTTPException:
+        if wants_json:
+            return JSONResponse({"ok": False, "error": "需要管理员登录"}, status_code=403)
+        raise
     track = db.get(Track, track_id)
     display = (title or "").strip()
     if not track:
+        if wants_json:
+            return JSONResponse({"ok": False, "error": "曲目不存在"}, status_code=404)
         flash(request, "曲目不存在。", "error")
     elif not display:
+        if wants_json:
+            return JSONResponse({"ok": False, "error": "曲目名称不能为空"}, status_code=400)
         flash(request, "曲目标题不能为空。", "error")
     else:
         track.title = display[:200]
         db.commit()
+        if wants_json:
+            return JSONResponse({"ok": True, "id": track.id, "title": track.title})
         flash(request, "曲目标题已更新。", "success")
     return RedirectResponse("/admin#tracks", status_code=303)
 
@@ -7718,6 +7735,7 @@ def admin_block_logs_clear(
 import queue as _queue_mod
 
 OPT_DIR = UPLOAD_DIR / "optimize"
+OPT_TMP_DIR = OPT_DIR / "_tmp"
 OPT_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".webm", ".mp4", ".opus", ".aif", ".aiff"}
 OPT_MIME = {
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac", ".m4a": "audio/mp4",
@@ -7730,10 +7748,12 @@ OPT_CHUNK_BYTES = 8 * 1024 * 1024          # client chunk size (stays far below 
 OPT_CHUNK_MAX = 16 * 1024 * 1024
 OPT_MAX_DURATION = 6 * 3600                # non-admin, seconds
 OPT_MAX_DURATION_ADMIN = 12 * 3600         # admin
-OPT_DISK_MIN_FREE = int(1.5 * 1024 * 1024 * 1024)  # keep at least 1.5GB free after a job's estimated need
-OPT_KEEP_SECONDS = 12 * 3600                       # un-imported finished jobs
+OPT_DISK_RESERVE = 300 * 1024 * 1024               # small free-space cushion after a job's peak working set
+OPT_DISK_MIN_FREE = OPT_DISK_RESERVE               # alias used by FLAC quota enforcement
+OPT_KEEP_SECONDS = 12 * 3600                       # keep job metadata (job.json) for the admin UI
 OPT_FAILED_KEEP_SECONDS = 2 * 3600                 # failed jobs (let the user read the error first)
 OPT_UPLOAD_STALE = 6 * 3600                # large chunked uploads may take a while
+OPT_TMP_STALE = 2 * 3600                   # abandoned temp files
 OPT_USER_ACTIVE_MAX = 2                    # non-admin: unfinished jobs at once
 OPT_USER_DAILY_MAX = 10                    # non-admin: jobs per 24h
 OPT_QUEUE_MAX = 8                          # non-admin jobs waiting in the global queue
@@ -7829,32 +7849,276 @@ def _opt_fmt_bytes(n: int) -> str:
 
 def _opt_est_need(src_size: int = 0, duration: float = 0, sample_rate: int = 44100,
                   src_on_disk: bool = False) -> int:
-    """Download (if not already on disk) + FLAC24 + MP3 320k + 15% scratch + reserve."""
+    """Peak local working set for one job, plus a small reserve.
+
+    The pipeline now keeps only one heavy output at a time (source is dropped
+    after the FLAC is done, and outputs are uploaded to R2 then deleted). Peak
+    usage is therefore about max(source+flac, flac+mp3), not both outputs plus
+    a 1.5GB floor. 2.5× input is a lower bound; MP3/AAC sources still expand
+    a lot when rendered to FLAC24, so a duration-based flac estimate is used
+    when we have it.
+    """
+    src_size = max(0, int(src_size or 0))
     sr = int(sample_rate or 44100) or 44100
     if duration and duration > 0:
         flac = int(float(duration) * sr * 2 * 3 * 0.7)
         mp3 = int(float(duration) * 40000)
-        outputs = int((flac + mp3) * 1.15)
     else:
-        outputs = int(max(0, int(src_size or 0)) * 6 * 1.15)
-    incoming = 0 if src_on_disk else max(0, int(src_size or 0))
-    return incoming + outputs + OPT_DISK_MIN_FREE
+        # No duration yet: assume a compressed source may expand ~6× to FLAC.
+        flac = int(src_size * 6)
+        mp3 = src_size
+    peak = max(src_size + flac, flac + mp3, int(src_size * 2.5))
+    incoming = 0 if src_on_disk else src_size
+    return incoming + int(peak * 1.05) + OPT_DISK_RESERVE
 
 
-def _opt_disk_msg(need: int) -> str:
+def _opt_disk_msg(need: int, reclaimed: int = 0) -> str:
     free = _opt_disk_free()
+    extra = f"已清理 {_opt_fmt_bytes(reclaimed)} 临时文件后，" if reclaimed else ""
     return (
         f"服务器磁盘空间不足（剩余 {_opt_fmt_bytes(free)}，"
-        f"本次约需 {_opt_fmt_bytes(need)}，需保留 {_opt_fmt_bytes(OPT_DISK_MIN_FREE)}），请稍后再试"
+        f"本次约需 {_opt_fmt_bytes(need)}，另保留 {_opt_fmt_bytes(OPT_DISK_RESERVE)}。"
+        f"{extra}请稍后再试）"
     )
 
 
+def _opt_unlink(path: Path) -> int:
+    try:
+        if path.is_file():
+            sz = path.stat().st_size
+            path.unlink()
+            return sz
+    except OSError:
+        return 0
+    return 0
+
+
+def _opt_clean_tmp(max_age: int = OPT_TMP_STALE) -> int:
+    """Remove abandoned files in the optimize temp dir (also empty it when max_age<=0)."""
+    freed = 0
+    try:
+        OPT_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+    now = time.time()
+    try:
+        names = list(OPT_TMP_DIR.iterdir())
+    except OSError:
+        return 0
+    for p in names:
+        try:
+            age = now - p.stat().st_mtime
+            if max_age > 0 and age < max_age:
+                continue
+            if p.is_file():
+                freed += _opt_unlink(p)
+            elif p.is_dir():
+                # only delete leftover empty/old dirs, never walk outside tmp
+                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                shutil.rmtree(p, ignore_errors=True)
+                if not p.exists():
+                    freed += sz
+        except OSError:
+            continue
+    return freed
+
+
+def _opt_r2_ok(key: str, expected: int = 0) -> bool:
+    if not key or not r2_storage.r2_enabled():
+        return False
+    remote = r2_storage.object_size(key)
+    if remote is None:
+        return False
+    if expected and int(remote) != int(expected):
+        return False
+    return True
+
+
+def _opt_upload_outputs_to_r2(job: dict, delete_local: bool = True) -> int:
+    """Upload a finished job's MP3/FLAC to R2, verify size, then drop local copies.
+
+    Returns bytes freed locally. job.json is kept so the admin can still preview/import.
+    """
+    if not job or not job.get("id") or not r2_storage.r2_enabled():
+        return 0
+    job_id = job["id"]
+    d = _opt_job_dir(job_id)
+    r2 = dict(job.get("r2") or {})
+    freed = 0
+    outputs = dict(job.get("outputs") or {})
+    changed = False
+
+    def _put(local: Path, key: str, content_type: str, cache_control: Optional[str] = None) -> bool:
+        if not local.is_file():
+            return _opt_r2_ok(key, local.stat().st_size if local.is_file() else 0)
+        r2_storage.upload_file(local, key, content_type=content_type, cache_control=cache_control)
+        remote = r2_storage.object_size(key)
+        if remote != int(local.stat().st_size):
+            logging.error("r2 optimize size mismatch job=%s key=%s local=%s remote=%s",
+                          job_id, key, local.stat().st_size, remote)
+            return False
+        return True
+
+    mp3 = d / "optimized.mp3"
+    flac = d / "optimized.flac"
+    if mp3.is_file() or (r2.get("mp3") and not _opt_r2_ok(r2.get("mp3"), outputs.get("mp3") or 0)):
+        key = r2.get("mp3") or r2_storage.optimize_mp3_key(job_id)
+        if mp3.is_file():
+            if not _put(mp3, key, "audio/mpeg"):
+                return freed
+            r2["mp3"] = key
+            outputs["mp3"] = int(mp3.stat().st_size)
+            changed = True
+    elif mp3.is_file() and not r2.get("mp3"):
+        pass
+    if flac.is_file() or r2.get("flac"):
+        key = r2.get("flac") or r2_storage.optimize_flac_key(job_id)
+        if flac.is_file():
+            if not _put(flac, key, "audio/flac", cache_control="private, max-age=0, no-store"):
+                return freed
+            r2["flac"] = key
+            outputs["flac"] = int(flac.stat().st_size)
+            changed = True
+    if changed:
+        job["r2"] = r2
+        job["outputs"] = outputs
+        job["storage"] = "r2"
+        _opt_save(job)
+    if delete_local:
+        for pth in (mp3, flac):
+            if pth.is_file() and _opt_r2_ok(r2.get("mp3" if pth == mp3 else "flac"), pth.stat().st_size):
+                freed += _opt_unlink(pth)
+        for pth in d.glob("orig.*"):
+            freed += _opt_unlink(pth)
+        freed += _opt_unlink(d / "ffmpeg.log")
+    return freed
+
+
+def _opt_reclaim_r2_locals() -> int:
+    """Delete local library copies only after the same object is confirmed on R2."""
+    if not r2_storage.r2_enabled():
+        return 0
+    freed = 0
+    db = SessionLocal()
+    try:
+        tracks = db.scalars(select(Track)).all()
+        confirmed_hashes: set[str] = set()
+        for track in tracks:
+            if (getattr(track, "storage", "local") or "local") != "r2" or not track.r2_key:
+                continue
+            remote = r2_storage.object_size(track.r2_key)
+            if remote is None:
+                continue
+            fname = Path(track.filename or "").name
+            if fname and fname == Path(fname).name:
+                path = UPLOAD_DIR / fname
+                if path.is_file() and path.stat().st_size == int(remote):
+                    freed += _opt_unlink(path)
+            if track.content_hash:
+                confirmed_hashes.add(track.content_hash)
+            if track.flac_path and getattr(track, "flac_r2_key", None):
+                fr = r2_storage.object_size(track.flac_r2_key)
+                path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
+                if path and path.is_file() and fr is not None and path.stat().st_size == int(fr):
+                    sz = path.stat().st_size
+                    try:
+                        dj_flac.unlink_with_snapshots(path, FLAC_SNAP_ROOTS)
+                        freed += sz
+                    except Exception:  # noqa: BLE001
+                        logging.exception("r2-confirmed flac delete failed")
+        # Orphan files in the uploads root whose hash matches a track already on R2.
+        try:
+            for path in UPLOAD_DIR.iterdir():
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in {".mp3", ".flac", ".wav", ".m4a", ".ogg"}:
+                    continue
+                # skip if still referenced by a not-yet-r2-confirmed name; hash check below
+                try:
+                    sha = file_sha256(path)
+                except Exception:  # noqa: BLE001
+                    continue
+                if sha in confirmed_hashes:
+                    freed += _opt_unlink(path)
+        except OSError:
+            pass
+    finally:
+        db.close()
+    return freed
+
+
+def _opt_reclaim_disk() -> int:
+    """Safe automatic cleanup used when a job does not have enough free space."""
+    freed = _opt_clean_tmp(max_age=0)
+    now = time.time()
+    try:
+        names = os.listdir(OPT_DIR)
+    except OSError:
+        names = []
+    current = _opt_current.get("id")
+    for name in names:
+        if name == "_tmp" or not OPT_ID_RE.match(name):
+            continue
+        if current and name == current:
+            continue
+        d = OPT_DIR / name
+        if not d.is_dir():
+            continue
+        job = _opt_load(name)
+        state = (job or {}).get("state")
+        try:
+            age_ref = float((job or {}).get("updated") or d.stat().st_mtime)
+            created = float((job or {}).get("created") or age_ref)
+        except (TypeError, ValueError, OSError):
+            age_ref = created = now
+        imported = bool(job and job.get("track_id") and _opt_library_exists(job))
+        stale_upload = state in ("uploading", "uploaded", "downloading") and now - age_ref > OPT_UPLOAD_STALE
+        if job is None and now - age_ref > OPT_UPLOAD_STALE:
+            stale_upload = True
+        failed_expired = state == "failed" and now - created > OPT_FAILED_KEEP_SECONDS
+        meta_expired = now - created > OPT_KEEP_SECONDS and state not in ("queued", "running", "downloading")
+        if imported or stale_upload or failed_expired or (meta_expired and not (state == "done" and not imported)):
+            # drop whole dir for imported / stale / old-failed; keep recent unimported done metadata
+            before = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+            if job and not imported:
+                for key in (job.get("r2") or {}).values():
+                    if key:
+                        r2_delete_key(str(key))
+            shutil.rmtree(d, ignore_errors=True)
+            if not d.exists():
+                freed += before
+            continue
+        if state == "done":
+            try:
+                freed += _opt_upload_outputs_to_r2(job, delete_local=True)
+            except Exception:  # noqa: BLE001
+                logging.exception("reclaim: r2 archive failed job=%s", name)
+            freed += sum(_opt_unlink(p) for p in d.glob("orig.*"))
+        elif state == "failed":
+            for pth in list(d.glob("orig.*")) + [d / "optimized.flac", d / "optimized.mp3", d / "ffmpeg.log"]:
+                freed += _opt_unlink(pth)
+    try:
+        freed += _opt_reclaim_r2_locals()
+    except Exception:  # noqa: BLE001
+        logging.exception("reclaim: r2-confirmed local scan failed")
+    return freed
+
+
 def _opt_require_disk(need: int, http: bool = True) -> None:
-    if _opt_disk_free() < need:
-        msg = _opt_disk_msg(need)
-        if http:
-            raise HTTPException(status_code=507, detail=msg)
-        raise RuntimeError(msg)
+    if _opt_disk_free() >= need:
+        return
+    reclaimed = 0
+    try:
+        reclaimed = _opt_reclaim_disk()
+    except Exception:  # noqa: BLE001
+        logging.exception("disk reclaim failed")
+    if _opt_disk_free() >= need:
+        logging.info("disk reclaim freed %s, continuing", reclaimed)
+        return
+    msg = _opt_disk_msg(need, reclaimed)
+    if http:
+        raise HTTPException(status_code=507, detail=msg)
+    raise RuntimeError(msg)
 
 
 def _opt_public(job: dict) -> dict:
@@ -8185,6 +8449,8 @@ def _opt_process(job_id: str) -> None:
         if after.get("i") is not None and target - after["i"] > 0.4 and gain < OPT_MAX_GAIN_DB:
             gain = min(OPT_MAX_GAIN_DB, gain + (target - after["i"]))
             after = render(gain, 58, 72, "响度微调")
+        # FLAC is the source of truth from here; drop the original to cap local disk use.
+        _opt_drop_orig(job_id)
         _opt_ffmpeg(job_id, [
             "-i", str(flac), "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "320k", "-ar", str(sr),
             "-map_metadata", "-1", str(mp3),
@@ -8196,9 +8462,19 @@ def _opt_process(job_id: str) -> None:
         outputs = {"flac": flac.stat().st_size, "mp3": mp3.stat().st_size}
         _opt_update(job_id, state="done", stage="完成", progress=100, after=after, gain_db=round(gain, 2),
                     outputs=outputs, finished=time.time())
-        # Telegram originals are no longer needed once outputs exist; the library copy is created on import.
-        if (job or {}).get("source") == "telegram":
-            _opt_drop_orig(job_id)
+        # Source is no longer needed once both outputs exist.
+        _opt_drop_orig(job_id)
+        job = _opt_load(job_id) or job
+        if r2_storage.r2_enabled():
+            _opt_update(job_id, stage="上传到 R2", progress=99)
+            try:
+                _opt_upload_outputs_to_r2(job, delete_local=True)
+                _opt_update(job_id, state="done", stage="完成", progress=100)
+            except Exception:  # noqa: BLE001
+                logging.exception("optimize r2 archive failed job=%s", job_id)
+                # Keep local outputs so import/preview still work if R2 is briefly down.
+        else:
+            _opt_update(job_id, storage="local")
     except Exception as exc:  # noqa: BLE001
         msg = str(exc) if isinstance(exc, RuntimeError) else "处理失败，请换一个文件再试"
         for p in (flac, mp3):
@@ -8236,7 +8512,11 @@ def _opt_library_exists(job: dict) -> bool:
     db = SessionLocal()
     try:
         track = db.get(Track, int(tid))
-        return bool(track and track.filename and (UPLOAD_DIR / track.filename).is_file())
+        if not track:
+            return False
+        if (getattr(track, "storage", "local") or "local") == "r2" and getattr(track, "r2_key", None):
+            return True
+        return bool(track.filename and (UPLOAD_DIR / Path(track.filename).name).is_file())
     except (TypeError, ValueError):
         return False
     finally:
@@ -8244,12 +8524,15 @@ def _opt_library_exists(job: dict) -> bool:
 
 
 def _opt_cleanup() -> None:
+    _opt_clean_tmp(max_age=OPT_TMP_STALE)
     now = time.time()
     try:
         names = os.listdir(OPT_DIR)
     except OSError:
         return
     for name in names:
+        if name == "_tmp":
+            continue
         d = OPT_DIR / name
         if not d.is_dir() or not OPT_ID_RE.match(name):
             continue
@@ -8269,15 +8552,32 @@ def _opt_cleanup() -> None:
         failed_expired = state == "failed" and now - created > OPT_FAILED_KEEP_SECONDS
         expired = now - created > OPT_KEEP_SECONDS and state not in ("queued", "running", "downloading")
         if imported or stale_upload or failed_expired or expired:
+            if job and not imported:
+                for key in (job.get("r2") or {}).values():
+                    if key:
+                        r2_delete_key(str(key))
             shutil.rmtree(d, ignore_errors=True)
             continue
-        if state == "done" and (job or {}).get("source") == "telegram":
+        if state == "done":
+            try:
+                _opt_upload_outputs_to_r2(job, delete_local=True)
+            except Exception:  # noqa: BLE001
+                logging.exception("cleanup r2 archive failed job=%s", name)
             _opt_drop_orig(name)
+        elif state == "failed":
+            for pth in list(d.glob("orig.*")) + [d / "optimized.flac", d / "optimized.mp3", d / "ffmpeg.log"]:
+                _opt_unlink(pth)
 
 
 def _opt_worker() -> None:
     last_clean = 0.0
     while True:
+        if time.time() - last_clean > 1800 or last_clean == 0.0:
+            last_clean = time.time()
+            try:
+                _opt_cleanup()
+            except Exception:  # noqa: BLE001
+                logging.exception("optimize cleanup failed")
         try:
             job_id = _opt_queue.get(timeout=300)
         except _queue_mod.Empty:
@@ -8290,12 +8590,7 @@ def _opt_worker() -> None:
                 pass
             finally:
                 _opt_current.update(id=None, proc=None, cancel=False)
-        if time.time() - last_clean > 1800:
-            last_clean = time.time()
-            try:
-                _opt_cleanup()
-            except Exception:  # noqa: BLE001
-                pass
+                _opt_clean_tmp(max_age=OPT_TMP_STALE)
 
 
 def opt_start_worker() -> None:
@@ -8304,10 +8599,9 @@ def opt_start_worker() -> None:
         return
     _opt_worker_started = True
     OPT_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        _opt_cleanup()
-    except Exception:  # noqa: BLE001
-        pass
+    OPT_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    # Heavy cleanup (R2 archive of leftover outputs) runs in the worker thread
+    # so application startup is not blocked.
     # Jobs interrupted by a restart are re-queued (the original upload is still on disk).
     jobs = sorted(_opt_all_jobs(), key=lambda j: float(j.get("created") or 0))
     for job in jobs:
@@ -8459,10 +8753,19 @@ def opt_file(job_id: str, kind: str, request: Request, download: int = 0, db: Se
         raise HTTPException(status_code=404, detail="文件不存在")
     if kind != "orig" and job.get("state") != "done":
         raise HTTPException(status_code=404, detail="还没处理完成")
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="文件不存在或已过期")
-    return FileResponse(path, media_type=media, filename=fname,
-                        content_disposition_type="attachment" if download else "inline")
+    if path.is_file():
+        return FileResponse(path, media_type=media, filename=fname,
+                            content_disposition_type="attachment" if download else "inline")
+    r2 = (job or {}).get("r2") or {}
+    key = r2.get("flac") if kind == "flac" else r2.get("mp3") if kind == "mp3" else None
+    if key and r2_storage.r2_enabled():
+        try:
+            url = r2_storage.presigned_url(key, expires=600, filename=fname, content_type=media)
+        except Exception:  # noqa: BLE001
+            logging.exception("optimize r2 presign failed job=%s kind=%s", job_id, kind)
+            url = r2_storage.public_url(key)
+        return RedirectResponse(url, status_code=302)
+    raise HTTPException(status_code=404, detail="文件不存在或已过期")
 
 
 @app.post("/dj/optimize/{job_id}/import")
@@ -8481,22 +8784,32 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
             raise HTTPException(status_code=409, detail="还没处理完成")
         if job.get("track_id"):
             raise HTTPException(status_code=409, detail="已经导入过曲库了")
-        # Library imports always store the optimized MP3 320k (FLAC remains downloadable from the job).
+        # Library imports always store the optimized MP3 320k (FLAC is optional).
         fmt = "mp3"
         src = _opt_job_dir(job_id) / f"optimized.{fmt}"
-        if not src.is_file():
+        r2info = dict(job.get("r2") or {})
+        r2_mp3 = r2info.get("mp3")
+        r2_flac = r2info.get("flac")
+        has_local = src.is_file()
+        has_r2 = bool(r2_mp3 and r2_storage.r2_enabled() and r2_storage.object_size(r2_mp3))
+        if not has_local and not has_r2:
             raise HTTPException(status_code=404, detail="文件不存在或已过期")
         title = str(payload.get("title") or "").strip()
         title = re.sub(r"[\r\n\t]+", " ", title)[:200] or (Path(job.get("name") or "").stem + "（优化版）")[:200]
         ext = f".{fmt}"
         stored = unique_upload_name(ext)
         dest = UPLOAD_DIR / stored
-        shutil.copyfile(src, dest)
-        dest.chmod(0o644)
+        sha = ""
+        fsize = int((job.get("outputs") or {}).get("mp3") or 0)
+        if has_local:
+            shutil.copyfile(src, dest)
+            dest.chmod(0o644)
+            sha = file_sha256(dest)
+            fsize = dest.stat().st_size
         status = TRACK_STATUS_APPROVED if user.is_admin else TRACK_STATUS_PENDING
         track = Track(
             title=title, filename=stored, original_name=(title + ext)[:255], uploader_id=user.id,
-            status=status, pack_name=None, content_hash=file_sha256(dest), file_size=dest.stat().st_size,
+            status=status, pack_name=None, content_hash=sha or None, file_size=fsize,
         )
         keep_flac = payload.get("keep_flac")
         if keep_flac is None:
@@ -8505,9 +8818,9 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
             flac_src = _opt_job_dir(job_id) / "optimized.flac"
             if flac_src.is_file():
                 try:
-                    fname, fsize = dj_flac.attach_flac(flac_src, UPLOAD_DIR)
+                    fname, fsize_f = dj_flac.attach_flac(flac_src, UPLOAD_DIR)
                     track.flac_path = fname
-                    track.flac_size = fsize
+                    track.flac_size = fsize_f
                     track.flac_pinned = False
                     track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 except Exception:  # noqa: BLE001
@@ -8521,8 +8834,38 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
             if getattr(track, "flac_path", None):
                 dj_flac.drop_track_flac(track, UPLOAD_DIR, FLAC_SNAP_ROOTS)
             raise
+        if r2_storage.r2_enabled():
+            try:
+                if has_r2:
+                    key = r2_storage.mp3_key(track.id, track.title or "")
+                    r2_storage.copy_object(r2_mp3, key, content_type="audio/mpeg")
+                    remote = r2_storage.object_size(key)
+                    if fsize and remote not in (None, int(fsize)):
+                        logging.error("import r2 copy size mismatch track=%s", track.id)
+                    else:
+                        track.storage = "r2"
+                        track.r2_key = key
+                        if keep_flac and r2_flac and r2_storage.object_size(r2_flac):
+                            fk = r2_storage.flac_key(track.id)
+                            r2_storage.copy_object(
+                                r2_flac, fk, content_type="audio/flac",
+                                cache_control="private, max-age=0, no-store",
+                            )
+                            track.flac_r2_key = fk
+                            if track.flac_path:
+                                path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
+                                if path:
+                                    dj_flac.unlink_with_snapshots(path, FLAC_SNAP_ROOTS)
+                                track.flac_path = None
+                        db.commit()
+                        dest.unlink(missing_ok=True)
+                if (getattr(track, "storage", "local") or "local") != "r2":
+                    upload_track_to_r2(track.id)
+            except Exception:  # noqa: BLE001
+                logging.exception("import r2 finalize failed job=%s", job_id)
+                upload_track_to_r2(track.id)
         try:
-            if track.flac_path:
+            if track.flac_path or getattr(track, "flac_r2_key", None):
                 dj_flac.enforce_flac_quota(
                     db, db.scalars(select(Track)).all(), UPLOAD_DIR, FLAC_SNAP_ROOTS,
                     dj_flac.flac_quota_bytes(lambda k, d="": get_setting(db, k, d)),
@@ -8544,9 +8887,12 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
                 tga_done_mark(job.get("tg_chat_id"), job.get("tg_msg"), downloaded=True, track_id=track.id)
             except Exception:  # noqa: BLE001
                 pass
-        # Library copy is now the source of truth; drop the optimize job files immediately.
+        if r2_storage.r2_enabled():
+            if r2_mp3 and r2_mp3 != getattr(track, "r2_key", None):
+                r2_delete_key(r2_mp3)
+            if r2_flac and r2_flac != getattr(track, "flac_r2_key", None):
+                r2_delete_key(r2_flac)
         _opt_purge_job_dir(job_id)
-        schedule_r2_upload(track.id)
     msg = "已导入曲库并发布" if status == TRACK_STATUS_APPROVED else "已提交到曲库，管理员审核通过后显示"
     return {"ok": True, "track_id": track.id, "status": status, "message": msg}
 
@@ -8575,6 +8921,10 @@ def opt_delete(job_id: str, request: Request, db: Session = Depends(get_db)):
                 _opt_queue.queue.remove(job_id)
         except ValueError:
             pass
+    if not job.get("track_id"):
+        for key in (job.get("r2") or {}).values():
+            if key:
+                r2_delete_key(str(key))
     shutil.rmtree(_opt_job_dir(job["id"]), ignore_errors=True)
     return {"ok": True}
 
