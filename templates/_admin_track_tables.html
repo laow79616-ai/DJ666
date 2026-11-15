@@ -49,7 +49,7 @@
               {% for track in pending_tracks %}
               <tr>
                 <td class="track-title-cell">
-                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <a href="{{ admin_track_play_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
                   <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
                   {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
                   <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
@@ -112,7 +112,7 @@
               {% for track in published_tracks %}
               <tr>
                 <td class="track-title-cell">
-                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <a href="{{ admin_track_play_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
                   <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
                   {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
                   <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
@@ -168,7 +168,7 @@
               {% for track in rejected_tracks %}
               <tr>
                 <td class="track-title-cell">
-                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <a href="{{ admin_track_play_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
                   <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
                   {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
                   <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>

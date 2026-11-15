@@ -1257,10 +1257,20 @@ def r2_delete_key(key: str) -> None:
 
 
 def track_audio_url(track) -> str:
-    if getattr(track, "storage", "local") == "r2" and getattr(track, "r2_key", None):
-        return r2_storage.public_url(track.r2_key)
+    """Public playback URL. Unpublished tracks never get a CDN or /uploads link."""
+    if getattr(track, "status", None) != TRACK_STATUS_APPROVED:
+        return ""
+    key = getattr(track, "r2_key", None)
+    if getattr(track, "storage", "local") == "r2" and key and not r2_storage.is_pending_key(key):
+        return r2_storage.public_url(key)
     name = Path(getattr(track, "filename", "") or "").name
     return f"/uploads/{name}" if name else ""
+
+
+def admin_track_play_url(track) -> str:
+    """Admin-only preview/playback path (presigned or local), including 待审曲目."""
+    tid = getattr(track, "id", None)
+    return f"/admin/tracks/{int(tid)}/preview" if tid else ""
 
 
 def track_has_flac(track) -> bool:
@@ -1295,10 +1305,39 @@ def _r2_set(**kwargs) -> None:
         _R2_STATUS.update(kwargs)
 
 
-def upload_track_to_r2(track_id: int) -> dict:
-    """Upload a track's local MP3 (and FLAC if present) to R2, verify size, then drop local copies.
+def _r2_cache_for_status(approved: bool) -> str:
+    return "public, max-age=31536000, immutable" if approved else "private, max-age=0, no-store"
 
-    On any failure the local files and 'local' storage flag are kept so playback still works.
+
+def _r2_key_matches_status(track) -> bool:
+    key = getattr(track, "r2_key", None)
+    if not key or (getattr(track, "storage", "local") or "local") != "r2":
+        return False
+    pending = r2_storage.is_pending_key(key)
+    if getattr(track, "status", None) == TRACK_STATUS_APPROVED:
+        return not pending
+    return pending
+
+
+def _r2_copy_mp3(src_key: str, dst_key: str, approved: bool) -> bool:
+    try:
+        r2_storage.copy_object(
+            src_key, dst_key, content_type="audio/mpeg",
+            cache_control=_r2_cache_for_status(approved),
+        )
+        return bool(r2_storage.object_size(dst_key))
+    except Exception:  # noqa: BLE001
+        logging.exception("r2 copy failed %s -> %s", src_key, dst_key)
+        return False
+
+
+def upload_track_to_r2(track_id: int) -> dict:
+    """Place a track's MP3 (and FLAC if present) on R2.
+
+    Approved tracks use the public ``mp3/{id}-…`` key. Pending / rejected /
+    importing tracks use an unguessable ``pending/{id}-{token}`` key with
+    private cache headers so the public CDN cannot be guessed or listed.
+    On any failure the local file is kept so admin preview still works.
     """
     if not r2_storage.r2_enabled():
         return {"ok": False, "error": "r2_disabled"}
@@ -1307,31 +1346,49 @@ def upload_track_to_r2(track_id: int) -> dict:
         track = db.get(Track, track_id)
         if not track:
             return {"ok": False, "error": "missing"}
+        approved = track.status == TRACK_STATUS_APPROVED
         fname = Path(track.filename or "").name
         local_mp3 = UPLOAD_DIR / fname if fname else None
-        already = (getattr(track, "storage", "local") == "r2" and getattr(track, "r2_key", None))
-        if already and (not local_mp3 or not local_mp3.is_file()):
-            # Already on R2; nothing local left to move. Still try leftover FLAC.
+        local_ok = bool(local_mp3 and local_mp3.is_file())
+        current_key = getattr(track, "r2_key", None)
+        already_ok = _r2_key_matches_status(track) and (not local_ok)
+        if already_ok:
             if track.flac_path:
                 flac_path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
-                if flac_path and flac_path.is_file():
-                    pass  # fall through to flac-only path below via a flag
-                else:
+                if not (flac_path and flac_path.is_file()):
                     return {"ok": True, "skipped": "already_r2"}
             else:
                 return {"ok": True, "skipped": "already_r2"}
-        if not local_mp3 or not local_mp3.is_file():
-            if already:
-                return {"ok": True, "skipped": "already_r2"}
-            logging.error("r2 upload skipped, local mp3 missing track=%s", track_id)
+
+        if approved:
+            dest_key = current_key if (current_key and not r2_storage.is_pending_key(current_key)) else r2_storage.mp3_key(track.id, track.title or "")
+        else:
+            dest_key = current_key if (current_key and r2_storage.is_pending_key(current_key)) else r2_storage.pending_mp3_key(track.id)
+
+        placed = False
+        if local_ok:
+            local_size = int(local_mp3.stat().st_size)
+            r2_storage.upload_file(
+                local_mp3, dest_key, content_type="audio/mpeg",
+                cache_control=_r2_cache_for_status(approved),
+            )
+            remote = r2_storage.object_size(dest_key)
+            if remote != local_size:
+                logging.error("r2 mp3 size mismatch track=%s local=%s remote=%s", track_id, local_size, remote)
+                return {"ok": False, "error": "size_mismatch"}
+            placed = True
+            if not track.file_size:
+                track.file_size = local_size
+        elif current_key and current_key != dest_key:
+            if not _r2_copy_mp3(current_key, dest_key, approved):
+                return {"ok": False, "error": "copy_failed"}
+            placed = True
+        elif current_key and current_key == dest_key:
+            placed = True
+        else:
+            logging.error("r2 upload skipped, no local mp3 or source key track=%s", track_id)
             return {"ok": False, "error": "no_local"}
-        key = track.r2_key or r2_storage.mp3_key(track.id, track.title or "")
-        local_size = int(local_mp3.stat().st_size)
-        r2_storage.upload_file(local_mp3, key, content_type="audio/mpeg")
-        remote = r2_storage.object_size(key)
-        if remote != local_size:
-            logging.error("r2 mp3 size mismatch track=%s local=%s remote=%s", track_id, local_size, remote)
-            return {"ok": False, "error": "size_mismatch"}
+
         flac_key = getattr(track, "flac_r2_key", None)
         if track.flac_path:
             flac_path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
@@ -1345,24 +1402,29 @@ def upload_track_to_r2(track_id: int) -> dict:
                 if fr != int(flac_path.stat().st_size):
                     logging.error("r2 flac size mismatch track=%s", track_id)
                     return {"ok": False, "error": "flac_size_mismatch"}
+
+        old_key = current_key if (current_key and current_key != dest_key) else None
         track.storage = "r2"
-        track.r2_key = key
+        track.r2_key = dest_key
         if flac_key:
             track.flac_r2_key = flac_key
-        if local_size and not track.file_size:
-            track.file_size = local_size
         db.commit()
-        try:
-            delete_track_file(fname)
-            if track.flac_path:
-                path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
-                if path:
-                    dj_flac.unlink_with_snapshots(path, FLAC_SNAP_ROOTS)
-                track.flac_path = None
-                db.commit()
-        except Exception:  # noqa: BLE001
-            logging.exception("r2 post-upload local delete failed track=%s", track_id)
-        logging.info("r2 upload ok track=%s", track_id)
+        if placed and local_ok:
+            try:
+                delete_track_file(fname)
+                if track.flac_path:
+                    path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
+                    if path:
+                        dj_flac.unlink_with_snapshots(path, FLAC_SNAP_ROOTS)
+                    track.flac_path = None
+                    db.commit()
+            except Exception:  # noqa: BLE001
+                logging.exception("r2 post-upload local delete failed track=%s", track_id)
+        # Only drop the previous *library* object (public mp3/ or pending/).
+        # Optimize-job keys stay so the 上传优化 card can still play A/B.
+        if old_key and (r2_storage.is_pending_key(old_key) or str(old_key).startswith("mp3/")):
+            r2_delete_key(old_key)
+        logging.info("r2 upload ok track=%s approved=%s key_prefix=%s", track_id, approved, dest_key.split("/", 1)[0])
         return {"ok": True}
     except Exception:  # noqa: BLE001
         db.rollback()
@@ -1370,6 +1432,26 @@ def upload_track_to_r2(track_id: int) -> dict:
         return {"ok": False, "error": "upload_failed"}
     finally:
         db.close()
+
+
+def relocate_unpublished_r2_keys() -> None:
+    """Move any unpublished tracks off guessable public mp3/ keys. Never run on the startup thread."""
+    if not r2_storage.r2_enabled():
+        return
+    db = SessionLocal()
+    try:
+        rows = db.scalars(select(Track).where(Track.status != TRACK_STATUS_APPROVED)).all()
+        ids = [t.id for t in rows if not _r2_key_matches_status(t)]
+    except Exception:  # noqa: BLE001
+        logging.exception("scan unpublished r2 keys failed")
+        return
+    finally:
+        db.close()
+    for tid in ids:
+        try:
+            upload_track_to_r2(tid)
+        except Exception:  # noqa: BLE001
+            logging.exception("relocate unpublished r2 failed track=%s", tid)
 
 
 def schedule_r2_upload(track_id) -> None:
@@ -3884,6 +3966,7 @@ async def lifespan(app: FastAPI):
     try:
         r2_storage.load_env_file(ENV_FILE)
         start_r2_worker()
+        threading.Thread(target=relocate_unpublished_r2_keys, name="r2-unpub", daemon=True).start()
     except Exception:  # noqa: BLE001
         logging.exception("r2 worker failed to start")
     try:
@@ -4024,6 +4107,7 @@ templates.env.globals["track_categories"] = TRACK_CATEGORY_CHOICES
 templates.env.globals["track_filter_tabs"] = TRACK_FILTER_TABS
 templates.env.globals["track_favorite_key"] = TRACK_FAVORITE_KEY
 templates.env.globals["track_audio_url"] = track_audio_url
+templates.env.globals["admin_track_play_url"] = admin_track_play_url
 templates.env.globals["track_has_flac"] = track_has_flac
 templates.env.globals["display_name"] = display_name
 templates.env.globals["ann_media"] = ann_media
@@ -4486,18 +4570,12 @@ def settings_page(request: Request, db: Session = Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return login_redirect("/settings")
-    my_tracks = db.scalars(
-        select(Track)
-        .where(Track.uploader_id == user.id)
-        .order_by(Track.created_at.desc())
-    ).all()
     return templates.TemplateResponse(
         request,
         "settings.html",
         ctx(
             request,
             db,
-            my_tracks=my_tracks,
             dup_batches=load_dup_batches(user),
             contact=get_submission_contact(db),
             nav="settings",
@@ -4722,7 +4800,12 @@ async def settings_upload_pack(
             return RedirectResponse("/settings#music", status_code=303)
         db.commit()
         for tid in new_pack_ids:
-            upload_track_to_r2(tid)
+            # Admin-approved imports go to the public key immediately; user
+            # uploads are queued to the unguessable pending/ prefix.
+            if auto_approve:
+                upload_track_to_r2(tid)
+            else:
+                schedule_r2_upload(tid)
         extra = []
         if skipped_large:
             extra.append(f"跳过 {skipped_large} 个超过 50MB 的音频")
@@ -7514,6 +7597,36 @@ def admin_user_delete(
 
 
 
+@app.get("/admin/tracks/{track_id}/preview")
+def admin_track_preview(track_id: int, request: Request, db: Session = Depends(get_db)):
+    """Admin-only listen/download for any status. Pending objects are presigned, never a public CDN URL."""
+    require_admin(request, db)
+    track = db.get(Track, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="曲目不存在")
+    fname = Path(track.filename or "").name
+    local = UPLOAD_DIR / fname if fname else None
+    if local and local.is_file():
+        media = {
+            ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+            ".m4a": "audio/mp4", ".flac": "audio/flac",
+        }.get(local.suffix.lower(), "application/octet-stream")
+        return FileResponse(local, media_type=media, filename=track.original_name or fname)
+    key = getattr(track, "r2_key", None)
+    if key and r2_storage.r2_enabled():
+        # Approved public library keys can go via the CDN; unpublished keys must be presigned.
+        if track.status == TRACK_STATUS_APPROVED and not r2_storage.is_pending_key(key):
+            return RedirectResponse(r2_storage.public_url(key), status_code=303)
+        try:
+            stem = (track.title or Path(track.original_name or "track").stem or "track")[:80]
+            url = r2_storage.presigned_url(key, expires=600, content_type="audio/mpeg")
+        except Exception:  # noqa: BLE001
+            logging.exception("r2 preview presign failed track=%s", track_id)
+            raise HTTPException(status_code=502, detail="预览暂时无法播放")
+        return RedirectResponse(url, status_code=303)
+    raise HTTPException(status_code=404, detail="音频文件不存在")
+
+
 @app.post("/admin/tracks/{track_id}/approve")
 def admin_track_approve(
     track_id: int,
@@ -7529,7 +7642,13 @@ def admin_track_approve(
         return RedirectResponse("/admin#tracks", status_code=303)
     track.status = TRACK_STATUS_APPROVED
     db.commit()
-    flash(request, "已通过审核，曲目将显示在首页音乐列表中。", "success")
+    # Move pending/ R2 objects (or local files) onto the public mp3/ key.
+    try:
+        upload_track_to_r2(track.id)
+    except Exception:  # noqa: BLE001
+        logging.exception("r2 publish after approve failed track=%s", track_id)
+        schedule_r2_upload(track.id)
+    flash(request, "已通过审核，曲目将显示在音乐列表中。", "success")
     return RedirectResponse("/admin#tracks", status_code=303)
 
 
@@ -8900,10 +9019,16 @@ def _opt_finalize_import(job_id: str) -> None:
                     logging.exception("keep FLAC on import failed for job %s", job_id)
             if r2_storage.r2_enabled():
                 db.commit()
-                upload_track_to_r2(track.id)
                 db.refresh(track)
         track.status = want_status
         db.commit()
+        if r2_storage.r2_enabled():
+            try:
+                upload_track_to_r2(track.id)
+                db.refresh(track)
+            except Exception:  # noqa: BLE001
+                logging.exception("r2 place after import failed track=%s", track_id)
+                schedule_r2_upload(track.id)
         try:
             if track.flac_path or getattr(track, "flac_r2_key", None):
                 dj_flac.enforce_flac_quota(
@@ -11381,9 +11506,7 @@ def serve_upload(filename: str, request: Request, db: Session = Depends(get_db))
     if not track:
         raise HTTPException(status_code=404, detail="文件不存在")
     if track.status != TRACK_STATUS_APPROVED:
-        user = current_user(request, db)
-        if not user or (not user.is_admin and user.id != track.uploader_id):
-            raise HTTPException(status_code=404, detail="文件不存在")
+        raise HTTPException(status_code=404, detail="文件不存在")
     media = {
         ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
         ".m4a": "audio/mp4", ".flac": "audio/flac",

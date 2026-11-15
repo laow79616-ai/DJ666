@@ -147,6 +147,15 @@ def mp3_key(track_id: int, title: str = "") -> str:
     return f"mp3/{int(track_id)}-{ascii_part}.mp3"
 
 
+def pending_mp3_key(track_id: int) -> str:
+    """Unguessable key: the custom domain publishes the whole bucket."""
+    return f"pending/{int(track_id)}-{secrets.token_hex(16)}.mp3"
+
+
+def is_pending_key(key: Optional[str]) -> bool:
+    return str(key or "").startswith("pending/")
+
+
 def flac_key(track_id: int) -> str:
     # Random token: the custom domain publishes the whole bucket, so FLAC paths must not be guessable.
     return f"flac/{int(track_id)}-{secrets.token_hex(16)}.flac"

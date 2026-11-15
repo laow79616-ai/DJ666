@@ -11,10 +11,9 @@
 <section class="panel settings-music" id="music">
   <div class="panel-head">
     <h2>上传音乐</h2>
-    <span class="count">{{ my_tracks|length }} 首</span>
   </div>
   <p class="muted">请上传「音乐包」：一个 ZIP、RAR 或 7Z 压缩包，里面放一首或多首音频（mp3 / wav / ogg / m4a / flac）。不支持直接上传单个音频文件。压缩包内的子文件夹会自动扫描，系统会忽略 __MACOSX、.DS_Store 等无关文件。</p>
-  <p class="hint">音乐包最大 200MB，其中单个音频不超过 50MB。上传后会先出现在下方你的曲目列表中，管理员审核通过后才会显示在首页供所有人播放。管理员账号上传的曲目会直接发布。</p>
+  <p class="hint">音乐包最大 200MB，其中单个音频不超过 50MB。上传后需管理员审核，通过后公开。未审核的曲目不会出现在音乐列表中，也无法被播放或下载。</p>
   <form class="stack-form upload-pack-form" action="/settings/upload" method="post" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <label>选择音乐包
@@ -62,37 +61,6 @@
   </div>
   {% endif %}
 
-  <div class="my-tracks">
-    <h3 class="ann-log-title">我的曲目</h3>
-    {% if my_tracks %}
-    <ul class="track-list my-track-list" id="myTrackList" data-playlist="mine">
-      {% for track in my_tracks %}
-      <li class="track-item my-track-item{% if track.status == 'importing' %} is-importing{% endif %}"{% if track.status != 'importing' %} data-src="{{ track_audio_url(track) }}"{% endif %} data-title="{{ track.title }}">
-        {% if track.status != 'importing' %}
-        <button type="button" class="play-btn" aria-label="播放 {{ track.title }}">▶</button>
-        {% else %}
-        <button type="button" class="play-btn" disabled aria-label="正在导入，暂不可播放">…</button>
-        {% endif %}
-        <div class="track-meta my-track-meta">
-          <strong class="track-title"><span class="track-title-text">{{ track.title }}</span></strong>
-          <span class="muted my-track-sub">
-            <span class="status-badge status-{{ track.status }}">
-              {% if track.status == 'approved' %}已发布
-              {% elif track.status == 'rejected' %}已拒绝
-              {% elif track.status == 'importing' %}导入中
-              {% else %}待审核{% endif %}
-            </span>
-            {% if track.pack_name %} · 来自 {{ track.pack_name }}{% endif %}
-            · {{ track.created_at|fmt_time }}
-          </span>
-        </div>
-      </li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="muted">你还没有上传过曲目。</p>
-    {% endif %}
-  </div>
 </section>
 
 

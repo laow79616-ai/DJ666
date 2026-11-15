@@ -396,7 +396,7 @@
     }).catch(function () { btn.disabled = false; alert("网络错误，请重试"); });
   }, true);
 
-  // Track clicks anywhere (music page, home "最新音乐", settings "我的曲目").
+  // Track clicks anywhere (music page, and any leftover playlist lists).
   document.addEventListener("click", function (e) {
     var all = e.target.closest("[data-play-all]");
     if (all) {
