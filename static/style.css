@@ -1380,19 +1380,20 @@ body.has-player { padding-bottom: calc(var(--player-h, 120px) + 88px); }
 .track-item.is-editable {
   display: flex;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
   column-gap: 8px;
   align-items: center;
   overflow: visible;
   position: relative;
 }
 .track-item.is-editable .play-btn { grid-column: 1; grid-row: 1; }
-.track-item.is-editable .track-meta { grid-column: 2; grid-row: 1; min-width: 0; }
+.track-item.is-editable .track-meta { grid-column: 2; grid-row: 1; min-width: 0; width: 100%; }
 .track-item.is-editable .track-rename-btn {
   grid-column: 3;
   grid-row: 1;
   margin-left: 0;
 }
+.track-item.is-editable .track-flac-dl { grid-column: 2 / 4; grid-row: 2; }
 @media (max-width: 760px) {
   /* Reserved right column for 「改名」, plus list padding so a default or
      right-edge 60×60 FAB (16px inset) cannot cover the button. */
@@ -1812,3 +1813,14 @@ body[data-page="chat"] .fab-nav {
 .storage-badge.is-local { color: #d7e6ef; background: #2a3a44; }
 .storage-badge.is-r2 { color: #071016; background: #7CFFB2; }
 .r2-panel { margin: 0 0 18px; padding: 12px 14px; border: 1px solid rgba(124,255,178,0.25); border-radius: 12px; }
+
+/* t170: tappable meta line (uploader · date) opens inline rename */
+.track-meta .track-sub.is-editable { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; min-height: 44px; padding: 4px 8px 4px 0; margin: 0; cursor: pointer; border-radius: 8px; -webkit-tap-highlight-color: rgba(60,239,255,.18); touch-action: manipulation; max-width: 100%; overflow: hidden; }
+.track-sub.is-editable .track-sub-text { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; text-decoration: underline dotted rgba(60,239,255,.5); text-underline-offset: 3px; }
+.track-sub-edit { flex: none; color: var(--cyan); font-weight: 700; font-size: .82rem; padding: 3px 8px; border: 1px solid rgba(60,239,255,.45); border-radius: 999px; }
+.track-sub.is-editable:focus-visible { box-shadow: 0 0 0 2px rgba(60,239,255,.45); outline: none; }
+.track-item.is-renaming .track-sub.is-editable { display: none; }
+.track-rename-inline input[name="title"] { min-height: 40px; font-size: 16px; }
+.track-rename-inline .btn { min-height: 40px; }
+.track-rename-ok { color: #47f59a; font-size: .82rem; font-weight: 700; }
+.track-rename-ok[hidden] { display: none; }

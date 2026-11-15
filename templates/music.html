@@ -12,8 +12,8 @@
   display: -webkit-flex;
   display: flex;
   display: grid;
-  -webkit-grid-template-columns: auto minmax(0, 1fr) auto;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  -webkit-grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
   -webkit-column-gap: 8px;
   column-gap: 8px;
   -webkit-align-items: center;
@@ -51,6 +51,7 @@
   pointer-events: auto;
 }
 #music .track-item.is-editable .track-rename-btn { grid-column: 3; grid-row: 1; }
+#music .track-item.is-editable .track-flac-dl { grid-column: 2 / 4; grid-row: 2; }
 #music .track-rename-btn[hidden] { display: none !important; }
 </style>
 {% endblock %}

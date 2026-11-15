@@ -4745,7 +4745,10 @@ def settings_rename_track(
     csrf_token: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    wants_json = request.headers.get("x-requested-with") == "dj666-rename"
+    wants_json = (
+        request.headers.get("x-requested-with") == "dj666-rename"
+        or "application/json" in (request.headers.get("accept") or "")
+    )
     try:
         require_csrf(request, csrf_token)
     except HTTPException:
@@ -5607,7 +5610,10 @@ def admin_track_rename(
     csrf_token: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    wants_json = request.headers.get("x-requested-with") == "dj666-rename"
+    wants_json = (
+        request.headers.get("x-requested-with") == "dj666-rename"
+        or "application/json" in (request.headers.get("accept") or "")
+    )
     try:
         require_csrf(request, csrf_token)
     except HTTPException:

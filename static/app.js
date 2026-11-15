@@ -326,13 +326,14 @@
   }
   document.addEventListener("click", function (e) {
     var b = e.target.closest("[data-track-rename]");
-    if (b) { e.preventDefault(); var it = b.closest(".track-item"); if (it && !it.classList.contains("is-renaming")) renameUi(it, true); return; }
+    if (b) { e.preventDefault(); e.stopPropagation(); var it = b.closest(".track-item"); if (it && !it.classList.contains("is-renaming")) renameUi(it, true); return; }
     var c = e.target.closest("[data-track-rename-cancel]");
-    if (c) { e.preventDefault(); renameUi(c.closest(".track-item"), false); }
+    if (c) { e.preventDefault(); e.stopPropagation(); renameUi(c.closest(".track-item"), false); return; }
+    if (e.target.closest(".track-rename-inline")) e.stopPropagation();
   }, true);
   document.addEventListener("keydown", function (e) {
     var t = e.target;
-    if ((e.key === "Enter" || e.key === " ") && t.matches && t.matches(".track-title[data-track-rename]")) { e.preventDefault(); renameUi(t.closest(".track-item"), true); }
+    if ((e.key === "Enter" || e.key === " ") && t.matches && t.matches("[data-track-rename]")) { e.preventDefault(); renameUi(t.closest(".track-item"), true); }
     if (e.key === "Escape" && t.closest && t.closest(".track-rename-inline")) { renameUi(t.closest(".track-item"), false); }
   });
   document.addEventListener("submit", function (e) {
@@ -343,7 +344,7 @@
     var inp = f.querySelector('input[name="title"]'), title = inp.value.trim();
     if (!title) { msg.textContent = "曲目名称不能为空"; return; }
     var btn = f.querySelector('button[type="submit"]'); btn.disabled = true;
-    fetch(f.action, { method: "POST", body: new FormData(f), credentials: "same-origin", headers: { "X-Requested-With": "dj666-rename" } })
+    fetch(f.action, { method: "POST", body: new FormData(f), credentials: "same-origin", headers: { "X-Requested-With": "dj666-rename", "Accept": "application/json" } })
       .then(function (r) { return r.json().catch(function () { return { ok: false, error: r.status === 400 ? "页面已过期，请刷新后重试" : "保存失败（" + r.status + "）" }; }); })
       .then(function (d) {
         btn.disabled = false;
@@ -353,7 +354,7 @@
           if (!sameSrc(el.dataset.src, src)) return;
           el.dataset.title = nt;
           var s = el.querySelector(".track-title-text") || el.querySelector(".track-title, .track-meta strong"); if (s) s.textContent = nt;
-          var tt = el.querySelector(".track-title[data-track-rename]"); if (tt) tt.setAttribute("aria-label", "修改曲名：" + nt);
+          el.querySelectorAll("[data-track-rename][aria-label]").forEach(function (tt) { if (tt.getAttribute("role") === "button") tt.setAttribute("aria-label", "修改曲名：" + nt); });
           var pb = el.querySelector(".play-btn"); if (pb) pb.setAttribute("aria-label", "播放 " + nt);
           var ti = el.querySelector('.track-rename-inline input[name="title"]'); if (ti) ti.value = nt;
         });
@@ -361,6 +362,8 @@
         st.queue.forEach(function (q) { if (sameSrc(q.src, src)) { q.title = nt; changed = true; } });
         if (changed) { render(); save(true); }
         renameUi(item, false);
+        var ok = item.querySelector(".track-rename-ok");
+        if (ok) { ok.hidden = false; clearTimeout(ok._t); ok._t = setTimeout(function () { ok.hidden = true; }, 2200); }
         var sInput = document.querySelector("[data-track-search]"); if (sInput) applySearch(sInput);
       })
       .catch(function () { btn.disabled = false; msg.textContent = "网络错误，请重试"; });
