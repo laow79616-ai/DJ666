@@ -40,7 +40,6 @@
     {% if user and user.is_admin and (track.flac_path or track.flac_r2_key) %}
     <a class="track-flac-dl" href="/admin/tracks/{{ track.id }}/flac" title="下载 FLAC 无损（{{ (track.flac_size or 0)|fmt_bytes }}）">下载 FLAC · {{ (track.flac_size or 0)|fmt_bytes }}</a>
     {% endif %}
-    {% if can_rename %}<button type="button" class="track-rename-btn" data-track-rename title="修改曲目名称" aria-label="修改曲目名称" style="visibility:visible;opacity:1;min-width:64px;min-height:44px;padding:11px 14px;background:#3cefff;color:#071016;font-weight:800;font-size:1.05rem;line-height:1;border:0;border-radius:999px;z-index:6;position:relative;-webkit-appearance:none;appearance:none;white-space:nowrap">改名</button>{% endif %}
   </li>
   {% endfor %}
 </ul>
