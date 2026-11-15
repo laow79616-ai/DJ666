@@ -16,7 +16,29 @@
   }
   var expandedMap = loadExpanded();
   function isImported(j) {
-    return !!(j && j.state === "done" && j.track_id);
+    // Library import finished. Keep importing / import_failed visible so the user can watch or retry.
+    if (!j) return false;
+    if (j.state === "importing" || j.state === "import_failed") return false;
+    return !!(j.track_id || j.state === "imported");
+  }
+  function showInOptList(j) {
+    return !isImported(j);
+  }
+  function removeJobCard(id) {
+    var c = cards[id];
+    if (!c) return;
+    if (c._hideImported) { clearTimeout(c._hideImported); c._hideImported = null; }
+    if (c.el && c.el.parentNode) c.el.remove();
+    delete cards[id];
+    if (expandedMap[id]) { delete expandedMap[id]; saveExpanded(expandedMap); }
+  }
+  function flashThenHideImported(c) {
+    if (!c || c._hideImported) return;
+    c._hideImported = setTimeout(function () {
+      if (!c.el) { removeJobCard(c.id); return; }
+      c.el.classList.add("is-leaving");
+      setTimeout(function () { removeJobCard(c.id); }, 350);
+    }, 1600);
   }
   function canCollapse(j) {
     return !!(j && j.state === "done");
@@ -208,6 +230,9 @@
   }
 
   function render(j) {
+    // Telegram 音乐导入 calls DJOpt.watch() for every queue item, including already
+    // imported ones. Do not resurrect those cards in the 上传优化 list.
+    if (isImported(j) && !cards[j.id]) return;
     var c = card(j.id);
     if (j.state === "importing") c._wasImporting = true;
     c.data = j;
@@ -246,6 +271,8 @@
     }
     renderResult(c, j);
     applyCollapse(c, j);
+    // Do not delete job records or R2 objects; just drop the card from this list.
+    if (isImported(j)) flashThenHideImported(c);
   }
 
   function anyBusy() {
@@ -267,10 +294,11 @@
   }
   function refresh(id, noSchedule) {
     return api("GET", "/dj/optimize/" + id).then(function (j) {
+      if (isImported(j) && !cards[id]) return;
       render(j);
       if (!noSchedule) schedule();
     }).catch(function (e) {
-      if (e.status === 404 && cards[id]) { cards[id].el.remove(); delete cards[id]; }
+      if (e.status === 404 && cards[id]) { removeJobCard(id); }
     });
   }
 
@@ -339,7 +367,7 @@
   });
 
   api("GET", "/dj/optimize/jobs").then(function (r) {
-    (r.jobs || []).slice().reverse().forEach(function (j) { if (!j.track_id || j.state === "importing" || j.state === "import_failed") render(j); });
+    (r.jobs || []).slice().reverse().forEach(function (j) { if (showInOptList(j)) render(j); });
     schedule();
   }).catch(function () {});
 

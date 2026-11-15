@@ -1395,12 +1395,8 @@ body.has-player { padding-bottom: calc(var(--player-h, 120px) + 88px); }
 }
 .track-item.is-editable .track-flac-dl { grid-column: 2 / 4; grid-row: 2; }
 @media (max-width: 760px) {
-  /* Reserved right column for 「改名」, plus list padding so a default or
-     right-edge 60×60 FAB (16px inset) cannot cover the button. */
-  #music .track-list {
-    /* List is already inset by page margin + panel padding (~36px),
-       so 64px here still clears a 60×60 FAB at right:16px. */
-    padding-right: 64px;
+  #music .track-list, #latestMusic .track-list, #home .track-list {
+    padding-right: 8px;
     padding-bottom: 108px;
     overflow: visible;
   }
@@ -1824,3 +1820,90 @@ body[data-page="chat"] .fab-nav {
 .track-rename-inline .btn { min-height: 40px; }
 .track-rename-ok { color: #47f59a; font-size: .82rem; font-weight: 700; }
 .track-rename-ok[hidden] { display: none; }
+
+/* t171: public lists hide uploader·date; admins/owners get a clear rename entry. */
+.track-rename-entry,
+.track-sub.track-rename-entry.is-editable {
+  display: inline-flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: auto;
+  max-width: 100%;
+  box-sizing: border-box;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 6px 12px;
+  margin: 2px 0 0;
+  cursor: pointer;
+  color: var(--cyan);
+  font-weight: 700;
+  font-size: 0.9rem;
+  line-height: 1.2;
+  border: 1px solid rgba(60, 239, 255, 0.45);
+  border-radius: 999px;
+  background: rgba(60, 239, 255, 0.08);
+  -webkit-tap-highlight-color: rgba(60, 239, 255, 0.18);
+  touch-action: manipulation;
+  white-space: nowrap;
+  overflow: visible;
+  text-decoration: none;
+}
+.track-rename-entry:hover,
+.track-rename-entry:focus-visible {
+  background: rgba(60, 239, 255, 0.18);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(60, 239, 255, 0.45);
+}
+.track-item.is-renaming .track-rename-entry { display: none !important; }
+
+/* t171: now-playing / paused badge on the current row (list only, not the bottom bar). */
+.track-item.is-playing {
+  background: rgba(71, 245, 154, 0.1);
+  box-shadow: inset 3px 0 0 #47f59a;
+}
+.track-item.is-playing .track-title-text { color: #47f59a; }
+.track-item.is-playing.is-paused .track-title-text { color: #9ad4b8; }
+.track-now {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  color: #47f59a;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+.track-now[hidden] { display: none !important; }
+.track-now.is-paused { color: #9ad4b8; }
+.track-eq {
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 2px;
+  height: 12px;
+  width: 12px;
+  flex: none;
+}
+.track-eq b {
+  display: block;
+  width: 3px;
+  height: 100%;
+  background: currentColor;
+  border-radius: 1px;
+  transform-origin: center bottom;
+  animation: trackEq 0.9s ease-in-out infinite;
+}
+.track-eq b:nth-child(2) { animation-delay: -0.2s; }
+.track-eq b:nth-child(3) { animation-delay: -0.45s; }
+.track-now.is-paused .track-eq b { animation: none; transform: scaleY(0.45); opacity: 0.75; }
+@keyframes trackEq {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .track-eq b { animation: none; }
+}

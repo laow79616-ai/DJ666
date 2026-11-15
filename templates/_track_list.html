@@ -24,8 +24,8 @@
     <div class="track-meta">
       {% if can_rename %}<strong class="track-title is-editable" data-track-rename role="button" tabindex="0" title="点击修改曲名（管理员）" aria-label="修改曲名：{{ track.title }}"><span class="track-title-text">{{ track.title }}</span><span class="track-edit-ico" aria-hidden="true">✎</span></strong>
       {% else %}<strong class="track-title"><span class="track-title-text">{{ track.title }}</span></strong>{% endif %}
-      {% if can_rename %}<span class="muted track-sub is-editable" data-track-rename role="button" tabindex="0" title="点击修改曲名" aria-label="修改曲名：{{ track.title }}"><span class="track-sub-text">{{ display_name(track.uploader, "未知用户") }} · {{ track.created_at|fmt_time }}</span><span class="track-sub-edit" aria-hidden="true">✎ 改名</span></span>
-      {% else %}<span class="muted">{{ display_name(track.uploader, "未知用户") }} · {{ track.created_at|fmt_time }}</span>{% endif %}
+      {% if can_rename %}<span class="track-sub track-rename-entry is-editable" data-track-rename role="button" tabindex="0" title="点击修改歌曲名称" aria-label="修改歌曲名称：{{ track.title }}">✎ 修改歌曲名称</span>{% endif %}
+      <span class="track-now" hidden><i class="track-eq" aria-hidden="true"><b></b><b></b><b></b></i><span class="track-now-text">正在播放</span></span>
       <span class="track-rename-ok" aria-live="polite" hidden>已保存</span>
       {% if can_rename %}
       <form class="track-rename-inline" action="{{ '/admin/tracks/%d/rename' % track.id if is_admin_user else '/settings/tracks/%d/rename' % track.id }}" method="post" data-no-pjax hidden>

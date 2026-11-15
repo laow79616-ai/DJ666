@@ -52,6 +52,25 @@
 #music .track-item.is-editable .track-rename-btn { grid-column: 3; grid-row: 1; }
 #music .track-item.is-editable .track-flac-dl { grid-column: 2 / 4; grid-row: 2; }
 #music .track-rename-btn[hidden] { display: none !important; }
+#music .track-rename-entry {
+  display: inline-flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  align-items: center;
+  min-height: 44px;
+  padding: 6px 12px;
+  color: #3cefff;
+  font-weight: 700;
+  font-size: 0.9rem;
+  border: 1px solid rgba(60,239,255,.45);
+  border-radius: 999px;
+  background: rgba(60,239,255,.08);
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: rgba(60,239,255,.18);
+  touch-action: manipulation;
+}
+#music .track-item.is-renaming .track-rename-entry { display: none !important; }
 </style>
 {% endblock %}
 {% block content %}

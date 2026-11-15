@@ -153,6 +153,7 @@ body[data-page="mixer"] { padding-bottom: 24px; }
 .djopt-jobs { display: grid; gap: 12px; }
 .djopt-job { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; background: rgba(11, 9, 18, 0.6); display: grid; gap: 8px; }
 .djopt-job.is-done { border-color: rgba(93, 255, 178, 0.35); }
+.djopt-job.is-leaving { opacity: 0; transition: opacity 0.3s ease; pointer-events: none; }
 .djopt-job.is-failed { border-color: rgba(255, 93, 115, 0.45); }
 .djopt-job-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .djopt-job-name { flex: 1 1 auto; min-width: 0; word-break: break-all; }

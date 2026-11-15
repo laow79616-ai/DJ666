@@ -6,7 +6,7 @@
   <p class="muted">使用用户名或注册邮箱登录，即可播放音乐并参与公屏聊天。</p>
   <form method="post" action="/login" class="auth-form" data-no-pjax>
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
-    <input type="hidden" name="next" value="{{ next_url or '/' }}">
+    <input type="hidden" name="next" value="{{ next_url or '/music' }}">
     <label>账号
       <input type="text" name="account" required autocomplete="username" placeholder="用户名或邮箱">
     </label>

@@ -1,11 +1,66 @@
 {% extends "base.html" %}
 {% from "_tg_media.html" import media_grid %}
+{% from "_track_list.html" import track_list with context %}
 {% block title %}DJ666 音乐随听{% endblock %}
 {% block page_id %}home{% endblock %}
+{% block extra_head %}
+<style>
+/* Critical list rules so a stale style.css cannot hide admin rename or the now-playing badge. */
+#home, #home .track-list, #home .track-item, #latestMusic { overflow: visible !important; }
+#home .track-item.is-editable, #latestMusic .track-item.is-editable {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  column-gap: 8px;
+  align-items: center;
+  overflow: visible !important;
+}
+#home .track-item.is-editable .play-btn, #latestMusic .track-item.is-editable .play-btn { grid-column: 1; grid-row: 1; }
+#home .track-item.is-editable .track-meta, #latestMusic .track-item.is-editable .track-meta { grid-column: 2; grid-row: 1; min-width: 0; }
+#home .track-item.is-editable .track-flac-dl, #latestMusic .track-item.is-editable .track-flac-dl { grid-column: 2 / 4; grid-row: 2; }
+.track-rename-entry {
+  display: inline-flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  align-items: center;
+  min-height: 44px;
+  padding: 6px 12px;
+  color: #3cefff;
+  font-weight: 700;
+  font-size: 0.9rem;
+  border: 1px solid rgba(60,239,255,.45);
+  border-radius: 999px;
+  background: rgba(60,239,255,.08);
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: rgba(60,239,255,.18);
+  touch-action: manipulation;
+}
+.track-item.is-renaming .track-rename-entry { display: none !important; }
+</style>
+{% endblock %}
 {% block content %}
 <section class="hero">
   <p class="eyebrow">{{ hero_eyebrow }}</p>
   <h1>{{ hero_title }}</h1>
+</section>
+
+<section class="panel" id="latestMusic">
+  <div class="panel-head">
+    <h2>最新音乐</h2>
+    <span class="music-head-actions">
+      <span class="count">{{ tracks|length }} 首</span>
+      {% if tracks %}
+      <button type="button" class="btn btn-sm" data-play-all="home">▶ 全部播放</button>
+      <button type="button" class="btn btn-sm btn-ghost" data-play-all="home" data-shuffle="1">🔀 随机播放</button>
+      {% endif %}
+      <a class="btn btn-sm btn-ghost" href="/music">全部曲目</a>
+    </span>
+  </div>
+  {% if tracks %}
+  {{ track_list(tracks, "homeTrackList", "home", show_search=True) }}
+  {% else %}
+  <p class="muted">暂无曲目。</p>
+  {% endif %}
 </section>
 
 <section class="panel panel-announce" id="announce">

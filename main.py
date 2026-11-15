@@ -3898,11 +3898,23 @@ class NoStoreHTMLMiddleware:
                 for k, v in headers:
                     if k.lower() == b"content-type":
                         ctype = v
-                if ctype.startswith(b"text/html") and not any(k.lower() == b"cache-control" for k, _ in headers):
-                    headers.append((b"cache-control", b"no-store, private"))
-                    if not any(k.lower() == b"vary" for k, _ in headers):
-                        headers.append((b"vary", b"Cookie"))
-                    message["headers"] = headers
+                if ctype.startswith(b"text/html"):
+                    kept = []
+                    has_vary = False
+                    for k, v in headers:
+                        lk = k.lower()
+                        if lk in {b"cache-control", b"pragma", b"expires", b"cdn-cache-control"}:
+                            continue
+                        if lk == b"vary":
+                            has_vary = True
+                        kept.append((k, v))
+                    kept.append((b"cache-control", b"private, no-store, no-cache, must-revalidate, max-age=0"))
+                    kept.append((b"pragma", b"no-cache"))
+                    kept.append((b"expires", b"0"))
+                    kept.append((b"cdn-cache-control", b"no-store"))
+                    if not has_vary:
+                        kept.append((b"vary", b"Cookie"))
+                    message["headers"] = kept
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
@@ -4119,12 +4131,17 @@ def login_redirect(next_url: str = "/") -> RedirectResponse:
 
 
 def safe_next_path(next_url: str, user: Optional[User] = None) -> str:
-    """Allow only in-site relative paths. Admins with the default next=/ land on /admin."""
-    target = next_url if next_url and next_url.startswith("/") and not next_url.startswith("//") else "/"
+    """Allow only in-site relative paths. Frontend login default landing is /music.
+
+    /admin/login is a separate form and still redirects to /admin. A visitor
+    hitting '/' is unchanged — only post-login (and already-logged-in /login)
+    uses this helper.
+    """
+    target = next_url if next_url and next_url.startswith("/") and not next_url.startswith("//") else "/music"
     if target.startswith("/admin") and not (user and user.is_admin):
-        return "/"
-    if user and user.is_admin and target in {"/", "/login", "/register", "/home"}:
-        return "/admin"
+        return "/music"
+    if target in {"/", "/login", "/register", "/home"}:
+        return "/music"
     return target
 
 
@@ -4214,12 +4231,14 @@ def home(request: Request, db: Session = Depends(get_db)):
             # The batch UPDATE ran in SQL; reflect it on the loaded rows without marking them dirty.
             set_committed_value(a, "site_views", int(a.site_views or 0) + 1)
     ann_stats = ann_interactions(db, [a.id for a in announcements], current_user(request, db), announcements)
+    tracks = approved_tracks(db)
     return templates.TemplateResponse(
         request,
         "index.html",
         ctx(
             request,
             db,
+            tracks=tracks,
             announcements=announcements,
             ann_stats=ann_stats,
             ann_comment_max=ANN_COMMENT_MAX_LEN,
@@ -4287,7 +4306,7 @@ def chat_page(request: Request, db: Session = Depends(get_db)):
 @app.get("/register", response_class=HTMLResponse)
 def register_page(request: Request, db: Session = Depends(get_db)):
     if current_user(request, db):
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/music", status_code=303)
     return templates.TemplateResponse(request, "register.html", ctx(request, db))
 
 
@@ -4303,7 +4322,7 @@ def register_submit(
 ):
     require_csrf(request, csrf_token)
     if current_user(request, db):
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/music", status_code=303)
     if str(agree).strip().lower() not in {"1", "on", "true", "yes"}:
         flash(request, "请先阅读并同意《平台合约规则》。", "error")
         return RedirectResponse("/register", status_code=303)
@@ -4333,15 +4352,15 @@ def register_submit(
     db.refresh(user)
     establish_session(request, user)
     flash(request, "注册成功，欢迎来到 DJ666！", "success")
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/music", status_code=303)
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request, next: str = "/", db: Session = Depends(get_db)):
+def login_page(request: Request, next: str = "/music", db: Session = Depends(get_db)):
     user = current_user(request, db)
     if user:
-        return RedirectResponse(safe_next_path(next or "/", user), status_code=303)
-    return templates.TemplateResponse(request, "login.html", ctx(request, db, next_url=next or "/"))
+        return RedirectResponse(safe_next_path(next or "/music", user), status_code=303)
+    return templates.TemplateResponse(request, "login.html", ctx(request, db, next_url=next or "/music"))
 
 
 @app.post("/login")
@@ -4350,7 +4369,7 @@ def login_submit(
     password: str = Form(...),
     account: str = Form(""),
     email: str = Form(""),
-    next: str = Form("/"),
+    next: str = Form("/music"),
     csrf_token: str = Form(""),
     db: Session = Depends(get_db),
 ):

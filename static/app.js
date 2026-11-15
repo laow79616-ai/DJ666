@@ -161,7 +161,21 @@
   function markPlaying() {
     var t = cur();
     document.querySelectorAll("[data-playlist] .track-item").forEach(function (el) {
-      el.classList.toggle("is-playing", !!t && sameSrc(el.dataset.src, t.src));
+      var on = !!t && sameSrc(el.dataset.src, t.src);
+      el.classList.toggle("is-playing", on);
+      el.classList.toggle("is-paused", on && audio.paused);
+      var badge = el.querySelector(".track-now");
+      if (!badge) return;
+      if (on) {
+        badge.hidden = false;
+        badge.classList.toggle("is-paused", !!audio.paused);
+        var label = badge.querySelector(".track-now-text");
+        if (label) label.textContent = audio.paused ? "已暂停" : "正在播放";
+        badge.setAttribute("aria-label", audio.paused ? "已暂停" : "正在播放");
+      } else {
+        badge.hidden = true;
+        badge.classList.remove("is-paused");
+      }
     });
   }
   function load(index, autoplay, startAt) {
