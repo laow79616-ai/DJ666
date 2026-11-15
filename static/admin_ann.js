@@ -134,7 +134,7 @@
       });
       lh += "</ul>";
     }
-    if (!t && !body) pText.innerHTML = (c || links.length ? "" : '<span class="muted">在下方输入内容、添加图片或视频，这里实时预览首页效果。</span>') + lh;
+    if (!t && !body) pText.innerHTML = (c || links.length ? "" : '<span class="muted">在下方输入内容、添加图片或视频，这里实时预览公告页效果。</span>') + lh;
     else pText.innerHTML = (t ? '<strong class="tg-title">' + esc(t) + "</strong>" : "") + (body ? '<div class="ann-body">' + linkify(body) + "</div>" : "") + lh;
     document.getElementById("annPreview").classList.toggle("has-media", c > 0);
   }
@@ -266,11 +266,11 @@
     setLinks(opts.links || []);
     if (mode === "edit") {
       form.action = "/admin/announcements/" + opts.id + "/edit";
-      modeEl.textContent = "正在手动编辑公告 #" + opts.id + " · 保存后首页同步，日后自动发布将保留此内容";
+      modeEl.textContent = "正在手动编辑公告 #" + opts.id + " · 保存后公告页同步，日后自动发布将保留此内容";
       cancelBtn.hidden = false;
     } else {
       form.action = form.dataset.createAction;
-      modeEl.textContent = opts.tgId ? "从 Telegram 采集内容载入 · 修改后发布" : "新公告 · 发布后显示在首页";
+      modeEl.textContent = opts.tgId ? "从 Telegram 采集内容载入 · 修改后发布" : "新公告 · 发布后显示在公告页";
       cancelBtn.hidden = !opts.tgId;
     }
     render(); autosize(); openSection();

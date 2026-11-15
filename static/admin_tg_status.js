@@ -24,7 +24,7 @@
     }
     if (pubForm) {
       pubForm.onsubmit = function () {
-        var tpl = pubForm.getAttribute("data-confirm-tpl") || "将把当前全部 {n} 条已过滤的待处理内容发布到公告首页。确定发布？";
+        var tpl = pubForm.getAttribute("data-confirm-tpl") || "将把当前全部 {n} 条已过滤的待处理内容发布到公告页。确定发布？";
         return confirm(tpl.replace("{n}", String(n)));
       };
     }

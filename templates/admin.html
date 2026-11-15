@@ -66,7 +66,7 @@ a.admin-dj-entry {
     <a class="admin-tab" role="tab" href="#upload" data-tab="upload" aria-controls="upload" aria-selected="false">上传音乐</a>
     <a class="admin-tab" role="tab" href="#tracks" data-tab="tracks" aria-controls="tracks" aria-selected="false">曲目{% if pending_tracks %}<span class="tab-badge">{{ pending_tracks|length }}</span>{% endif %}</a>
     <a class="admin-tab" role="tab" href="#contact" data-tab="contact" aria-controls="contact" aria-selected="false">投稿联系人</a>
-    <a class="admin-tab" role="tab" href="#homecopy" data-tab="homecopy" aria-controls="homecopy" aria-selected="false">首页文案</a>
+    <a class="admin-tab" role="tab" href="#homecopy" data-tab="homecopy" aria-controls="homecopy" aria-selected="false">公告文案</a>
     <a class="admin-tab" role="tab" href="#announce" data-tab="announce" aria-controls="announce" aria-selected="false">发布公告</a>
     <a class="admin-tab" role="tab" href="#anncomments" data-tab="anncomments" aria-controls="anncomments" aria-selected="false">公告评论</a>
     <a class="admin-tab" role="tab" href="#telegram" data-tab="telegram" aria-controls="telegram" aria-selected="false">Telegram 采集<span class="tab-badge" id="tgTabBadge"{% if not tg_new_total %} hidden{% endif %} data-tg-new-total>{{ tg_new_total }}</span></a>
@@ -211,10 +211,10 @@ a.admin-dj-entry {
 <section class="panel admin-pane" role="tabpanel" id="homecopy">
   <div class="admin-pane-inner">
     <div class="admin-pane-head">
-      <h2>首页文案</h2>
+      <h2>公告文案</h2>
     </div>
     <div class="admin-pane-body">
-      <p class="hint" style="margin-top:0;">这两行显示在网站首页顶部。留空的项目会使用默认文案，首页不会出现空白标题。</p>
+      <p class="hint" style="margin-top:0;">这两行显示在公告页顶部。留空的项目会使用默认文案，公告页不会出现空白标题。</p>
       <form class="stack-form" action="/admin/homecopy" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf }}">
         <label>顶部小标题
@@ -242,7 +242,7 @@ a.admin-dj-entry {
           <div class="tg-avatar" aria-hidden="true">DJ</div>
           <div class="tg-channel-info">
             <strong>DJ666 公告频道</strong>
-            <span class="muted" id="annMode">新公告 · 发布后显示在首页</span>
+            <span class="muted" id="annMode">新公告 · 发布后显示在公告页</span>
           </div>
           <button type="button" class="link-btn" id="annCancelEdit" hidden>取消编辑</button>
         </div>
@@ -254,7 +254,7 @@ a.admin-dj-entry {
             <div class="tg-bubble" id="annPreview">
               <div class="tg-author">DJ666 公告</div>
               <div id="annPreviewMedia"></div>
-              <div class="tg-text" id="annPreviewText"><span class="muted">在下方输入内容、添加图片或视频，这里实时预览首页效果。</span></div>
+              <div class="tg-text" id="annPreviewText"><span class="muted">在下方输入内容、添加图片或视频，这里实时预览公告页效果。</span></div>
               <div class="tg-meta">刚刚</div>
             </div>
           </article>
@@ -270,7 +270,7 @@ a.admin-dj-entry {
           <div class="ann-link-editor" id="annLinkEditor">
             <div class="ann-link-rows" id="annLinkRows"></div>
             <button type="button" class="btn btn-sm btn-ghost" id="annLinkAdd">＋ 添加文案链接</button>
-            <span class="hint">每行一个「文案 + 链接」，首页公告里逐行显示，点击跳转；文案可留空（显示网址）。仅支持 http / https，最多 {{ ann_max_links }} 行。</span>
+            <span class="hint">每行一个「文案 + 链接」，公告页里逐行显示，点击跳转；文案可留空（显示网址）。仅支持 http / https，最多 {{ ann_max_links }} 行。</span>
           </div>
           <div class="tg-tray" id="annTray" hidden></div>
           <div class="tg-inputbar" id="annDrop">
@@ -292,7 +292,7 @@ a.admin-dj-entry {
 
       <div class="ann-log">
         <h3 class="ann-log-title">已发布记录（{{ ann_total }}）</h3>
-        <p class="hint">每条公告下方均可「手动编辑内容」并保存。已编辑的内容会显示在首页；日后从 Telegram 再次发布同一来源时，将优先保留这份已编辑内容。列表分页显示，不会删除任何已发布公告。</p>
+        <p class="hint">每条公告下方均可「手动编辑内容」并保存。已编辑的内容会显示在公告页；日后从 Telegram 再次发布同一来源时，将优先保留这份已编辑内容。列表分页显示，不会删除任何已发布公告。</p>
         {% if ann_total > ann_page_size %}
         <p class="muted">第 {{ ann_page }} / {{ ann_pages }} 页，每页 {{ ann_page_size }} 条。
           {% if ann_page > 1 %}<a href="/admin?apage={{ ann_page-1 }}#announce">上一页</a>{% endif %}
@@ -332,7 +332,7 @@ a.admin-dj-entry {
                   <button type="submit" class="link-btn">恢复显示</button>
                 </form>
                 {% else %}
-                <form class="inline-form" action="/admin/announcements/{{ ann.id }}/hide" method="post" onsubmit="return confirm('从首页隐藏这条公告？可随时恢复，不会删除。');">
+                <form class="inline-form" action="/admin/announcements/{{ ann.id }}/hide" method="post" onsubmit="return confirm('从公告页隐藏这条公告？可随时恢复，不会删除。');">
                   <input type="hidden" name="csrf_token" value="{{ csrf }}">
                   <input type="hidden" name="reason" value="管理员隐藏">
                   <button type="submit" class="link-btn">隐藏</button>
@@ -348,7 +348,7 @@ a.admin-dj-entry {
                 {% if ann.content_edited %}
                 <span class="hint">已手动编辑并保存，日后自动发布同一来源时将保留此内容，不会被采集原文覆盖。</span>
                 {% else %}
-                <span class="hint">在此修改并保存这条公告；保存后首页同步，日后自动发布将优先使用已编辑内容。</span>
+                <span class="hint">在此修改并保存这条公告；保存后公告页同步，日后自动发布将优先使用已编辑内容。</span>
                 {% endif %}
               </div>
             </div>
@@ -392,7 +392,7 @@ a.admin-dj-entry {
               <td><input type="checkbox" name="ids" value="{{ c.id }}" form="annCmtBatch" class="anncmt-pick"></td>
               <td>{{ display_name(c.user) }}</td>
               <td class="anncmt-text">{{ c.content }}</td>
-              <td class="anncmt-ann muted"><a href="/#ann-{{ c.announcement_id }}" target="_blank" rel="noopener">#{{ c.announcement_id }}</a> {% if c.announcement %}{{ (c.announcement.title or c.announcement.content or "（仅媒体）")|truncate(28, True, "…") }}{% endif %}</td>
+              <td class="anncmt-ann muted"><a href="/news#ann-{{ c.announcement_id }}" target="_blank" rel="noopener">#{{ c.announcement_id }}</a> {% if c.announcement %}{{ (c.announcement.title or c.announcement.content or "（仅媒体）")|truncate(28, True, "…") }}{% endif %}</td>
               <td class="muted">{{ c.created_at|fmt_time }}</td>
               <td>
                 <form class="inline-form" action="/admin/ann-comments/{{ c.id }}/delete" method="post" onsubmit="return confirm('确定删除这条评论？');">
@@ -406,7 +406,7 @@ a.admin-dj-entry {
         </table>
       </div>
       {% else %}
-      <p class="muted">暂无公告评论。用户在首页公告下发表的评论会显示在这里。</p>
+      <p class="muted">暂无公告评论。用户在公告页下发表的评论会显示在这里。</p>
       {% endif %}
     </div>
   </div>
@@ -433,7 +433,7 @@ a.admin-dj-entry {
         </form>
         {% if tg_new_total %}
         <form id="tgPublishAllForm" action="/admin/telegram/publish-all" method="post" data-no-pjax
-              data-confirm-tpl="将把当前全部 {n} 条已过滤的待处理内容发布到公告首页。确定发布？"
+              data-confirm-tpl="将把当前全部 {n} 条已过滤的待处理内容发布到公告页。确定发布？"
               onsubmit="return confirm(this.getAttribute('data-confirm-tpl').replace('{n}', '{{ tg_new_total }}'));">
           <input type="hidden" name="csrf_token" value="{{ csrf }}">
           <button type="submit" class="btn" id="tgPublishAllBtn"{% if tg_running %} disabled{% endif %}>一键发布（{{ tg_new_total }}）</button>
@@ -477,7 +477,7 @@ a.admin-dj-entry {
         <button type="submit" name="action" value="ignore" class="btn btn-sm btn-danger" data-need-sel data-confirm="忽略所选 {n} 条并删除其已下载媒体？">批量忽略</button>
         <button type="submit" name="action" value="learn" class="btn btn-sm btn-ghost" data-need-sel data-confirm="把所选 {n} 条的图片（含视频封面）加入图片过滤规则，并忽略这些条目？" title="以后采集到相同或相似的图片会自动移除">图片加入过滤并忽略</button>
         <label class="tg-check small"><input type="checkbox" name="with_source" value="1"> 附来源</label>
-        <button type="submit" name="action" value="publish" class="btn btn-sm btn-ghost" data-need-sel data-confirm="把所选 {n} 条发布为公告（首页可见）？">批量发布</button>
+        <button type="submit" name="action" value="publish" class="btn btn-sm btn-ghost" data-need-sel data-confirm="把所选 {n} 条发布为公告（公告页可见）？">批量发布</button>
       </form>
       {% endif %}
       <div class="tg-feed admin-feed">
@@ -522,11 +522,11 @@ a.admin-dj-entry {
             <form class="tg-pending-edit" id="tg-edit-{{ item.id }}" action="/admin/telegram/{{ item.id }}/edit" method="post" hidden>
               <input type="hidden" name="csrf_token" value="{{ csrf }}">
               <input type="hidden" name="links_present" value="1">
-              <label class="tg-edit-label" for="tg-edit-title-{{ item.id }}">标题 <span class="hint">（可选，首页加粗显示在最上方）</span></label>
+              <label class="tg-edit-label" for="tg-edit-title-{{ item.id }}">标题 <span class="hint">（可选，公告页加粗显示在最上方）</span></label>
               <input type="text" id="tg-edit-title-{{ item.id }}" name="title" maxlength="200" value="{{ item.edit_title or '' }}" placeholder="标题（可留空）">
               <label class="tg-edit-label" for="tg-edit-text-{{ item.id }}">正文</label>
               <textarea id="tg-edit-text-{{ item.id }}" name="text" rows="8">{{ item.text }}</textarea>
-              <div class="tg-edit-label">文案链接 <span class="hint">（可多条；只支持 http:// 或 https://，首页显示在正文下方，点击新窗口打开）</span></div>
+              <div class="tg-edit-label">文案链接 <span class="hint">（可多条；只支持 http:// 或 https://，公告页显示在正文下方，点击新窗口打开）</span></div>
               <div class="tg-edit-links" data-tg-links>
                 {% for l in elinks %}
                 <div class="tg-edit-link-row"><input type="text" name="link_text" maxlength="80" placeholder="文案（如：点击查看详情）" value="{{ l.text }}"><input type="text" name="link_url" maxlength="500" placeholder="链接 https://…" inputmode="url" autocomplete="off" value="{{ l.url }}"><button type="button" class="link-btn danger" data-tg-link-del>删除</button></div>
@@ -583,7 +583,7 @@ a.admin-dj-entry {
       <h2>过滤内容 <span class="count">TG采集 · 文字 {{ tgf_strip|length + tgf_block|length }} 条 · 赌博广告 {{ tgf_gamble|length }} 条 · 图片 {{ tgf_images|length }} 张</span></h2>
     </div>
     <div class="admin-pane-body">
-      <p class="hint">用于「Telegram 采集」：每次采集（手动或定时）以及发布前（自动发布、一键发布、单条发布）都会按这里的规则过滤。规则增删后会立即重新扫描「待处理」。文字匹配不区分大小写，并忽略空格、表情、箭头和标点；同时检查正文、链接、按钮文字和网址。您手动添加到过滤池的词条一律作为「整条忽略」（硬拦截），并做全角/空格正规化。新闻/曝光类报道仍会保留，但出现广告号召、联系方式或「#友情广告」等标签时不再豁免。已从首页隐藏的广告可在本页下方恢复，不会被硬删除。</p>
+      <p class="hint">用于「Telegram 采集」：每次采集（手动或定时）以及发布前（自动发布、一键发布、单条发布）都会按这里的规则过滤。规则增删后会立即重新扫描「待处理」。文字匹配不区分大小写，并忽略空格、表情、箭头和标点；同时检查正文、链接、按钮文字和网址。您手动添加到过滤池的词条一律作为「整条忽略」（硬拦截），并做全角/空格正规化。新闻/曝光类报道仍会保留，但出现广告号召、联系方式或「#友情广告」等标签时不再豁免。已从公告页隐藏的广告可在本页下方恢复，不会被硬删除。</p>
 
       <div class="tgf-grid">
         <form class="tgf-card" action="/admin/telegram/filters/text" method="post">
@@ -689,7 +689,7 @@ a.admin-dj-entry {
       </form>
 
       <div class="tgf-hidden">
-        <h3 class="ann-log-title">已隐藏的公告（{{ hidden_anns|length if hidden_anns is defined else 0 }}） <span class="muted tgf-desc">从首页软隐藏，可恢复；不会删除记录或媒体。</span></h3>
+        <h3 class="ann-log-title">已隐藏的公告（{{ hidden_anns|length if hidden_anns is defined else 0 }}） <span class="muted tgf-desc">从公告页软隐藏，可恢复；不会删除记录或媒体。</span></h3>
         {% if hidden_anns %}
         <ul class="tgf-ign-list">
           {% for ann in hidden_anns %}
@@ -698,7 +698,7 @@ a.admin-dj-entry {
             <span class="tgf-reason">{{ ann.hidden_reason or "广告" }} · {{ ann.hidden_at|fmt_time if ann.hidden_at else "" }}</span>
             <form class="inline-form" action="/admin/announcements/{{ ann.id }}/unhide" method="post">
               <input type="hidden" name="csrf_token" value="{{ csrf }}">
-              <button type="submit" class="link-btn">恢复到首页</button>
+              <button type="submit" class="link-btn">恢复到公告页</button>
             </form>
           </li>
           {% endfor %}
@@ -1230,9 +1230,9 @@ a.admin-dj-entry {
 </script>
 <script type="application/json" id="annData">{{ ann_data|tojson }}</script>
 <script type="application/json" id="tgData">{{ tg_data|tojson }}</script>
-<script src="/static/admin_tg_status.js?v=tgtitle1" defer></script>
+<script src="/static/admin_tg_status.js?v=t176a" defer></script>
 <script src="/static/dj_optimize.js?v=t172hide2" defer></script>
-<script src="/static/admin_ann.js?v=tgtitle1" defer></script>
+<script src="/static/admin_ann.js?v=t176a" defer></script>
 <script src="/static/admin_upload.js?v=cat1" defer></script>
 <script src="/static/admin_tracks.js?v=t168imp1" defer></script>
 <script src="/static/admin_bot.js?v=adsup2" defer></script>

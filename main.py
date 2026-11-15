@@ -4256,18 +4256,27 @@ def login_redirect(next_url: str = "/") -> RedirectResponse:
     return RedirectResponse(target, status_code=303)
 
 
-def safe_next_path(next_url: str, user: Optional[User] = None) -> str:
-    """Allow only in-site relative paths. Frontend login default landing is /music.
+def _decode_next_hash(target: str) -> str:
+    """Turn /%23ann-12 or /#ann-12 into /news#ann-12 (old announcement deep links)."""
+    raw = urllib.parse.unquote(target or "")
+    if raw.startswith("/#ann-") or raw.startswith("/#announce"):
+        return "/news" + raw[1:]
+    if raw == "/home" or raw.startswith("/home?"):
+        return "/news" + raw[len("/home"):]
+    return target
 
-    /admin/login is a separate form and still redirects to /admin. A visitor
-    hitting '/' is unchanged — only post-login (and already-logged-in /login)
-    uses this helper.
+
+def safe_next_path(next_url: str, user: Optional[User] = None) -> str:
+    """Allow only in-site relative paths. Frontend login lands on the music homepage ('/').
+
+    /admin/login is a separate form and still redirects to /admin.
     """
-    target = next_url if next_url and next_url.startswith("/") and not next_url.startswith("//") else "/music"
+    target = next_url if next_url and next_url.startswith("/") and not next_url.startswith("//") else "/"
+    target = _decode_next_hash(target)
     if target.startswith("/admin") and not (user and user.is_admin):
-        return "/music"
-    if target in {"/", "/login", "/register", "/home"}:
-        return "/music"
+        return "/"
+    if target in {"/login", "/register"}:
+        return "/"
     return target
 
 
@@ -4335,8 +4344,28 @@ def paginate_announcements(
     return rows, total, page, pages
 
 
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request, db: Session = Depends(get_db)):
+def _legacy_ann_query(request: Request) -> bool:
+    """Old announcement list lived at '/'; these query keys still mean that page."""
+    qp = request.query_params
+    return any((qp.get(k) or "").strip() for k in ("page", "ann", "date", "q"))
+
+
+def _qs_redirect(path: str, request: Request) -> RedirectResponse:
+    qs = request.url.query
+    dest = path + (("?" + qs) if qs else "")
+    return RedirectResponse(dest, status_code=303)
+
+
+def music_listing(request: Request, db: Session):
+    tracks = approved_tracks(db)
+    return templates.TemplateResponse(
+        request,
+        "music.html",
+        ctx(request, db, tracks=tracks, nav="music", canonical="/"),
+    )
+
+
+def news_listing(request: Request, db: Session):
     q = (request.query_params.get("q") or "").strip()
     day = (request.query_params.get("date") or "").strip()
     try:
@@ -4372,21 +4401,40 @@ def home(request: Request, db: Session = Depends(get_db)):
             ann_page=ann_page,
             ann_pages=ann_pages,
             ann_page_size=ANN_PAGE_SIZE,
-            nav="home",
+            nav="news",
+            canonical="/news",
             **hero_copy_public(db),
         ),
     )
 
 
-@app.get("/home")
-def home_alias():
-    return RedirectResponse("/", status_code=303)
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request, db: Session = Depends(get_db)):
+    # Old bookmarks: /?page= /?ann= /?date= /?q= were the announcement list.
+    if _legacy_ann_query(request):
+        return _qs_redirect("/news", request)
+    return music_listing(request, db)
 
 
 @app.get("/music", response_class=HTMLResponse)
 def music_page(request: Request, db: Session = Depends(get_db)):
-    tracks = approved_tracks(db)
-    return templates.TemplateResponse(request, "music.html", ctx(request, db, tracks=tracks, nav="music"))
+    return music_listing(request, db)
+
+
+@app.get("/news", response_class=HTMLResponse)
+def news_page(request: Request, db: Session = Depends(get_db)):
+    return news_listing(request, db)
+
+
+@app.get("/announcements", response_class=HTMLResponse)
+def news_alias_announcements(request: Request):
+    return _qs_redirect("/news", request)
+
+
+@app.get("/home")
+def home_alias(request: Request):
+    # /home used to be an alias for the announcements homepage.
+    return _qs_redirect("/news", request)
 
 
 @app.post("/favorites/{track_id}/toggle")
@@ -4463,7 +4511,7 @@ def chat_page(request: Request, db: Session = Depends(get_db)):
 @app.get("/register", response_class=HTMLResponse)
 def register_page(request: Request, db: Session = Depends(get_db)):
     if current_user(request, db):
-        return RedirectResponse("/music", status_code=303)
+        return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(request, "register.html", ctx(request, db))
 
 
@@ -4479,7 +4527,7 @@ def register_submit(
 ):
     require_csrf(request, csrf_token)
     if current_user(request, db):
-        return RedirectResponse("/music", status_code=303)
+        return RedirectResponse("/", status_code=303)
     if str(agree).strip().lower() not in {"1", "on", "true", "yes"}:
         flash(request, "请先阅读并同意《平台合约规则》。", "error")
         return RedirectResponse("/register", status_code=303)
@@ -4509,15 +4557,15 @@ def register_submit(
     db.refresh(user)
     establish_session(request, user)
     flash(request, "注册成功，欢迎来到 DJ666！", "success")
-    return RedirectResponse("/music", status_code=303)
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request, next: str = "/music", db: Session = Depends(get_db)):
+def login_page(request: Request, next: str = "/", db: Session = Depends(get_db)):
     user = current_user(request, db)
     if user:
-        return RedirectResponse(safe_next_path(next or "/music", user), status_code=303)
-    return templates.TemplateResponse(request, "login.html", ctx(request, db, next_url=next or "/music"))
+        return RedirectResponse(safe_next_path(next or "/", user), status_code=303)
+    return templates.TemplateResponse(request, "login.html", ctx(request, db, next_url=next or "/"))
 
 
 @app.post("/login")
@@ -4526,7 +4574,7 @@ def login_submit(
     password: str = Form(...),
     account: str = Form(""),
     email: str = Form(""),
-    next: str = Form("/music"),
+    next: str = Form("/"),
     csrf_token: str = Form(""),
     db: Session = Depends(get_db),
 ):
@@ -5778,7 +5826,7 @@ def admin_homecopy_save(
     require_admin(request, db)
     set_setting(db, "hero_eyebrow", (eyebrow or "").strip()[:HERO_EYEBROW_MAX])
     set_setting(db, "hero_title", (title or "").strip()[:HERO_TITLE_MAX])
-    flash(request, "首页文案已保存。", "success")
+    flash(request, "公告文案已保存。", "success")
     return RedirectResponse("/admin#homecopy", status_code=303)
 
 
@@ -6798,11 +6846,11 @@ def wants_json(request: Request) -> bool:
 
 
 def ann_back(ann_id: int) -> RedirectResponse:
-    return RedirectResponse(f"/#ann-{ann_id}", status_code=303)
+    return RedirectResponse(f"/news?ann={int(ann_id)}#ann-{int(ann_id)}", status_code=303)
 
 
 def ann_login_url(ann_id: int) -> str:
-    return f"/login?next=/%23ann-{ann_id}"
+    return f"/login?next=/news%23ann-{int(ann_id)}"
 
 
 def ann_fail(request: Request, ann_id: int, message: str, status: int = 400):
@@ -7168,13 +7216,13 @@ def admin_tg_publish(
     ok, reason = publish_one_tg_post(db, post, with_source == "1")
     db.commit()
     if ok:
-        flash(request, "已一键发布为公告，首页可见。", "success")
+        flash(request, "已一键发布为公告，公告页可见。", "success")
     elif reason == "kept_edited":
         flash(request, "该来源已有手动编辑的公告，已保留编辑内容，未用采集原文覆盖。", "info")
     elif reason in ("already", "dup"):
         flash(request, "这条已经发布过了，未重复发布。", "info")
     elif reason == "filtered":
-        flash(request, "发布前复查过滤规则：该条已按广告规则忽略，未发布到首页。", "info")
+        flash(request, "发布前复查过滤规则：该条已按广告规则忽略，未发布到公告页。", "info")
     else:
         flash(request, "当前状态不可发布。", "error")
     return RedirectResponse("/admin#telegram", status_code=303)
@@ -7193,7 +7241,7 @@ def admin_tg_publish_all(
     if published == 0 and skipped == 0:
         flash(request, "当前没有可发布的待处理内容。", "info")
     else:
-        msg = f"一键发布完成：已发布 {published} 条到公告首页"
+        msg = f"一键发布完成：已发布 {published} 条到公告页"
         if skipped:
             msg += f"，跳过 {skipped} 条（已发布、未处于待处理或发布前被过滤）"
         msg += "。"
@@ -7512,7 +7560,7 @@ async def admin_tg_batch(request: Request, db: Session = Depends(get_db)):
             else:
                 skipped += 1
         db.commit()
-        msg = f"已发布 {count} 条为公告，首页可见。"
+        msg = f"已发布 {count} 条为公告，公告页可见。"
         if kept:
             msg += f" 另有 {kept} 条已有手动编辑内容，已保留未覆盖。"
         if skipped:
@@ -7703,7 +7751,7 @@ def admin_ann_hide(ann_id: int, request: Request, csrf_token: str = Form(""), re
         return RedirectResponse("/admin#announce", status_code=303)
     hide_announcement(ann, reason or "管理员隐藏")
     db.commit()
-    flash(request, "已从首页隐藏（可在「过滤内容」里恢复）。", "success")
+    flash(request, "已从公告页隐藏（可在「过滤内容」里恢复）。", "success")
     nxt = request.headers.get("referer") or "/admin#announce"
     if "/admin" not in (nxt or ""):
         nxt = "/admin#announce"
@@ -7720,7 +7768,7 @@ def admin_ann_unhide(ann_id: int, request: Request, csrf_token: str = Form(""), 
         return RedirectResponse("/admin#tgfilter", status_code=303)
     unhide_announcement(ann)
     db.commit()
-    flash(request, "已恢复到首页。", "success")
+    flash(request, "已恢复到公告页。", "success")
     return RedirectResponse("/admin#tgfilter", status_code=303)
 
 

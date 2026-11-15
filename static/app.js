@@ -248,7 +248,7 @@
   function annFilterUrl() {
     var textInput = document.querySelector("[data-ann-search]");
     var dateInput = document.querySelector("[data-ann-date-filter]");
-    var u = new URL("/", location.origin);
+    var u = new URL("/news", location.origin);
     var q = textInput ? textInput.value.trim() : "";
     var day = dateInput && dateInput.value ? dateInput.value : "";
     if (q) u.searchParams.set("q", q);
@@ -294,6 +294,11 @@
   (function jumpAnnHash() {
     var m = (location.hash || "").match(/^#ann-(\d+)$/);
     if (!m || document.getElementById("ann-" + m[1])) return;
+    var destPath = "/news";
+    if (location.pathname !== destPath) {
+      location.replace(destPath + "?ann=" + m[1] + "#ann-" + m[1]);
+      return;
+    }
     var u = new URL(location.href);
     if (u.searchParams.get("ann") === m[1]) return;
     u.searchParams.set("ann", m[1]);
@@ -464,7 +469,7 @@
   window.DJPlayer = { playQueue: playQueue, state: function () { return st; }, audio: audio, showBar: setBar };
 
   // ------------------------------------------------------------------
-  // Floating page menu (首页 / 音乐 / 公屏). Links go through pjax below.
+  // Floating page menu (音乐 / 公告 / 公屏). Links go through pjax below.
   // ------------------------------------------------------------------
   var fabNav = document.getElementById("fabNav");
   var fabMenu = document.getElementById("fabMenu");
@@ -474,11 +479,16 @@
     fabNav.classList.toggle("open", on);
     fabBtn.setAttribute("aria-expanded", on ? "true" : "false");
   }
+  function fabNavPath(p) {
+    if (p === "/music") return "/";
+    if (p === "/announcements" || p === "/home") return "/news";
+    return p;
+  }
   function fabActive() {
     if (!fabMenu) return;
-    var path = location.pathname;
+    var path = fabNavPath(location.pathname);
     fabMenu.querySelectorAll("a[data-fab]").forEach(function (a) {
-      var on = new URL(a.href, location.href).pathname === path;
+      var on = fabNavPath(new URL(a.href, location.href).pathname) === path;
       a.classList.toggle("is-active", on);
       if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
     });
@@ -727,10 +737,19 @@
   });
   if (supported) history.replaceState({ pjax: true }, "", location.href);
 
-  // Old links: /#music and /#chat now have their own pages.
-  if (location.pathname === "/" && (location.hash === "#music" || location.hash === "#chat")) {
-    var dest = location.hash === "#music" ? "/music" : "/chat";
+  // Old links: /#music, /#chat, /#announce, /#ann-ID, and /home.
+  (function legacyHomeHashes() {
+    var path = location.pathname;
+    var h = location.hash || "";
+    var dest = "";
+    var m = /^#ann-(\d+)$/.exec(h);
+    if (path === "/home") dest = "/news" + location.search + (h || "#announce");
+    else if (m && path !== "/news") dest = "/news?ann=" + m[1] + "#ann-" + m[1];
+    else if ((path === "/" || path === "/music") && (h === "#announce" || h === "#home")) dest = "/news#announce";
+    else if (path === "/" && h === "#chat") dest = "/chat";
+    else if (path === "/" && h === "#music") dest = "/";
+    if (!dest || dest === path + location.search + h) return;
     if (supported) { history.replaceState({ pjax: true }, "", dest); visit(dest, { push: false }); }
     else location.replace(dest);
-  }
+  })();
 })();

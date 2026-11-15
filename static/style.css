@@ -733,7 +733,8 @@ body.tg-lb-open { overflow: hidden; }
 }
 
 /* Public homepage announcements: full-width cards, no DJ avatar */
-body[data-page="home"] .page {
+body[data-page="home"] .page,
+body[data-page="news"] .page {
   width: min(1360px, calc(100% - 24px));
 }
 .panel-announce {
@@ -871,7 +872,8 @@ body[data-page="home"] .page {
   max-height: min(720px, 70vh);
 }
 @media (max-width: 860px) {
-  body[data-page="home"] .page { width: calc(100% - 20px); }
+  body[data-page="home"] .page,
+  body[data-page="news"] .page { width: calc(100% - 20px); }
   .panel-announce { padding: 16px 14px 18px; }
   .announce-head { margin: -16px -14px 12px; padding: 12px 14px 10px; }
 }

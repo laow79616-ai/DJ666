@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_track_list.html" import track_list with context %}
-{% block title %}音乐 · DJ666{% endblock %}
+{% block title %}DJ666 音乐随听{% endblock %}
 {% block page_id %}music{% endblock %}
 {% block extra_head %}
 <style>
@@ -33,7 +33,7 @@
       <button type="button" class="btn btn-sm" data-play-all="music">▶ 全部播放</button>
       <button type="button" class="btn btn-sm btn-ghost" data-play-all="music" data-shuffle="1">🔀 随机播放</button>
       {% endif %}
-      <a class="btn btn-sm btn-ghost music-ann-link" href="/" title="返回首页公告">📢 公告</a>
+      <a class="btn btn-sm btn-ghost music-ann-link" href="/news" title="查看公告">📢 公告</a>
     </span>
   </div>
   {% if tracks %}
@@ -42,7 +42,7 @@
   <p class="muted">暂无曲目。</p>
   {% endif %}
   {% if not user %}
-  <p class="hint">登录后可在「设置」上传自己的音乐包。<a href="/login?next=/music">登录</a> 或 <a href="/register">注册</a></p>
+  <p class="hint">登录后可在「设置」上传自己的音乐包。<a href="/login?next=/">登录</a> 或 <a href="/register">注册</a></p>
   {% endif %}
 </section>
 {% endblock %}

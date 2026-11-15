@@ -153,7 +153,7 @@
     }
   });
 
-  // Open the comment panel when arriving at /#ann-ID (e.g. after login or no-JS fallback).
+  // Open the comment panel when arriving at /news#ann-ID (e.g. after login or no-JS fallback).
   function fromHash() {
     var m = /^#ann-(\d+)$/.exec(location.hash || ""); if (!m) return;
     var post = document.getElementById("ann-" + m[1]); if (!post) return;

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "_tg_media.html" import media_grid %}
-{% block title %}DJ666 音乐随听{% endblock %}
-{% block page_id %}home{% endblock %}
+{% block title %}公告 · DJ666{% endblock %}
+{% block page_id %}news{% endblock %}
 {% block content %}
 <section class="hero">
   <p class="eyebrow">{{ hero_eyebrow }}</p>
@@ -12,7 +12,7 @@
   <div class="panel-head announce-head">
     <h2>公告</h2>
     {% if announcements or ann_q or ann_date or ann_total %}
-    <form class="ann-filters" method="get" action="/" role="search">
+    <form class="ann-filters" method="get" action="/news" role="search">
       <div class="ann-search">
         <span class="ann-search-ico" aria-hidden="true">🔍</span>
         <input type="search" class="ann-search-input" name="q" value="{{ ann_q or '' }}" data-ann-search placeholder="搜索公告…" aria-label="搜索公告" autocomplete="off" enterkeyhint="search">
@@ -62,7 +62,7 @@
               </button>
             </form>
             {% else %}
-            <a class="ann-act ann-like" href="/login?next=/%23ann-{{ ann.id }}" title="登录后可点赞">
+            <a class="ann-act ann-like" href="/login?next=/news%23ann-{{ ann.id }}" title="登录后可点赞">
               <svg class="ann-heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.1 4.3 2.5h2c.7-1.4 2.2-2.5 4.3-2.5 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg>
               <span class="ann-act-label">点赞</span><b class="ann-like-count">{{ st.likes|cn_count }}</b>
             </a>
@@ -98,7 +98,7 @@
               <div class="ann-cmt-actions"><span class="ann-cmt-msg" role="status"></span><button type="submit" class="btn btn-sm">发送</button></div>
             </form>
             {% else %}
-            <p class="ann-cmt-login"><a href="/login?next=/%23ann-{{ ann.id }}">登录</a> 或 <a href="/register">注册</a> 后可以点赞和评论</p>
+            <p class="ann-cmt-login"><a href="/login?next=/news%23ann-{{ ann.id }}">登录</a> 或 <a href="/register">注册</a> 后可以点赞和评论</p>
             {% endif %}
           </div>
         </div>
@@ -110,10 +110,10 @@
       <p class="muted">共 {{ ann_total }} 条公告，第 {{ ann_page }} / {{ ann_pages }} 页（每页 {{ ann_page_size }} 条，已发布内容全部保留）</p>
       <div class="ann-pager-links">
         {% if ann_page > 1 %}
-        <a class="btn btn-sm btn-ghost" href="/?{% if ann_q %}q={{ ann_q|urlencode }}&amp;{% endif %}{% if ann_date %}date={{ ann_date }}&amp;{% endif %}{% if ann_page-1 > 1 %}page={{ ann_page-1 }}{% endif %}#announce">上一页</a>
+        <a class="btn btn-sm btn-ghost" href="/news?{% if ann_q %}q={{ ann_q|urlencode }}&amp;{% endif %}{% if ann_date %}date={{ ann_date }}&amp;{% endif %}{% if ann_page-1 > 1 %}page={{ ann_page-1 }}{% endif %}#announce">上一页</a>
         {% endif %}
         {% if ann_page < ann_pages %}
-        <a class="btn btn-sm" href="/?{% if ann_q %}q={{ ann_q|urlencode }}&amp;{% endif %}{% if ann_date %}date={{ ann_date }}&amp;{% endif %}page={{ ann_page+1 }}#announce">下一页</a>
+        <a class="btn btn-sm" href="/news?{% if ann_q %}q={{ ann_q|urlencode }}&amp;{% endif %}{% if ann_date %}date={{ ann_date }}&amp;{% endif %}page={{ ann_page+1 }}#announce">下一页</a>
         {% endif %}
       </div>
     </nav>

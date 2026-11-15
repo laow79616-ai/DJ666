@@ -4,10 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}DJ666 音乐随听{% endblock %}</title>
+  {% set canon = canonical if canonical is defined and canonical else request.url.path %}
+  <link rel="canonical" href="https://www.dj666.pw{{ canon }}">
+  <meta property="og:site_name" content="DJ666">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://www.dj666.pw{{ canon }}">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=t173a">
+  <link rel="stylesheet" href="/static/style.css?v=t176a">
   {% block extra_head %}{% endblock %}
 </head>
 {% set p = request.url.path %}
@@ -71,16 +76,16 @@
   </main>
 
   <footer class="site-footer">
-    <p>DJ666 · 随听、一起聊 · <a href="/rules">平台合约规则</a></p>
+    <p>DJ666 · <a href="/">音乐</a> · <a href="/news">公告</a> · <a href="/chat">公屏</a> · <a href="/rules">平台合约规则</a></p>
   </footer>
 
   {% if not admin_area %}
   <div class="fab-nav" id="fabNav">
     <div class="fab-menu" id="fabMenu" role="menu" hidden>
       <button type="button" class="fab-expand" id="fabExpandPlayer" data-fab="player" role="menuitem" hidden><span class="fab-ico" aria-hidden="true">▶</span>展开播放器</button>
-      <a href="/" data-fab="home" role="menuitem"{% if p == '/' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">⌂</span>首页</a>
-      <a href="/music" data-fab="music" role="menuitem"{% if p == '/music' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">♪</span>音乐</a>
-      <a href="/chat" data-fab="chat" role="menuitem"{% if p == '/chat' %} class="is-active"{% endif %}><span class="fab-ico" aria-hidden="true">💬</span>公屏</a>
+      <a href="/" data-fab="music" role="menuitem"{% if p == '/' or p == '/music' %} class="is-active" aria-current="page"{% endif %}><span class="fab-ico" aria-hidden="true">♪</span>音乐</a>
+      <a href="/news" data-fab="news" role="menuitem"{% if p == '/news' or p == '/announcements' or p == '/home' %} class="is-active" aria-current="page"{% endif %}><span class="fab-ico" aria-hidden="true">📢</span>公告</a>
+      <a href="/chat" data-fab="chat" role="menuitem"{% if p == '/chat' %} class="is-active" aria-current="page"{% endif %}><span class="fab-ico" aria-hidden="true">💬</span>公屏</a>
     </div>
     <button type="button" class="fab-btn" id="fabBtn" aria-label="页面导航" aria-haspopup="menu" aria-expanded="false" aria-controls="fabMenu">
       <span class="fab-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -108,7 +113,7 @@
   </div>
 
   <script src="/static/tg.js?v=1" defer></script>
-  <script src="/static/app.js?v=t173a" defer></script>
+  <script src="/static/app.js?v=t176a" defer></script>
   <script src="/static/ann_interact.js?v=tgc1" defer></script>
   <div id="pageScripts">{% block scripts %}{% endblock %}</div>
 </body>
