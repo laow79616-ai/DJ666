@@ -1039,9 +1039,8 @@ a.admin-dj-entry {
     <div class="admin-pane-body">
       <link rel="stylesheet" href="/static/mixer.css?v=tgaq1">
       {% set mixer_embedded = True %}
-      {% set hide_mixer = False %}
+      {% set hide_mixer = True %}
       {% include "_mixer.html" %}
-      <script type="application/json" id="mixerLibrary">{{ library|tojson }}</script>
       {% if user and user.is_admin %}
       <section class="tga" id="tgaPanel" data-csrf="{{ csrf }}" aria-labelledby="tgaTitle">
         <header class="tga-head">
@@ -1233,8 +1232,6 @@ a.admin-dj-entry {
 <script type="application/json" id="tgData">{{ tg_data|tojson }}</script>
 <script src="/static/admin_tg_status.js?v=tgtitle1" defer></script>
 <script src="/static/dj_optimize.js?v=t168imp1" defer></script>
-<script src="/static/dj_repeat.js?v=t108" defer></script>
-<script src="/static/mixer.js?v=pbar1" defer></script>
 <script src="/static/admin_ann.js?v=tgtitle1" defer></script>
 <script src="/static/admin_upload.js?v=cat1" defer></script>
 <script src="/static/admin_tracks.js?v=t168imp1" defer></script>

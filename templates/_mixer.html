@@ -1,4 +1,4 @@
-{# Shared DJ mixer + 录音 + 上传优化 UI. Used by the admin 「DJ 混音」 tab. Needs: library, opt_cfg, user, csrf. #}
+{# Shared DJ mixer + 录音 + 上传优化 UI. Admin 「DJ 混音」 sets hide_mixer=True so only 上传优化 is shown (the two-deck 简易打碟台 was the public /dj page and is not embedded in admin). Needs: opt_cfg, user, csrf. #}
 {% if not hide_mixer %}
 <section class="mixer" id="mixer">
   <header class="mixer-head">

@@ -4267,7 +4267,7 @@ def dj_mixer_ctx(db: Session, user=None) -> dict:
 
 @app.get("/dj")
 def dj_mixer_page():
-    # Public simple DJ deck removed; the mixer remains on the admin DJ tab.
+    # Public simple DJ deck removed. The admin DJ tab keeps 上传优化 / Telegram import, not the two-deck page.
     return RedirectResponse("/", status_code=302)
 
 
