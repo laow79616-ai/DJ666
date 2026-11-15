@@ -67,8 +67,12 @@
     {% if my_tracks %}
     <ul class="track-list my-track-list" id="myTrackList" data-playlist="mine">
       {% for track in my_tracks %}
-      <li class="track-item my-track-item" data-src="/uploads/{{ track.filename }}" data-title="{{ track.title }}">
+      <li class="track-item my-track-item{% if track.status == 'importing' %} is-importing{% endif %}"{% if track.status != 'importing' %} data-src="{{ track_audio_url(track) }}"{% endif %} data-title="{{ track.title }}">
+        {% if track.status != 'importing' %}
         <button type="button" class="play-btn" aria-label="播放 {{ track.title }}">▶</button>
+        {% else %}
+        <button type="button" class="play-btn" disabled aria-label="正在导入，暂不可播放">…</button>
+        {% endif %}
         <div class="track-meta my-track-meta">
           <form class="track-rename-form" action="/settings/tracks/{{ track.id }}/rename" method="post">
             <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -79,6 +83,7 @@
             <span class="status-badge status-{{ track.status }}">
               {% if track.status == 'approved' %}已发布
               {% elif track.status == 'rejected' %}已拒绝
+              {% elif track.status == 'importing' %}导入中
               {% else %}待审核{% endif %}
             </span>
             {% if track.pack_name %} · 来自 {{ track.pack_name }}{% endif %}

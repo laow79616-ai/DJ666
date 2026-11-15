@@ -236,6 +236,7 @@ MAX_TRACKS_PER_PACK = 50
 TRACK_STATUS_PENDING = "pending"
 TRACK_STATUS_APPROVED = "approved"
 TRACK_STATUS_REJECTED = "rejected"
+TRACK_STATUS_IMPORTING = "importing"
 
 # User-facing music categories. Keys are stored on tracks.category; empty/NULL = 未分类.
 TRACK_CATEGORY_CHOICES = (
@@ -1514,6 +1515,7 @@ TRACK_STATUS_LABELS = {
     TRACK_STATUS_APPROVED: "已发布",
     TRACK_STATUS_PENDING: "待审核",
     TRACK_STATUS_REJECTED: "已拒绝",
+    TRACK_STATUS_IMPORTING: "导入中",
 }
 
 
@@ -6218,6 +6220,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
     pending_tracks = [item for item in tracks if item.status == TRACK_STATUS_PENDING]
     published_tracks = [item for item in tracks if item.status == TRACK_STATUS_APPROVED]
     rejected_tracks = [item for item in tracks if item.status == TRACK_STATUS_REJECTED]
+    importing_tracks = [item for item in tracks if item.status == TRACK_STATUS_IMPORTING]
     chat_messages = db.scalars(
         select(ChatMessage)
         .options(joinedload(ChatMessage.user))
@@ -6273,6 +6276,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
             pending_tracks=pending_tracks,
             published_tracks=published_tracks,
             rejected_tracks=rejected_tracks,
+            importing_tracks=importing_tracks,
             contact=get_submission_contact(db),
             hero_copy=hero_copy_stored(db),
             hero_copy_defaults={"eyebrow": HERO_EYEBROW_DEFAULT, "title": HERO_TITLE_DEFAULT},
@@ -6344,6 +6348,34 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
             tg_auto_publish_delays=TG_AUTO_PUBLISH_DELAY_CHOICES,
             ann_max_media=ANN_MAX_MEDIA,
             ann_max_mb=ANN_MEDIA_MAX_BYTES // (1024 * 1024),
+        ),
+    )
+
+
+
+@app.get("/admin/tracks/fragment", response_class=HTMLResponse)
+def admin_tracks_fragment(request: Request, db: Session = Depends(get_db)):
+    """HTML fragment of the admin track tables, used for in-place AJAX refresh."""
+    require_admin(request, db)
+    tracks = (
+        db.scalars(
+            select(Track)
+            .options(joinedload(Track.uploader))
+            .order_by(Track.created_at.desc())
+        )
+        .unique()
+        .all()
+    )
+    return templates.TemplateResponse(
+        request,
+        "_admin_track_tables.html",
+        ctx(
+            request,
+            db,
+            pending_tracks=[item for item in tracks if item.status == TRACK_STATUS_PENDING],
+            published_tracks=[item for item in tracks if item.status == TRACK_STATUS_APPROVED],
+            rejected_tracks=[item for item in tracks if item.status == TRACK_STATUS_REJECTED],
+            importing_tracks=[item for item in tracks if item.status == TRACK_STATUS_IMPORTING],
         ),
     )
 
@@ -8076,14 +8108,14 @@ def _opt_reclaim_disk() -> int:
         if job is None and now - age_ref > OPT_UPLOAD_STALE:
             stale_upload = True
         failed_expired = state == "failed" and now - created > OPT_FAILED_KEEP_SECONDS
-        meta_expired = now - created > OPT_KEEP_SECONDS and state not in ("queued", "running", "downloading")
-        if imported or stale_upload or failed_expired or (meta_expired and not (state == "done" and not imported)):
-            # drop whole dir for imported / stale / old-failed; keep recent unimported done metadata
+        protected = state in ("queued", "running", "downloading", "importing", "import_failed")
+        meta_expired = now - created > OPT_KEEP_SECONDS and state not in protected
+        # Keep job.json for recent successful imports so the UI can show 已导入.
+        drop_imported = imported and meta_expired
+        if stale_upload or failed_expired or drop_imported or (meta_expired and not (state == "done" and not imported) and state not in protected):
             before = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
             if job and not imported:
-                for key in (job.get("r2") or {}).values():
-                    if key:
-                        r2_delete_key(str(key))
+                _opt_delete_unreferenced_keys(job)
             shutil.rmtree(d, ignore_errors=True)
             if not d.exists():
                 freed += before
@@ -8460,21 +8492,25 @@ def _opt_process(job_id: str) -> None:
         mp3_meas = (_opt_parse_ebur(t3) or [{}])[0]
         after["mp3_tp"] = mp3_meas.get("tp")
         outputs = {"flac": flac.stat().st_size, "mp3": mp3.stat().st_size}
-        _opt_update(job_id, state="done", stage="完成", progress=100, after=after, gain_db=round(gain, 2),
-                    outputs=outputs, finished=time.time())
-        # Source is no longer needed once both outputs exist.
+        # Do not mark the job done until R2 archive finishes, otherwise import
+        # can start before r2 keys exist and fall back to a local copy.
         _opt_drop_orig(job_id)
         job = _opt_load(job_id) or job
+        job["after"] = after
+        job["gain_db"] = round(gain, 2)
+        job["outputs"] = outputs
         if r2_storage.r2_enabled():
-            _opt_update(job_id, stage="上传到 R2", progress=99)
+            _opt_update(job_id, stage="上传到 R2", progress=99, after=after, gain_db=round(gain, 2), outputs=outputs)
             try:
+                job = _opt_load(job_id) or job
                 _opt_upload_outputs_to_r2(job, delete_local=True)
-                _opt_update(job_id, state="done", stage="完成", progress=100)
             except Exception:  # noqa: BLE001
                 logging.exception("optimize r2 archive failed job=%s", job_id)
                 # Keep local outputs so import/preview still work if R2 is briefly down.
         else:
-            _opt_update(job_id, storage="local")
+            _opt_update(job_id, storage="local", after=after, gain_db=round(gain, 2), outputs=outputs)
+        _opt_update(job_id, state="done", stage="完成", progress=100, after=after, gain_db=round(gain, 2),
+                    outputs=outputs, finished=time.time())
     except Exception as exc:  # noqa: BLE001
         msg = str(exc) if isinstance(exc, RuntimeError) else "处理失败，请换一个文件再试"
         for p in (flac, mp3):
@@ -8550,12 +8586,12 @@ def _opt_cleanup() -> None:
         if job is None and now - age_ref > OPT_UPLOAD_STALE:
             stale_upload = True
         failed_expired = state == "failed" and now - created > OPT_FAILED_KEEP_SECONDS
-        expired = now - created > OPT_KEEP_SECONDS and state not in ("queued", "running", "downloading")
-        if imported or stale_upload or failed_expired or expired:
+        protected = state in ("queued", "running", "downloading", "importing", "import_failed")
+        expired = now - created > OPT_KEEP_SECONDS and state not in protected
+        drop_imported = imported and expired
+        if stale_upload or failed_expired or drop_imported or (expired and not (state == "done" and not imported) and state not in protected):
             if job and not imported:
-                for key in (job.get("r2") or {}).values():
-                    if key:
-                        r2_delete_key(str(key))
+                _opt_delete_unreferenced_keys(job)
             shutil.rmtree(d, ignore_errors=True)
             continue
         if state == "done":
@@ -8593,6 +8629,267 @@ def _opt_worker() -> None:
                 _opt_clean_tmp(max_age=OPT_TMP_STALE)
 
 
+
+_opt_import_queue: "queue_mod.Queue[str]" = queue_mod.Queue()
+_opt_import_thread = None
+_opt_import_queued: set[str] = set()
+_opt_import_qlock = threading.Lock()
+
+
+def _opt_r2_keys_in_use() -> set[str]:
+    """Track-held R2 keys that must never be deleted by optimize-job cleanup."""
+    keys: set[str] = set()
+    db = SessionLocal()
+    try:
+        for track in db.scalars(select(Track)).all():
+            if getattr(track, "r2_key", None):
+                keys.add(str(track.r2_key))
+            if getattr(track, "flac_r2_key", None):
+                keys.add(str(track.flac_r2_key))
+    except Exception:  # noqa: BLE001
+        logging.exception("scan of in-use r2 keys failed")
+    finally:
+        db.close()
+    return keys
+
+
+def _opt_delete_unreferenced_keys(job: dict) -> None:
+    if not job:
+        return
+    in_use = _opt_r2_keys_in_use()
+    for key in (job.get("r2") or {}).values():
+        if key and str(key) not in in_use:
+            r2_delete_key(str(key))
+
+
+def _opt_import_enqueue(job_id: str) -> None:
+    if not job_id or not OPT_ID_RE.match(job_id):
+        return
+    with _opt_import_qlock:
+        if job_id in _opt_import_queued:
+            return
+        _opt_import_queued.add(job_id)
+    _opt_import_queue.put(job_id)
+    _opt_start_import_worker()
+
+
+def _opt_mark_import_failed(job_id: str, message: str) -> None:
+    with _opt_lock:
+        job = _opt_load(job_id)
+        if not job:
+            return
+        job["state"] = "import_failed"
+        job["stage"] = "导入失败"
+        job["error"] = (message or "导入失败")[:200]
+        _opt_save(job)
+    logging.error("optimize import failed job=%s err=%s", job_id, message)
+
+
+def _opt_finalize_import(job_id: str) -> None:
+    """Adopt already-uploaded optimize objects as the track's R2 keys (no copy)."""
+    t0 = time.perf_counter()
+    with _opt_lock:
+        job = _opt_load(job_id)
+        if not job or job.get("state") != "importing":
+            return
+        track_id = job.get("track_id")
+        r2info = dict(job.get("r2") or {})
+        r2_mp3 = r2info.get("mp3")
+        r2_flac = r2info.get("flac")
+        keep_flac = bool(job.get("keep_flac"))
+        want_status = job.get("import_status") or TRACK_STATUS_PENDING
+        if want_status not in (TRACK_STATUS_APPROVED, TRACK_STATUS_PENDING):
+            want_status = TRACK_STATUS_PENDING
+    if not track_id:
+        _opt_mark_import_failed(job_id, "缺少曲目记录")
+        return
+
+    def _elapsed() -> float:
+        return time.perf_counter() - t0
+
+    try:
+        local_mp3 = _opt_job_dir(job_id) / "optimized.mp3"
+        local_flac = _opt_job_dir(job_id) / "optimized.flac"
+        # If optimize marked done just before archive finished, wait briefly for keys.
+        if r2_storage.r2_enabled() and not r2_mp3:
+            for _ in range(20):
+                time.sleep(0.25)
+                with _opt_lock:
+                    job = _opt_load(job_id) or job
+                    r2info = dict(job.get("r2") or {})
+                    r2_mp3 = r2info.get("mp3")
+                    r2_flac = r2info.get("flac")
+                if r2_mp3:
+                    break
+                # Try to finish the archive ourselves if local outputs are still here.
+                if local_mp3.is_file() or local_flac.is_file():
+                    try:
+                        _opt_upload_outputs_to_r2(job, delete_local=True)
+                    except Exception:  # noqa: BLE001
+                        logging.exception("import-time r2 archive failed job=%s", job_id)
+                    with _opt_lock:
+                        job = _opt_load(job_id) or job
+                        r2info = dict(job.get("r2") or {})
+                        r2_mp3 = r2info.get("mp3")
+                        r2_flac = r2info.get("flac")
+                    break
+        mp3_sz = flac_sz = None
+        if r2_storage.r2_enabled() and r2_mp3:
+            t_head = time.perf_counter()
+            mp3_sz = r2_storage.object_size(r2_mp3)
+            logging.info("import head mp3 job=%s ms=%.1f", job_id, (time.perf_counter() - t_head) * 1000)
+            if not mp3_sz:
+                raise RuntimeError("无法校验 R2 上的 MP3")
+            if keep_flac and r2_flac:
+                t_head = time.perf_counter()
+                flac_sz = r2_storage.object_size(r2_flac)
+                logging.info("import head flac job=%s ms=%.1f", job_id, (time.perf_counter() - t_head) * 1000)
+                if not flac_sz:
+                    raise RuntimeError("无法校验 R2 上的 FLAC")
+        elif local_mp3.is_file():
+            # Fallback only when R2 is off or the optimize object is missing.
+            mp3_sz = int(local_mp3.stat().st_size)
+        else:
+            raise RuntimeError("优化结果不存在，无法导入")
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("import verify failed job=%s", job_id)
+        _opt_mark_import_failed(job_id, str(exc)[:200])
+        return
+
+    db = SessionLocal()
+    try:
+        track = db.get(Track, int(track_id))
+        if not track:
+            _opt_mark_import_failed(job_id, "曲目记录丢失")
+            return
+        if r2_storage.r2_enabled() and r2_mp3 and mp3_sz:
+            # Keep the optimize object key as the track key — no server-side copy.
+            track.storage = "r2"
+            track.r2_key = r2_mp3
+            track.file_size = int(mp3_sz)
+            if keep_flac and r2_flac and flac_sz:
+                track.flac_r2_key = r2_flac
+                track.flac_size = int(flac_sz)
+                track.flac_path = None
+                if not getattr(track, "flac_added_at", None):
+                    track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            fname = Path(track.filename or "").name
+            if fname:
+                dest = UPLOAD_DIR / fname
+                if dest.is_file():
+                    dest.unlink(missing_ok=True)
+        else:
+            fname = Path(track.filename or "").name or unique_upload_name(".mp3")
+            dest = UPLOAD_DIR / fname
+            if local_mp3.is_file():
+                shutil.copyfile(local_mp3, dest)
+                dest.chmod(0o644)
+                track.filename = fname
+                track.file_size = dest.stat().st_size
+                track.content_hash = file_sha256(dest)
+            if keep_flac and local_flac.is_file():
+                try:
+                    flac_name, fsize_f = dj_flac.attach_flac(local_flac, UPLOAD_DIR)
+                    track.flac_path = flac_name
+                    track.flac_size = fsize_f
+                    track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                except Exception:  # noqa: BLE001
+                    logging.exception("keep FLAC on import failed for job %s", job_id)
+            if r2_storage.r2_enabled():
+                db.commit()
+                upload_track_to_r2(track.id)
+                db.refresh(track)
+        track.status = want_status
+        db.commit()
+        try:
+            if track.flac_path or getattr(track, "flac_r2_key", None):
+                dj_flac.enforce_flac_quota(
+                    db, db.scalars(select(Track)).all(), UPLOAD_DIR, FLAC_SNAP_ROOTS,
+                    dj_flac.flac_quota_bytes(lambda k, d="": get_setting(db, k, d)),
+                    OPT_DISK_MIN_FREE,
+                    lambda k, d="": get_setting(db, k, d),
+                    lambda k, v: set_setting(db, k, v),
+                    remote_delete=r2_delete_key,
+                )
+                db.commit()
+        except Exception:  # noqa: BLE001
+            logging.exception("flac quota enforce after import failed")
+            db.rollback()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logging.exception("import finalize db failed job=%s", job_id)
+        _opt_mark_import_failed(job_id, str(exc)[:200])
+        return
+    finally:
+        db.close()
+
+    with _opt_lock:
+        job = _opt_load(job_id) or job
+        job["state"] = "done"
+        job["stage"] = "完成"
+        job["progress"] = 100
+        job["error"] = ""
+        job["track_status"] = want_status
+        job["imported_format"] = "mp3"
+        job["storage"] = "r2" if r2_mp3 else job.get("storage")
+        _opt_save(job)
+    if job.get("source") == "telegram":
+        try:
+            tga_done_mark(job.get("tg_chat_id"), job.get("tg_msg"), downloaded=True, track_id=int(track_id))
+        except Exception:  # noqa: BLE001
+            logging.exception("tga mark after import failed")
+    d = _opt_job_dir(job_id)
+    for pth in list(d.glob("orig.*")) + [d / "optimized.mp3", d / "optimized.flac", d / "ffmpeg.log"]:
+        _opt_unlink(pth)
+    logging.info("import adopted keys job=%s track=%s total_ms=%.1f", job_id, track_id, _elapsed() * 1000)
+
+
+def _opt_resume_imports() -> None:
+    """Re-queue in-flight imports after a restart. Local metadata only; no R2 I/O."""
+    try:
+        names = os.listdir(OPT_DIR)
+    except OSError:
+        names = []
+    n = 0
+    for name in names:
+        if name == "_tmp" or not OPT_ID_RE.match(name):
+            continue
+        job = _opt_load(name)
+        if job and job.get("state") == "importing":
+            _opt_import_enqueue(name)
+            n += 1
+    if n:
+        logging.info("resumed %s pending optimize imports", n)
+
+
+def _opt_import_worker() -> None:
+    try:
+        _opt_resume_imports()
+    except Exception:  # noqa: BLE001
+        logging.exception("resume pending imports failed")
+    while True:
+        job_id = _opt_import_queue.get()
+        try:
+            with _opt_import_qlock:
+                _opt_import_queued.discard(job_id)
+            _opt_finalize_import(job_id)
+        except Exception:  # noqa: BLE001
+            logging.exception("import worker failed job=%s", job_id)
+            try:
+                _opt_mark_import_failed(job_id, "导入过程出错")
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _opt_start_import_worker() -> None:
+    global _opt_import_thread
+    if _opt_import_thread is not None and _opt_import_thread.is_alive():
+        return
+    t = threading.Thread(target=_opt_import_worker, name="dj-opt-import", daemon=True)
+    _opt_import_thread = t
+    t.start()
+
+
 def opt_start_worker() -> None:
     global _opt_worker_started
     if _opt_worker_started:
@@ -8609,6 +8906,8 @@ def opt_start_worker() -> None:
             _opt_update(job["id"], state="queued", stage="排队中（服务重启后继续）", progress=0)
             _opt_queue.put(job["id"])
     threading.Thread(target=_opt_worker, name="dj-optimize", daemon=True).start()
+    # Resume pending imports in a background thread; never do R2 work here.
+    _opt_start_import_worker()
 
 
 def _opt_name_clean(name: str) -> str:
@@ -8620,8 +8919,13 @@ def _opt_name_clean(name: str) -> str:
 @app.get("/dj/optimize/jobs")
 def opt_jobs(request: Request, db: Session = Depends(get_db)):
     user = _opt_user_or_401(request, db)
-    # Imported jobs are deleted as soon as the library copy exists; any leftover is hidden here.
-    jobs = [j for j in _opt_all_jobs() if j.get("user_id") == user.id and not j.get("track_id")]
+    # Hide finished imports; keep in-flight / failed imports so the card can poll or retry.
+    jobs = [
+        j for j in _opt_all_jobs()
+        if j.get("user_id") == user.id and (
+            not j.get("track_id") or j.get("state") in ("importing", "import_failed")
+        )
+    ]
     jobs.sort(key=lambda j: float(j.get("created") or 0), reverse=True)
     return {"jobs": [_opt_public(j) for j in jobs[:20]]}
 
@@ -8770,6 +9074,7 @@ def opt_file(job_id: str, kind: str, request: Request, download: int = 0, db: Se
 
 @app.post("/dj/optimize/{job_id}/import")
 async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db)):
+    """Create the track row immediately and return; R2 adopt/verify runs in the background."""
     _opt_csrf(request)
     user = _opt_user_or_401(request, db)
     try:
@@ -8780,121 +9085,78 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
         job = _opt_load(job_id)
         if not job or not _opt_owner_ok(job, user):
             raise HTTPException(status_code=404, detail="任务不存在或已过期")
+        if job.get("state") == "importing":
+            return {
+                "ok": True,
+                "track_id": job.get("track_id"),
+                "status": TRACK_STATUS_IMPORTING,
+                "state": "importing",
+                "message": "正在导入",
+            }
+        if job.get("state") == "import_failed" and job.get("track_id"):
+            job["state"] = "importing"
+            job["stage"] = "导入曲库中"
+            job["error"] = ""
+            job["progress"] = 100
+            keep = payload.get("keep_flac")
+            if keep is not None:
+                job["keep_flac"] = bool(keep)
+            _opt_save(job)
+            _opt_import_enqueue(job_id)
+            return {
+                "ok": True,
+                "track_id": job.get("track_id"),
+                "status": TRACK_STATUS_IMPORTING,
+                "state": "importing",
+                "message": "已重新开始导入",
+            }
         if job.get("state") != "done":
             raise HTTPException(status_code=409, detail="还没处理完成")
-        if job.get("track_id"):
+        if job.get("track_id") and _opt_library_exists(job):
             raise HTTPException(status_code=409, detail="已经导入过曲库了")
-        # Library imports always store the optimized MP3 320k (FLAC is optional).
-        fmt = "mp3"
-        src = _opt_job_dir(job_id) / f"optimized.{fmt}"
-        r2info = dict(job.get("r2") or {})
-        r2_mp3 = r2info.get("mp3")
-        r2_flac = r2info.get("flac")
-        has_local = src.is_file()
-        has_r2 = bool(r2_mp3 and r2_storage.r2_enabled() and r2_storage.object_size(r2_mp3))
-        if not has_local and not has_r2:
-            raise HTTPException(status_code=404, detail="文件不存在或已过期")
         title = str(payload.get("title") or "").strip()
         title = re.sub(r"[\r\n\t]+", " ", title)[:200] or (Path(job.get("name") or "").stem + "（优化版）")[:200]
-        ext = f".{fmt}"
-        stored = unique_upload_name(ext)
-        dest = UPLOAD_DIR / stored
-        sha = ""
+        stored = unique_upload_name(".mp3")
         fsize = int((job.get("outputs") or {}).get("mp3") or 0)
-        if has_local:
-            shutil.copyfile(src, dest)
-            dest.chmod(0o644)
-            sha = file_sha256(dest)
-            fsize = dest.stat().st_size
-        status = TRACK_STATUS_APPROVED if user.is_admin else TRACK_STATUS_PENDING
-        track = Track(
-            title=title, filename=stored, original_name=(title + ext)[:255], uploader_id=user.id,
-            status=status, pack_name=None, content_hash=sha or None, file_size=fsize,
-        )
+        want_status = TRACK_STATUS_APPROVED if user.is_admin else TRACK_STATUS_PENDING
         keep_flac = payload.get("keep_flac")
         if keep_flac is None:
             keep_flac = bool(user.is_admin)
-        if keep_flac:
-            flac_src = _opt_job_dir(job_id) / "optimized.flac"
-            if flac_src.is_file():
-                try:
-                    fname, fsize_f = dj_flac.attach_flac(flac_src, UPLOAD_DIR)
-                    track.flac_path = fname
-                    track.flac_size = fsize_f
-                    track.flac_pinned = False
-                    track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                except Exception:  # noqa: BLE001
-                    logging.exception("keep FLAC on import failed for job %s", job_id)
+        keep_flac = bool(keep_flac)
+        track = Track(
+            title=title, filename=stored, original_name=(title + ".mp3")[:255], uploader_id=user.id,
+            status=TRACK_STATUS_IMPORTING, pack_name=None, content_hash=None, file_size=fsize or None,
+        )
+        if keep_flac and ((job.get("r2") or {}).get("flac") or (_opt_job_dir(job_id) / "optimized.flac").is_file()):
+            flac_size = int((job.get("outputs") or {}).get("flac") or 0) or None
+            track.flac_size = flac_size
+            track.flac_pinned = False
+            track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.add(track)
         try:
             db.commit()
+            db.refresh(track)
         except Exception:
             db.rollback()
-            dest.unlink(missing_ok=True)
-            if getattr(track, "flac_path", None):
-                dj_flac.drop_track_flac(track, UPLOAD_DIR, FLAC_SNAP_ROOTS)
             raise
-        if r2_storage.r2_enabled():
-            try:
-                if has_r2:
-                    key = r2_storage.mp3_key(track.id, track.title or "")
-                    r2_storage.copy_object(r2_mp3, key, content_type="audio/mpeg")
-                    remote = r2_storage.object_size(key)
-                    if fsize and remote not in (None, int(fsize)):
-                        logging.error("import r2 copy size mismatch track=%s", track.id)
-                    else:
-                        track.storage = "r2"
-                        track.r2_key = key
-                        if keep_flac and r2_flac and r2_storage.object_size(r2_flac):
-                            fk = r2_storage.flac_key(track.id)
-                            r2_storage.copy_object(
-                                r2_flac, fk, content_type="audio/flac",
-                                cache_control="private, max-age=0, no-store",
-                            )
-                            track.flac_r2_key = fk
-                            if track.flac_path:
-                                path = dj_flac.resolve_flac(UPLOAD_DIR, track.flac_path)
-                                if path:
-                                    dj_flac.unlink_with_snapshots(path, FLAC_SNAP_ROOTS)
-                                track.flac_path = None
-                        db.commit()
-                        dest.unlink(missing_ok=True)
-                if (getattr(track, "storage", "local") or "local") != "r2":
-                    upload_track_to_r2(track.id)
-            except Exception:  # noqa: BLE001
-                logging.exception("import r2 finalize failed job=%s", job_id)
-                upload_track_to_r2(track.id)
-        try:
-            if track.flac_path or getattr(track, "flac_r2_key", None):
-                dj_flac.enforce_flac_quota(
-                    db, db.scalars(select(Track)).all(), UPLOAD_DIR, FLAC_SNAP_ROOTS,
-                    dj_flac.flac_quota_bytes(lambda k, d="": get_setting(db, k, d)),
-                    OPT_DISK_MIN_FREE,
-                    lambda k, d="": get_setting(db, k, d),
-                    lambda k, v: set_setting(db, k, v),
-                    remote_delete=r2_delete_key,
-                )
-                db.commit()
-        except Exception:  # noqa: BLE001
-            logging.exception("flac quota enforce after import failed")
-            db.rollback()
+        job["state"] = "importing"
+        job["stage"] = "导入曲库中"
+        job["progress"] = 100
+        job["error"] = ""
         job["track_id"] = track.id
-        job["track_status"] = status
-        job["imported_format"] = fmt
+        job["track_status"] = TRACK_STATUS_IMPORTING
+        job["imported_format"] = "mp3"
+        job["keep_flac"] = keep_flac
+        job["import_status"] = want_status
         _opt_save(job)
-        if job.get("source") == "telegram":
-            try:
-                tga_done_mark(job.get("tg_chat_id"), job.get("tg_msg"), downloaded=True, track_id=track.id)
-            except Exception:  # noqa: BLE001
-                pass
-        if r2_storage.r2_enabled():
-            if r2_mp3 and r2_mp3 != getattr(track, "r2_key", None):
-                r2_delete_key(r2_mp3)
-            if r2_flac and r2_flac != getattr(track, "flac_r2_key", None):
-                r2_delete_key(r2_flac)
-        _opt_purge_job_dir(job_id)
-    msg = "已导入曲库并发布" if status == TRACK_STATUS_APPROVED else "已提交到曲库，管理员审核通过后显示"
-    return {"ok": True, "track_id": track.id, "status": status, "message": msg}
+        _opt_import_enqueue(job_id)
+        return {
+            "ok": True,
+            "track_id": track.id,
+            "status": TRACK_STATUS_IMPORTING,
+            "state": "importing",
+            "message": "已开始导入曲库",
+        }
 
 
 @app.post("/dj/optimize/{job_id}/delete")
@@ -8922,9 +9184,7 @@ def opt_delete(job_id: str, request: Request, db: Session = Depends(get_db)):
         except ValueError:
             pass
     if not job.get("track_id"):
-        for key in (job.get("r2") or {}).values():
-            if key:
-                r2_delete_key(str(key))
+        _opt_delete_unreferenced_keys(job)
     shutil.rmtree(_opt_job_dir(job["id"]), ignore_errors=True)
     return {"ok": True}
 

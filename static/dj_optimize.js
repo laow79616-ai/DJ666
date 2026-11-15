@@ -121,18 +121,26 @@
 
   function renderResult(c, j) {
     var box = c.el.querySelector(".djopt-result");
-    var key = j.state + "|" + (j.track_id || "") + "|" + (j.outputs ? 1 : 0);
+    var key = j.state + "|" + (j.track_id || "") + "|" + (j.track_status || "") + "|" + (j.error || "") + "|" + (j.outputs ? 1 : 0);
     if (c.rendered === key) return;
     c.rendered = key;
-    if (j.state !== "done") { box.hidden = true; box.innerHTML = ""; return; }
+    if (j.state !== "done" && j.state !== "importing" && j.state !== "import_failed") { box.hidden = true; box.innerHTML = ""; return; }
     var b = j.before || {}, a = j.after || {};
     var stem = (j.name || "audio").replace(/\.[^.]+$/, "");
-    var imported = j.track_id
-      ? '<p class="djopt-ok">✅ 已导入曲库（' + (j.track_status === "approved" ? "已发布" : "待管理员审核") + "，格式 " + esc((j.imported_format || "").toUpperCase()) + "）</p>"
-      : '<div class="djopt-import"><input type="text" maxlength="200" class="djopt-title" value="' + esc(stem + "（优化版）") + '" aria-label="曲名">' +
+    var imported;
+    if (j.state === "importing") {
+      imported = '<p class="djopt-ok">导入中… 正在把文件写入曲库，完成后会自动更新。</p>';
+    } else if (j.state === "import_failed") {
+      imported = '<p class="djopt-ok">❌ 导入失败：' + esc(j.error || "未知错误") + '</p>' +
+        '<div class="djopt-import"><button type="button" class="btn btn-sm djopt-imp djopt-imp-retry">重试导入</button></div>';
+    } else if (j.track_id) {
+      imported = '<p class="djopt-ok">✅ 已导入曲库（' + (j.track_status === "approved" ? "已发布" : "待管理员审核") + "，格式 " + esc((j.imported_format || "").toUpperCase()) + "）</p>";
+    } else {
+      imported = '<div class="djopt-import"><input type="text" maxlength="200" class="djopt-title" value="' + esc(stem + "（优化版）") + '" aria-label="曲名">' +
         '<label class="djopt-keepflac"><input type="checkbox" class="djopt-keep-flac"' + (document.getElementById("djopt") && document.getElementById("djopt").getAttribute("data-keep-flac") === "1" ? " checked" : "") + '> 同时保留 FLAC 无损</label>' +
         '<button type="button" class="btn btn-sm djopt-imp">导入曲库（MP3 320k）</button></div>' +
-        '<p class="muted">导入曲库保存优化后的 MP3 320k 用于播放。勾选后会另外保留 FLAC 24bit，供管理员/操作人后期下载；任务文件在导入后仍会立即清理。</p>';
+        '<p class="muted">导入曲库保存优化后的 MP3 320k 用于播放。勾选后会另外保留 FLAC 24bit，供管理员/操作人后期下载。</p>';
+    }
     box.innerHTML =
       '<table class="djopt-stats"><thead><tr><th></th><th>整体响度</th><th>真峰值</th><th>动态范围</th></tr></thead><tbody>' +
       "<tr><td>原版</td><td>" + num(b.i, " LUFS") + "</td><td>" + num(b.tp, " dBTP") + "</td><td>" + num(b.lra, " LU") + "</td></tr>" +
@@ -180,24 +188,28 @@
     if (imp) {
       imp.addEventListener("click", function () {
         imp.disabled = true;
+        imp.textContent = "导入中…";
         var msg = box.querySelector(".djopt-msg");
-        msg.textContent = "正在导入…";
+        msg.textContent = "导入中…";
         var keep = box.querySelector(".djopt-keep-flac");
+        var titleEl = box.querySelector(".djopt-title");
         api("POST", "/dj/optimize/" + j.id + "/import", {
-          title: box.querySelector(".djopt-title").value,
+          title: titleEl ? titleEl.value : "",
           format: "mp3",
           keep_flac: !!(keep && keep.checked)
-        }).then(function (r) {
-          c.el.remove();
-          delete cards[j.id];
-          if (expandedMap[j.id]) { delete expandedMap[j.id]; saveExpanded(expandedMap); }
-        }).catch(function (e) { imp.disabled = false; msg.textContent = e.message; });
+        }).then(function () {
+          return refresh(j.id);
+        }).then(function () {
+          schedule();
+          if (typeof window.refreshAdminTracks === "function") window.refreshAdminTracks();
+        }).catch(function (e) { imp.disabled = false; imp.textContent = imp.classList.contains("djopt-imp-retry") ? "重试导入" : "导入曲库（MP3 320k）"; msg.textContent = e.message; });
       });
     }
   }
 
   function render(j) {
     var c = card(j.id);
+    if (j.state === "importing") c._wasImporting = true;
     c.data = j;
     c.el.querySelector(".djopt-job-name").textContent = j.name || "音频";
     c.el.querySelector(".djopt-badge").textContent = j.source === "record" ? "录音" : j.source === "telegram" ? "Telegram" : "上传";
@@ -214,6 +226,10 @@
       setBar(c, 0, "排队中" + (j.queue_pos ? "（第 " + j.queue_pos + " 位）" : "") + "…", "is-busy");
     } else if (st === "running") {
       setBar(c, j.progress || 0, (j.stage || "处理中") + " · " + (j.progress || 0) + "%", "is-busy");
+    } else if (st === "importing") {
+      setBar(c, 100, "导入中…", "is-busy");
+    } else if (st === "import_failed") {
+      setBar(c, 100, "❌ 导入失败" + (j.error ? "：" + j.error : ""), "is-failed");
     } else if (st === "done") {
       var doneMsg = "✅ 优化完成";
       if (j.track_id) {
@@ -221,6 +237,10 @@
           (j.imported_format ? "，" + String(j.imported_format).toUpperCase() : "") + "）";
       }
       setBar(c, 100, doneMsg, "is-done");
+      if (j.track_id && typeof window.refreshAdminTracks === "function" && c._wasImporting) {
+        c._wasImporting = false;
+        window.refreshAdminTracks();
+      }
     } else if (st === "failed") {
       setBar(c, 100, "❌ " + (j.error || "处理失败"), "is-failed");
     }
@@ -231,7 +251,7 @@
   function anyBusy() {
     return Object.keys(cards).some(function (k) {
       var d = cards[k].data;
-      return d && (d.state === "queued" || d.state === "running" || d.state === "uploaded" || d.state === "downloading");
+      return d && (d.state === "queued" || d.state === "running" || d.state === "uploaded" || d.state === "downloading" || d.state === "importing");
     });
   }
   function schedule() {
@@ -240,7 +260,7 @@
     pollTimer = setTimeout(function () {
       var ids = Object.keys(cards).filter(function (k) {
         var d = cards[k].data;
-        return d && (d.state === "queued" || d.state === "running" || d.state === "uploaded" || d.state === "downloading");
+        return d && (d.state === "queued" || d.state === "running" || d.state === "uploaded" || d.state === "downloading" || d.state === "importing");
       });
       Promise.all(ids.map(function (id) { return refresh(id, true); })).then(schedule, schedule);
     }, 2000);
@@ -319,7 +339,7 @@
   });
 
   api("GET", "/dj/optimize/jobs").then(function (r) {
-    (r.jobs || []).slice().reverse().forEach(function (j) { if (!j.track_id) render(j); });
+    (r.jobs || []).slice().reverse().forEach(function (j) { if (!j.track_id || j.state === "importing" || j.state === "import_failed") render(j); });
     schedule();
   }).catch(function () {});
 

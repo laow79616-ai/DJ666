@@ -162,24 +162,27 @@ def optimize_flac_key(job_id: str) -> str:
 
 
 def copy_object(src_key: str, dst_key: str, content_type: Optional[str] = None, cache_control: Optional[str] = None) -> None:
-    """Server-side copy inside the same bucket (no local download)."""
+    """Server-side copy inside the same bucket (no local download).
+
+    Uses boto3's managed copy(), which automatically switches to multipart
+    copy for objects over 5GB (a single CopyObject call cannot).
+    """
     src_key = str(src_key).lstrip("/")
     dst_key = str(dst_key).lstrip("/")
     if not src_key or not dst_key or src_key == dst_key:
         return
-    extra = {
-        "Bucket": bucket(),
-        "Key": dst_key,
-        "CopySource": {"Bucket": bucket(), "Key": src_key},
-    }
+    extra: dict = {}
     if content_type or cache_control:
-        extra["MetadataDirective"] = "REPLACE"
         if content_type:
             extra["ContentType"] = content_type
         extra["CacheControl"] = cache_control or "public, max-age=31536000, immutable"
-    else:
-        extra["MetadataDirective"] = "COPY"
-    _client().copy_object(**extra)
+        extra["MetadataDirective"] = "REPLACE"
+    _client().copy(
+        {"Bucket": bucket(), "Key": src_key},
+        bucket(),
+        dst_key,
+        ExtraArgs=extra or None,
+    )
 
 
 def usage_bytes(prefix: str = "") -> Optional[int]:

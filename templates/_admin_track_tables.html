@@ -1,0 +1,216 @@
+{% macro track_cat_select(track) -%}
+<form class="inline-form track-cat-form" action="/admin/tracks/{{ track.id }}/category" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <select name="category" class="track-cat-select" onchange="this.form.submit()" aria-label="曲目分类" data-prev="{{ track.category or '' }}">
+    <option value=""{% if not track.category %} selected{% endif %}>未分类</option>
+    {% for key, label in track_categories %}
+    <option value="{{ key }}"{% if track.category == key %} selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <span class="track-cat-status" aria-live="polite"></span>
+</form>
+{%- endmacro %}
+
+      {% if importing_tracks %}
+      <div class="ann-log" style="margin-top:0;padding-top:0;border-top:0;">
+        <h3 class="ann-log-title">正在导入 <span class="count">{{ importing_tracks|length }}</span></h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in importing_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <span>{{ track.title }}</span>
+                  <span class="status-badge status-importing">导入中</span>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td class="row-actions-cell"><span class="muted">导入完成后将出现在已发布或待审核列表</span></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+      <div class="ann-log" style="margin-top:0;padding-top:0;border-top:0;">
+        <h3 class="ann-log-title">待审核</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in pending_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
+                  {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
+                  <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
+                  <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="text" name="title" value="{{ track.title }}" maxlength="200" required>
+                    <button type="submit" class="btn btn-sm">保存</button>
+                  </form>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td class="row-actions-cell">
+
+                  {% if track.flac_path or track.flac_r2_key %}
+                  <span class="flac-badge" title="已保留 FLAC 无损">FLAC{% if track.flac_pinned %} · 保留{% endif %}</span>
+                  <a class="link-btn" href="/admin/tracks/{{ track.id }}/flac">下载 FLAC（{{ (track.flac_size or 0)|fmt_bytes }}）</a>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/pin" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="hidden" name="pinned" value="{{ '0' if track.flac_pinned else '1' }}">
+                    <button type="submit" class="link-btn">{{ "取消保留" if track.flac_pinned else "永久保留" }}</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/delete" method="post" onsubmit="return confirm('删除这首的 FLAC 存档？MP3 播放不受影响。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除 FLAC</button>
+                  </form>
+                  {% endif %}
+
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/approve" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn">通过</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/reject" method="post" onsubmit="return confirm('确定拒绝这首曲目？拒绝后不会出现在首页。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">拒绝</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                </td>
+              </tr>
+              {% else %}
+              <tr><td colspan="6" class="muted">暂无待审核曲目。</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="ann-log">
+        <h3 class="ann-log-title">已发布</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in published_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
+                  {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
+                  <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
+                  <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="text" name="title" value="{{ track.title }}" maxlength="200" required>
+                    <button type="submit" class="btn btn-sm">保存</button>
+                  </form>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td class="row-actions-cell">
+
+                  {% if track.flac_path or track.flac_r2_key %}
+                  <span class="flac-badge" title="已保留 FLAC 无损">FLAC{% if track.flac_pinned %} · 保留{% endif %}</span>
+                  <a class="link-btn" href="/admin/tracks/{{ track.id }}/flac">下载 FLAC（{{ (track.flac_size or 0)|fmt_bytes }}）</a>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/pin" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="hidden" name="pinned" value="{{ '0' if track.flac_pinned else '1' }}">
+                    <button type="submit" class="link-btn">{{ "取消保留" if track.flac_pinned else "永久保留" }}</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/delete" method="post" onsubmit="return confirm('删除这首的 FLAC 存档？MP3 播放不受影响。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除 FLAC</button>
+                  </form>
+                  {% endif %}
+
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                </td>
+              </tr>
+              {% else %}
+              <tr><td colspan="6" class="muted">暂无已发布曲目。</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {% if rejected_tracks %}
+      <div class="ann-log">
+        <h3 class="ann-log-title">已拒绝</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for track in rejected_tracks %}
+              <tr>
+                <td class="track-title-cell">
+                  <a href="{{ track_audio_url(track) }}" target="_blank" rel="noopener">{{ track.title }}</a>
+                  <span class="storage-badge {{ 'is-r2' if track.storage == 'r2' else 'is-local' }}">{{ 'R2' if track.storage == 'r2' else '本地' }}</span>
+                  {% if track.flac_path or track.flac_r2_key %}<span class="flac-badge">FLAC</span>{% endif %}
+                  <button type="button" class="link-btn track-rename-toggle" data-rename-toggle>改名</button>
+                  <form class="inline-form admin-rename-form" action="/admin/tracks/{{ track.id }}/rename" method="post" hidden>
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="text" name="title" value="{{ track.title }}" maxlength="200" required>
+                    <button type="submit" class="btn btn-sm">保存</button>
+                  </form>
+                </td>
+                <td>{{ display_name(track.uploader, "未知") }}</td>
+                <td>{{ track.pack_name or "—" }}</td>
+                <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
+                <td>{{ track.created_at|fmt_time }}</td>
+                <td class="row-actions-cell">
+
+                  {% if track.flac_path or track.flac_r2_key %}
+                  <span class="flac-badge" title="已保留 FLAC 无损">FLAC{% if track.flac_pinned %} · 保留{% endif %}</span>
+                  <a class="link-btn" href="/admin/tracks/{{ track.id }}/flac">下载 FLAC（{{ (track.flac_size or 0)|fmt_bytes }}）</a>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/pin" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <input type="hidden" name="pinned" value="{{ '0' if track.flac_pinned else '1' }}">
+                    <button type="submit" class="link-btn">{{ "取消保留" if track.flac_pinned else "永久保留" }}</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/flac/delete" method="post" onsubmit="return confirm('删除这首的 FLAC 存档？MP3 播放不受影响。');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除 FLAC</button>
+                  </form>
+                  {% endif %}
+
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/approve" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn">改通过</button>
+                  </form>
+                  <form class="inline-form" action="/admin/tracks/{{ track.id }}/delete" method="post" onsubmit="return confirm('确定删除这首曲目？');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                    <button type="submit" class="link-btn danger">删除</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
