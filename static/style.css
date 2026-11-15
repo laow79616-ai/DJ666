@@ -1143,14 +1143,16 @@ body.has-player { padding-bottom: calc(var(--player-h, 120px) + 88px); }
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
 .fab-menu[hidden] { display: none; }
-.fab-menu a {
+.fab-menu a, .fab-menu button {
   display: flex; align-items: center; gap: 12px;
   padding: 13px 17px; border-radius: 12px;
   color: var(--text); text-decoration: none; white-space: nowrap;
   font-size: 1.25rem;
+  width: 100%; border: 0; background: transparent; cursor: pointer; font: inherit; text-align: left;
 }
-.fab-menu a:hover { background: rgba(255, 255, 255, 0.06); }
+.fab-menu a:hover, .fab-menu button:hover { background: rgba(255, 255, 255, 0.06); }
 .fab-menu a.is-active { color: var(--cyan); background: rgba(60, 239, 255, 0.08); text-shadow: 0 0 12px rgba(60, 239, 255, 0.4); }
+.fab-menu button[hidden] { display: none; }
 .fab-ico { width: 22px; text-align: center; font-size: 1.2rem; }
 .player[hidden] { display: none !important; }
 

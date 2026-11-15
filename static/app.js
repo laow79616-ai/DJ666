@@ -35,7 +35,7 @@
   }
   // The player bar is hidden until a track is played (or the user opens it).
   // Closing / collapsing the bar hides the UI only — playback continues.
-  // The green FAB toggles the bar when a track is loaded (long-press opens nav).
+  // The green FAB always opens the page menu; use 「展开播放器」 to show the bar again.
   var barWanted = false;
   var fabBtn = document.getElementById("fabBtn");
   function syncPlayerH() {
@@ -121,13 +121,10 @@
   function markFab() {
     if (!fabBtn) return;
     fabBtn.classList.toggle("is-playing", !audio.paused && bar.hidden);
-    if (cur()) {
-      fabBtn.setAttribute("aria-label", bar.hidden ? "展开播放器" : "收起播放器");
-      fabBtn.setAttribute("title", bar.hidden ? "展开播放器（长按打开导航）" : "收起播放器（长按打开导航）");
-    } else {
-      fabBtn.setAttribute("aria-label", "页面导航");
-      fabBtn.setAttribute("title", "页面导航");
-    }
+    fabBtn.setAttribute("aria-label", !audio.paused && bar.hidden ? "页面导航（正在播放）" : "页面导航");
+    fabBtn.setAttribute("title", fabBtn.getAttribute("aria-label"));
+    var expand = document.getElementById("fabExpandPlayer");
+    if (expand) expand.hidden = !(cur() && bar.hidden);
   }
   window.addEventListener("resize", syncChromeH);
   syncChromeH();
@@ -492,7 +489,7 @@
   function fabFlipMenu() {
     if (!fabNav || !fabMenu) return;
     var r = fabNav.getBoundingClientRect();
-    var menuW = 180, menuH = 200;
+    var menuW = 180, menuH = 260;
     fabNav.classList.toggle("menu-below", r.top < menuH + 8);
     fabNav.classList.toggle("menu-left", r.left < menuW + 8);
   }
@@ -514,26 +511,12 @@
   if (fabNav) {
     loadFabPos();
     applyFabPos();
-    var fabLongTimer = null;
-    function clearFabLong() {
-      if (fabLongTimer) { clearTimeout(fabLongTimer); fabLongTimer = null; }
-    }
     fabBtn.addEventListener("pointerdown", function (e) {
       if (!fabBtn || e.button) return;
       e.stopPropagation();
       try { fabBtn.setPointerCapture(e.pointerId); } catch (err) {}
       var r = fabNav.getBoundingClientRect();
       fabDrag = { id: e.pointerId, x: e.clientX, y: e.clientY, sl: r.left, st: r.top, moved: false };
-      clearFabLong();
-      if (cur()) {
-        fabLongTimer = setTimeout(function () {
-          fabLongTimer = null;
-          if (fabDrag && !fabDrag.moved) {
-            fabOpen(true);
-            fabSuppressClick = true;
-          }
-        }, 480);
-      }
     });
     fabBtn.addEventListener("pointermove", function (e) {
       if (!fabDrag || e.pointerId !== fabDrag.id) return;
@@ -541,7 +524,6 @@
       if (!fabDrag.moved && Math.abs(dx) + Math.abs(dy) < FAB_DRAG_THRESHOLD) return;
       if (!fabDrag.moved) {
         fabDrag.moved = true;
-        clearFabLong();
         fabOpen(false);
         fabNav.classList.add("is-dragging");
       }
@@ -551,7 +533,6 @@
     });
     function endFabDrag(e) {
       if (!fabDrag || (e && e.pointerId !== fabDrag.id)) return;
-      clearFabLong();
       var wasDrag = fabDrag.moved;
       fabNav.classList.remove("is-dragging");
       fabDrag = null;
@@ -565,19 +546,19 @@
     fabBtn.addEventListener("click", function (e) {
       e.stopPropagation();
       if (fabSuppressClick) { fabSuppressClick = false; e.preventDefault(); return; }
-      if (cur()) {
-        fabOpen(false);
-        setBar(!!bar.hidden);
-        return;
-      }
       fabOpen(fabMenu.hidden);
     });
     fabMenu.addEventListener("click", function (e) {
-      var a = e.target.closest("a[data-fab]");
+      var a = e.target.closest("[data-fab]");
       if (!a) return;
-      if (a.dataset.fab === "music") setBar(true);
+      if (a.dataset.fab === "player") {
+        e.preventDefault();
+        setBar(true);
+        fabOpen(false);
+        return;
+      }
       fabOpen(false);
-      if (new URL(a.href, location.href).pathname === location.pathname) e.preventDefault();  // already here
+      if (a.tagName === "A" && new URL(a.href, location.href).pathname === location.pathname) e.preventDefault();  // already here
     });
     document.addEventListener("click", function (e) { if (!fabMenu.hidden && !fabNav.contains(e.target)) fabOpen(false); });
     document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !fabMenu.hidden) { fabOpen(false); fabBtn.focus(); } });
