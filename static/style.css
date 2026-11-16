@@ -1514,6 +1514,27 @@ body.has-player { padding-bottom: calc(var(--player-h, 120px) + 88px); }
 body[data-page="music"] .hero {
   text-align: center;
 }
+body[data-page="music"] .music-total-dur {
+  margin: 8px 0 0;
+  color: var(--cyan);
+  font-family: Orbitron, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: clamp(0.8rem, 2.8vw, 1.05rem);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: 1.5;
+  text-shadow: 0 0 14px rgba(60, 239, 255, 0.28);
+  font-variant-numeric: tabular-nums;
+}
+body[data-page="music"] .music-total-dur[data-ready="0"] {
+  color: var(--muted);
+  text-shadow: none;
+}
+@media (max-width: 640px) {
+  body[data-page="music"] .music-total-dur {
+    letter-spacing: 0.04em;
+    padding: 0 12px;
+  }
+}
 
 /* ---- chat page: message list fills leftover height; input fixed at the bottom ---- */
 body[data-page="chat"] {

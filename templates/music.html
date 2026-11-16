@@ -22,6 +22,7 @@
 <section class="hero slim">
   <p class="eyebrow">MUSIC</p>
   <h1>音乐</h1>
+  <p class="music-total-dur" id="musicTotalDuration" data-ready="{{ '1' if library_duration is defined and library_duration.with_duration else '0' }}">{{ library_duration.label if library_duration is defined else '总时长：统计中…' }}</p>
 </section>
 
 <section class="panel" id="music">
@@ -45,4 +46,37 @@
   <p class="hint">登录后可在「设置」上传自己的音乐包。<a href="/login?next=/">登录</a> 或 <a href="/register">注册</a></p>
   {% endif %}
 </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var el = document.getElementById("musicTotalDuration");
+  if (!el) return;
+  var timer = null;
+  var extra = null;
+  function apply(d) {
+    if (!d || !d.label) return;
+    el.textContent = d.label;
+    el.setAttribute("data-ready", d.with_duration ? "1" : "0");
+    if (d.missing) {
+      el.title = "已统计 " + d.with_duration + " 首，另有 " + d.missing + " 首时长待统计";
+    } else if (typeof d.tracks === "number") {
+      el.title = "曲库 " + d.tracks + " 首";
+    }
+  }
+  function tick() {
+    fetch("/api/stats/total-duration", { cache: "no-store", credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(apply)
+      .catch(function () {});
+  }
+  timer = setInterval(tick, 60000);
+  if (el.getAttribute("data-ready") !== "1") extra = setTimeout(tick, 5000);
+  (window.DJPageLeave = window.DJPageLeave || []).push(function () {
+    if (timer) clearInterval(timer);
+    if (extra) clearTimeout(extra);
+  });
+})();
+</script>
 {% endblock %}

@@ -56,6 +56,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -472,6 +473,7 @@ class Track(Base):
     pack_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     file_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
     flac_path: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     flac_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -1007,6 +1009,7 @@ def migrate_tracks_schema(db: Session) -> None:
         ("storage", "VARCHAR(10) DEFAULT 'local'"),
         ("r2_key", "VARCHAR(200)"),
         ("flac_r2_key", "VARCHAR(200)"),
+        ("duration", "FLOAT"),
     ):
         if col not in cols:
             db.execute(text(f"ALTER TABLE tracks ADD COLUMN {col} {ddl}"))
@@ -1265,6 +1268,247 @@ def track_audio_url(track) -> str:
         return r2_storage.public_url(key)
     name = Path(getattr(track, "filename", "") or "").name
     return f"/uploads/{name}" if name else ""
+
+
+_FFPROBE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_DURATION_MIN = 0.5
+_duration_backfill_started = False
+_duration_backfill_lock = threading.Lock()
+
+
+def _ffprobe_duration(src: str, timeout: float = 20.0) -> Optional[float]:
+    """Duration in seconds from a local path or HTTP(S) URL, or None."""
+    if not src:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-user_agent", _FFPROBE_UA,
+        "-show_entries", "format=duration:stream=duration",
+        "-of", "json",
+        src,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return None
+    try:
+        info = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    candidates: list[float] = []
+    fmt = (info.get("format") or {}).get("duration")
+    try:
+        if fmt is not None:
+            candidates.append(float(fmt))
+    except (TypeError, ValueError):
+        pass
+    for stream in info.get("streams") or []:
+        try:
+            candidates.append(float(stream.get("duration")))
+        except (TypeError, ValueError):
+            continue
+    for dur in candidates:
+        if math.isfinite(dur) and dur >= _DURATION_MIN:
+            return dur
+    return None
+
+
+def probe_track_duration(track: Track) -> Optional[float]:
+    fname = Path(getattr(track, "filename", "") or "").name
+    if fname:
+        path = UPLOAD_DIR / fname
+        if path.is_file():
+            dur = _ffprobe_duration(str(path))
+            if dur:
+                return dur
+    url = track_audio_url(track)
+    if url and url.startswith(("http://", "https://")):
+        dur = _ffprobe_duration(url)
+        if dur:
+            return dur
+    key = getattr(track, "r2_key", None)
+    if key and r2_storage.r2_enabled():
+        try:
+            signed = r2_storage.presigned_url(key, expires=120)
+        except Exception:  # noqa: BLE001
+            signed = ""
+        if signed:
+            dur = _ffprobe_duration(signed)
+            if dur:
+                return dur
+    return None
+
+
+def assign_track_duration(track: Track, src=None) -> Optional[float]:
+    """Set track.duration from a known value, a local path/URL, or by probing. Not committed."""
+    dur: Optional[float] = None
+    if isinstance(src, (int, float)) and not isinstance(src, bool):
+        try:
+            val = float(src)
+            if math.isfinite(val) and val >= _DURATION_MIN:
+                dur = val
+        except (TypeError, ValueError):
+            dur = None
+    elif src:
+        dur = _ffprobe_duration(str(src))
+    if dur is None:
+        dur = probe_track_duration(track)
+    if dur is None:
+        return None
+    track.duration = round(float(dur), 3)
+    return track.duration
+
+
+def format_total_duration_label(seconds: float) -> str:
+    minutes_total = int((max(0.0, float(seconds)) + 30) // 60)
+    days, rem = divmod(minutes_total, 24 * 60)
+    hours, minutes = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} 天")
+    if days or hours:
+        parts.append(f"{hours} 小时")
+    parts.append(f"{minutes} 分钟")
+    if not days and not hours and minutes == 0:
+        return "总时长：0 分钟"
+    return "总时长：" + " ".join(parts)
+
+
+def library_duration_stats(db: Session) -> dict:
+    row = db.execute(
+        text(
+            "SELECT COUNT(*) AS tracks, "
+            "COALESCE(SUM(CASE WHEN duration IS NOT NULL AND duration >= 0.5 THEN 1 ELSE 0 END), 0) AS with_duration, "
+            "COALESCE(SUM(CASE WHEN duration IS NOT NULL AND duration >= 0.5 THEN duration ELSE 0 END), 0) AS seconds "
+            "FROM tracks WHERE status = :st"
+        ),
+        {"st": TRACK_STATUS_APPROVED},
+    ).mappings().first()
+    tracks = int((row or {}).get("tracks") or 0)
+    with_dur = int((row or {}).get("with_duration") or 0)
+    seconds = float((row or {}).get("seconds") or 0)
+    missing = max(0, tracks - with_dur)
+    if tracks == 0:
+        label = "总时长：0 分钟"
+    elif with_dur == 0:
+        label = "总时长：统计中…"
+    else:
+        label = format_total_duration_label(seconds)
+    return {
+        "ok": True,
+        "label": label,
+        "seconds": round(seconds, 3),
+        "tracks": tracks,
+        "with_duration": with_dur,
+        "missing": missing,
+    }
+
+
+def _duration_from_opt_jobs() -> dict[int, float]:
+    out: dict[int, float] = {}
+    root = UPLOAD_DIR / "optimize"
+    if not root.is_dir():
+        return out
+    for path in root.glob("*/job.json"):
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            tid = int(data.get("track_id"))
+            dur = float(data.get("duration"))
+        except (TypeError, ValueError):
+            continue
+        if tid > 0 and math.isfinite(dur) and dur >= _DURATION_MIN:
+            out[tid] = dur
+    return out
+
+
+def backfill_track_durations() -> None:
+    """Fill missing track durations without blocking the web process."""
+    try:
+        job_durs = _duration_from_opt_jobs()
+        if job_durs:
+            db = SessionLocal()
+            try:
+                rows = db.scalars(
+                    select(Track).where(
+                        Track.id.in_(list(job_durs.keys())),
+                        or_(Track.duration.is_(None), Track.duration < _DURATION_MIN),
+                    )
+                ).all()
+                filled = 0
+                for track in rows:
+                    track.duration = round(job_durs[track.id], 3)
+                    filled += 1
+                if filled:
+                    db.commit()
+                    logging.info("duration backfill from optimize jobs: %s", filled)
+            except Exception:  # noqa: BLE001
+                logging.exception("duration backfill from optimize jobs failed")
+                db.rollback()
+            finally:
+                db.close()
+        db = SessionLocal()
+        try:
+            pending = list(
+                db.scalars(
+                    select(Track.id)
+                    .where(or_(Track.duration.is_(None), Track.duration < _DURATION_MIN))
+                    .order_by((Track.status == TRACK_STATUS_APPROVED).desc(), Track.id.asc())
+                ).all()
+            )
+        finally:
+            db.close()
+        ok = 0
+        fail = 0
+        for tid in pending:
+            db = SessionLocal()
+            try:
+                track = db.get(Track, tid)
+                if track is None:
+                    continue
+                current = getattr(track, "duration", None)
+                if current is not None:
+                    try:
+                        if float(current) >= _DURATION_MIN:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                dur = probe_track_duration(track)
+                if dur:
+                    track.duration = round(dur, 3)
+                    db.commit()
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception:  # noqa: BLE001
+                logging.exception("duration probe failed track=%s", tid)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                fail += 1
+            finally:
+                db.close()
+            time.sleep(0.05)
+        logging.info("duration backfill probe done ok=%s fail=%s pending=%s", ok, fail, len(pending))
+    except Exception:  # noqa: BLE001
+        logging.exception("duration backfill failed")
+
+
+def start_duration_backfill() -> None:
+    global _duration_backfill_started
+    with _duration_backfill_lock:
+        if _duration_backfill_started:
+            return
+        _duration_backfill_started = True
+    threading.Thread(target=backfill_track_durations, name="dur-backfill", daemon=True).start()
 
 
 def admin_track_play_url(track) -> str:
@@ -1751,6 +1995,8 @@ def overwrite_track_audio(
     track.original_name = (original or track.original_name or "")[:255]
     track.file_size = size
     track.content_hash = sha
+    if assign_track_duration(track, UPLOAD_DIR / stored_name) is None:
+        track.duration = None
     # A normal user replacing the audio of an already reviewed track must go
     # through review again; admins keep the current status.
     if content_changed and not by_user.is_admin and track.status != TRACK_STATUS_PENDING:
@@ -3977,6 +4223,10 @@ async def lifespan(app: FastAPI):
         tga_start()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        start_duration_backfill()
+    except Exception:  # noqa: BLE001
+        logging.exception("duration backfill failed to start")
     task = asyncio.create_task(telegram_scheduler())
     asyncio.get_running_loop().run_in_executor(None, _bot_webhook_on_startup)
     try:
@@ -4361,7 +4611,22 @@ def music_listing(request: Request, db: Session):
     return templates.TemplateResponse(
         request,
         "music.html",
-        ctx(request, db, tracks=tracks, nav="music", canonical="/"),
+        ctx(
+            request,
+            db,
+            tracks=tracks,
+            nav="music",
+            canonical="/",
+            library_duration=library_duration_stats(db),
+        ),
+    )
+
+
+@app.get("/api/stats/total-duration")
+def api_total_duration(db: Session = Depends(get_db)):
+    return JSONResponse(
+        library_duration_stats(db),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
     )
 
 
@@ -4812,6 +5077,7 @@ async def settings_upload_pack(
                     file_size=src_size,
                     category=infer_track_category(title, pack_label, entry_name),
                 )
+            assign_track_duration(pack_track, UPLOAD_DIR / stored)
             db.add(pack_track)
             db.flush()
             new_pack_ids.append(pack_track.id)
@@ -5079,6 +5345,7 @@ async def save_admin_audio(
             file_size=size,
             category=cat,
         )
+        assign_track_duration(track, UPLOAD_DIR / stored_name)
         try:
             db.add(track)
             db.commit()
@@ -9403,6 +9670,7 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
             title=title, filename=stored, original_name=(title + ".mp3")[:255], uploader_id=user.id,
             status=TRACK_STATUS_IMPORTING, pack_name=None, content_hash=None, file_size=fsize or None,
         )
+        assign_track_duration(track, job.get("duration"))
         if keep_flac and ((job.get("r2") or {}).get("flac") or (_opt_job_dir(job_id) / "optimized.flac").is_file()):
             flac_size = int((job.get("outputs") or {}).get("flac") or 0) or None
             track.flac_size = flac_size
