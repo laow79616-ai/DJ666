@@ -1037,7 +1037,7 @@ a.admin-dj-entry {
 <section class="panel admin-pane admin-pane-djmix" role="tabpanel" id="djmix">
   <div class="admin-pane-inner">
     <div class="admin-pane-body">
-      <link rel="stylesheet" href="/static/mixer.css?v=t172hide1">
+      <link rel="stylesheet" href="/static/mixer.css?v=t182auto1">
       {% set mixer_embedded = True %}
       {% set hide_mixer = True %}
       {% include "_mixer.html" %}
@@ -1086,6 +1086,40 @@ a.admin-dj-entry {
         <div class="tga-box" id="tgaMain" hidden>
           <div class="tga-account"><span id="tgaMe"></span><span class="muted" id="tgaQuota"></span>
             <button type="button" class="btn btn-sm btn-ghost" data-tga-logout>退出登录</button></div>
+          <div class="tga-auto" id="tgaAuto">
+            <div class="tga-auto-head">
+              <h3>自动采集</h3>
+              <p class="muted tga-auto-status" id="tgaAutoStatus">尚未检查</p>
+            </div>
+            <p class="muted tga-auto-tip">添加频道后会自动采集全部尚未导入的音频，经现有优化流程（FLAC + MP3）后直接发布到曲库。之后按设定间隔检查新帖，已导入的不会重复下载。</p>
+            <div class="tga-auto-controls">
+              <label>检测间隔（分钟）
+                <input type="number" id="tgaAutoInterval" min="10" max="1440" step="1" value="60">
+              </label>
+              <button type="button" class="btn btn-sm" id="tgaAutoIntervalSave">保存间隔</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="tgaAutoCheckNow">立即检查</button>
+            </div>
+            <p class="tga-auto-counts" id="tgaAutoCounts"></p>
+            <p class="tga-auto-error" id="tgaAutoError" hidden></p>
+            <form class="tga-form tga-inline" onsubmit="return false">
+              <input type="text" id="tgaAutoChat" placeholder="添加频道：https://t.me/xxx 或 @用户名" autocomplete="off">
+              <button type="button" class="btn btn-sm" id="tgaAutoAdd">加入并自动采集</button>
+            </form>
+            <div class="tga-table-wrap">
+              <table class="tga-table tga-auto-table" id="tgaAutoTable" hidden>
+                <thead>
+                  <tr>
+                    <th>频道</th>
+                    <th>状态</th>
+                    <th>上次检查</th>
+                    <th>结果</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="tgaAutoRows"></tbody>
+              </table>
+            </div>
+          </div>
           <div class="tga-browse">
             <form class="tga-form tga-inline" onsubmit="return false">
               <input type="text" name="chat" id="tgaChat" placeholder="频道链接 https://t.me/xxx 或 @用户名" autocomplete="off">
@@ -1116,7 +1150,10 @@ a.admin-dj-entry {
               <ul class="tga-queue-list" id="tgaQueueList"></ul>
             </div>
           <div class="tga-list" id="tgaList" hidden>
-            <h3 id="tgaChatTitle"></h3>
+            <div class="tga-list-head">
+              <h3 id="tgaChatTitle"></h3>
+              <button type="button" class="btn btn-sm btn-ghost" id="tgaAutoAddCurrent">加入自动采集</button>
+            </div>
             <div class="tga-batch" id="tgaBatchBar">
               <label class="tg-check"><input type="checkbox" id="tgaSelAll"> 全选</label>
               <button type="button" class="btn btn-sm btn-ghost" id="tgaSelNone">取消</button>
@@ -1133,7 +1170,7 @@ a.admin-dj-entry {
         </div>
         <p class="hint tga-limits">限制：全站一次只下载一个文件，队列在后台按顺序处理（条目之间至少间隔 5 秒），不阻塞本页，也可在进行中继续追加。下载次数不再设每日上限。单个文件最大 500MB。遇到 Telegram 限流会自动等待后继续。</p>
       </section>
-      <script src="/static/tg_audio.js?v=tgaq3" defer></script>
+      <script src="/static/tg_audio.js?v=t182auto1" defer></script>
       <script src="/static/admin_backup.js?v=bak3" defer></script>
       {% endif %}
     </div>

@@ -623,6 +623,7 @@ class TgAudioQueueItem(Base):
     status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
     error: Mapped[str] = mapped_column(String(300), default="")
     retries: Mapped[int] = mapped_column(Integer, default=0)
+    auto_import: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
@@ -900,6 +901,18 @@ def migrate_schema(db: Session) -> None:
     db.commit()
     migrate_tracks_schema(db)
     migrate_announcements_schema(db)
+    migrate_tga_queue_schema(db)
+
+
+def migrate_tga_queue_schema(db: Session) -> None:
+    cols = {row[1] for row in db.execute(text("PRAGMA table_info(tga_queue)")).fetchall()}
+    if not cols:
+        return
+    if "auto_import" not in cols:
+        db.execute(text("ALTER TABLE tga_queue ADD COLUMN auto_import BOOLEAN DEFAULT 0"))
+        db.commit()
+    db.execute(text("UPDATE tga_queue SET auto_import = 0 WHERE auto_import IS NULL"))
+    db.commit()
 
 
 def migrate_announcements_schema(db: Session) -> None:
@@ -9048,6 +9061,10 @@ def _opt_process(job_id: str) -> None:
             _opt_update(job_id, storage="local", after=after, gain_db=round(gain, 2), outputs=outputs)
         _opt_update(job_id, state="done", stage="完成", progress=100, after=after, gain_db=round(gain, 2),
                     outputs=outputs, finished=time.time())
+        try:
+            _opt_maybe_auto_import(job_id)
+        except Exception:  # noqa: BLE001
+            logging.exception("auto import after optimize failed job=%s", job_id)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc) if isinstance(exc, RuntimeError) else "处理失败，请换一个文件再试"
         for p in (flac, mp3):
@@ -9615,6 +9632,135 @@ def opt_file(job_id: str, kind: str, request: Request, download: int = 0, db: Se
     raise HTTPException(status_code=404, detail="文件不存在或已过期")
 
 
+def _opt_start_library_import(
+    job_id: str,
+    *,
+    user_id: int,
+    title: str = "",
+    keep_flac: Optional[bool] = None,
+    want_status: Optional[str] = None,
+    require_owner: Optional["User"] = None,
+) -> dict:
+    """Create the track row immediately; R2 adopt/verify runs in the background."""
+    db = SessionLocal()
+    try:
+        user = db.get(User, int(user_id or 0)) if user_id else None
+        with _opt_lock:
+            job = _opt_load(job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="任务不存在或已过期")
+            if require_owner is not None and not _opt_owner_ok(job, require_owner):
+                raise HTTPException(status_code=404, detail="任务不存在或已过期")
+            if job.get("state") == "importing":
+                return {
+                    "ok": True,
+                    "track_id": job.get("track_id"),
+                    "status": TRACK_STATUS_IMPORTING,
+                    "state": "importing",
+                    "message": "正在导入",
+                }
+            if job.get("state") == "import_failed" and job.get("track_id"):
+                job["state"] = "importing"
+                job["stage"] = "导入曲库中"
+                job["error"] = ""
+                job["progress"] = 100
+                if keep_flac is not None:
+                    job["keep_flac"] = bool(keep_flac)
+                _opt_save(job)
+                _opt_import_enqueue(job_id)
+                return {
+                    "ok": True,
+                    "track_id": job.get("track_id"),
+                    "status": TRACK_STATUS_IMPORTING,
+                    "state": "importing",
+                    "message": "已重新开始导入",
+                }
+            if job.get("state") != "done":
+                raise HTTPException(status_code=409, detail="还没处理完成")
+            if job.get("track_id") and _opt_library_exists(job):
+                raise HTTPException(status_code=409, detail="已经导入过曲库了")
+            display = re.sub(r"[\r\n\t]+", " ", str(title or "").strip())[:200]
+            display = display or (Path(job.get("name") or "").stem + "（优化版）")[:200]
+            stored = unique_upload_name(".mp3")
+            fsize = int((job.get("outputs") or {}).get("mp3") or 0)
+            if want_status not in (TRACK_STATUS_APPROVED, TRACK_STATUS_PENDING):
+                want_status = TRACK_STATUS_APPROVED if (user and user.is_admin) else TRACK_STATUS_PENDING
+            if keep_flac is None:
+                keep_flac = bool(user and user.is_admin)
+            keep_flac = bool(keep_flac)
+            track = Track(
+                title=display, filename=stored, original_name=(display + ".mp3")[:255],
+                uploader_id=(user.id if user else None),
+                status=TRACK_STATUS_IMPORTING, pack_name=None, content_hash=None, file_size=fsize or None,
+            )
+            assign_track_duration(track, job.get("duration"))
+            if keep_flac and ((job.get("r2") or {}).get("flac") or (_opt_job_dir(job_id) / "optimized.flac").is_file()):
+                flac_size = int((job.get("outputs") or {}).get("flac") or 0) or None
+                track.flac_size = flac_size
+                track.flac_pinned = False
+                track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.add(track)
+            try:
+                db.commit()
+                db.refresh(track)
+            except Exception:
+                db.rollback()
+                raise
+            job["state"] = "importing"
+            job["stage"] = "导入曲库中"
+            job["progress"] = 100
+            job["error"] = ""
+            job["track_id"] = track.id
+            job["track_status"] = TRACK_STATUS_IMPORTING
+            job["imported_format"] = "mp3"
+            job["keep_flac"] = keep_flac
+            job["import_status"] = want_status
+            _opt_save(job)
+            _opt_import_enqueue(job_id)
+            return {
+                "ok": True,
+                "track_id": track.id,
+                "status": TRACK_STATUS_IMPORTING,
+                "state": "importing",
+                "message": "已开始导入曲库",
+            }
+    finally:
+        db.close()
+
+
+def _opt_maybe_auto_import(job_id: str) -> None:
+    """If this optimize job was queued by auto-collect, import it as an admin-published track."""
+    job = _opt_load(job_id) or {}
+    if not job.get("auto_import"):
+        return
+    if job.get("state") == "importing":
+        return
+    if job.get("track_id") and _opt_library_exists(job):
+        return
+    if job.get("state") not in ("done", "import_failed"):
+        return
+    user_id = int(job.get("user_id") or 0)
+    try:
+        result = _opt_start_library_import(
+            job_id,
+            user_id=user_id,
+            title="",
+            keep_flac=True if job.get("keep_flac") is None else bool(job.get("keep_flac")),
+            want_status=TRACK_STATUS_APPROVED,
+        )
+        tid = (result or {}).get("track_id")
+        if tid:
+            try:
+                tga_done_mark(job.get("tg_chat_id"), job.get("tg_msg"), downloaded=True, job=job_id, track_id=tid)
+                tga_files_mark(job.get("tg_file_id"), job.get("tg_chat_id"), job.get("tg_msg"), job=job_id, track_id=tid)
+            except Exception as exc:  # noqa: BLE001
+                _tga_log("auto-import-mark", exc)
+    except HTTPException as exc:
+        logging.info("auto import skipped job=%s detail=%s", job_id, exc.detail)
+    except Exception:  # noqa: BLE001
+        logging.exception("auto import failed job=%s", job_id)
+
+
 @app.post("/dj/optimize/{job_id}/import")
 async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db)):
     """Create the track row immediately and return; R2 adopt/verify runs in the background."""
@@ -9624,83 +9770,13 @@ async def opt_import(job_id: str, request: Request, db: Session = Depends(get_db
         payload = await request.json()
     except Exception:  # noqa: BLE001
         payload = {}
-    with _opt_lock:
-        job = _opt_load(job_id)
-        if not job or not _opt_owner_ok(job, user):
-            raise HTTPException(status_code=404, detail="任务不存在或已过期")
-        if job.get("state") == "importing":
-            return {
-                "ok": True,
-                "track_id": job.get("track_id"),
-                "status": TRACK_STATUS_IMPORTING,
-                "state": "importing",
-                "message": "正在导入",
-            }
-        if job.get("state") == "import_failed" and job.get("track_id"):
-            job["state"] = "importing"
-            job["stage"] = "导入曲库中"
-            job["error"] = ""
-            job["progress"] = 100
-            keep = payload.get("keep_flac")
-            if keep is not None:
-                job["keep_flac"] = bool(keep)
-            _opt_save(job)
-            _opt_import_enqueue(job_id)
-            return {
-                "ok": True,
-                "track_id": job.get("track_id"),
-                "status": TRACK_STATUS_IMPORTING,
-                "state": "importing",
-                "message": "已重新开始导入",
-            }
-        if job.get("state") != "done":
-            raise HTTPException(status_code=409, detail="还没处理完成")
-        if job.get("track_id") and _opt_library_exists(job):
-            raise HTTPException(status_code=409, detail="已经导入过曲库了")
-        title = str(payload.get("title") or "").strip()
-        title = re.sub(r"[\r\n\t]+", " ", title)[:200] or (Path(job.get("name") or "").stem + "（优化版）")[:200]
-        stored = unique_upload_name(".mp3")
-        fsize = int((job.get("outputs") or {}).get("mp3") or 0)
-        want_status = TRACK_STATUS_APPROVED if user.is_admin else TRACK_STATUS_PENDING
-        keep_flac = payload.get("keep_flac")
-        if keep_flac is None:
-            keep_flac = bool(user.is_admin)
-        keep_flac = bool(keep_flac)
-        track = Track(
-            title=title, filename=stored, original_name=(title + ".mp3")[:255], uploader_id=user.id,
-            status=TRACK_STATUS_IMPORTING, pack_name=None, content_hash=None, file_size=fsize or None,
-        )
-        assign_track_duration(track, job.get("duration"))
-        if keep_flac and ((job.get("r2") or {}).get("flac") or (_opt_job_dir(job_id) / "optimized.flac").is_file()):
-            flac_size = int((job.get("outputs") or {}).get("flac") or 0) or None
-            track.flac_size = flac_size
-            track.flac_pinned = False
-            track.flac_added_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        db.add(track)
-        try:
-            db.commit()
-            db.refresh(track)
-        except Exception:
-            db.rollback()
-            raise
-        job["state"] = "importing"
-        job["stage"] = "导入曲库中"
-        job["progress"] = 100
-        job["error"] = ""
-        job["track_id"] = track.id
-        job["track_status"] = TRACK_STATUS_IMPORTING
-        job["imported_format"] = "mp3"
-        job["keep_flac"] = keep_flac
-        job["import_status"] = want_status
-        _opt_save(job)
-        _opt_import_enqueue(job_id)
-        return {
-            "ok": True,
-            "track_id": track.id,
-            "status": TRACK_STATUS_IMPORTING,
-            "state": "importing",
-            "message": "已开始导入曲库",
-        }
+    return _opt_start_library_import(
+        job_id,
+        user_id=user.id,
+        title=str(payload.get("title") or ""),
+        keep_flac=None if payload.get("keep_flac") is None else bool(payload.get("keep_flac")),
+        require_owner=user,
+    )
 
 
 @app.post("/dj/optimize/{job_id}/delete")
@@ -10421,6 +10497,7 @@ def tga_status(force: bool = False) -> dict:
         "recent": tga_recent_public(),
         "batch": q,
         "queue": q,
+        "auto": tga_auto_public(q),
     }
 
 
@@ -10768,7 +10845,13 @@ async def _tga_entity(cl, ref: str):
 TGA_RECENT_PATH = DATA_DIR / "tga_recent.json"
 TGA_DONE_PATH = DATA_DIR / "tga_done.json"
 TGA_RECENT_KEEP = 20
-TGA_DONE_KEEP = 5000
+TGA_DONE_KEEP = 20000
+TGA_FILES_PATH = DATA_DIR / "tga_files.json"
+TGA_FILES_KEEP = 20000
+TGA_AUTO_PATH = DATA_DIR / "tga_auto.json"
+TGA_AUTO_INTERVAL_DEFAULT = 60
+TGA_AUTO_INTERVAL_MIN = 10
+TGA_AUTO_INTERVAL_MAX = 24 * 60
 
 
 def _tga_json_load(path: Path, default):
@@ -10845,6 +10928,45 @@ def tga_done_mark(chat_id, msg_id, **fields) -> None:
             for old in sorted(done, key=lambda x: float((done[x] or {}).get("ts") or 0))[: len(done) - TGA_DONE_KEEP]:
                 done.pop(old, None)
         _tga_write_private(TGA_DONE_PATH, json.dumps(done).encode("utf-8"))
+
+
+def tga_files_load() -> dict:
+    data = _tga_json_load(TGA_FILES_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+
+def tga_files_mark(file_id, chat_id, msg_id, **fields) -> None:
+    fid = str(file_id or "").strip()
+    if not fid:
+        return
+    with _tga_lock:
+        data = tga_files_load()
+        cur = data.get(fid) if isinstance(data.get(fid), dict) else {}
+        try:
+            if chat_id:
+                cur["chat_id"] = int(chat_id)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if msg_id:
+                cur["msg_id"] = int(msg_id)
+        except (TypeError, ValueError):
+            pass
+        cur.update(fields)
+        cur["ts"] = time.time()
+        data[fid] = cur
+        if len(data) > TGA_FILES_KEEP:
+            for old in sorted(data, key=lambda x: float((data[x] or {}).get("ts") or 0))[: len(data) - TGA_FILES_KEEP]:
+                data.pop(old, None)
+        _tga_write_private(TGA_FILES_PATH, json.dumps(data).encode("utf-8"))
+
+
+def tga_file_seen(file_id) -> bool:
+    fid = str(file_id or "").strip()
+    if not fid:
+        return False
+    rec = tga_files_load().get(fid)
+    return bool(isinstance(rec, dict) and (rec.get("track_id") or rec.get("job") or rec.get("downloaded")))
 
 
 def _tga_id_aliases(cid) -> set:
@@ -10954,9 +11076,17 @@ def _tga_audio_item(msg) -> Optional[dict]:
         return None
     title = f.title or (Path(name).stem if name else "") or f"音频 {msg.id}"
     d = msg.date.astimezone(TZ_CN).strftime("%Y-%m-%d %H:%M") if msg.date else ""
+    file_id = ""
+    doc = getattr(msg, "document", None)
+    try:
+        if doc is not None and getattr(doc, "id", None) is not None:
+            file_id = str(int(doc.id))
+    except (TypeError, ValueError):
+        file_id = str(getattr(doc, "id", "") or "")
     return {
         "id": msg.id, "title": title, "performer": f.performer or "", "duration": f.duration or 0,
         "size": f.size or 0, "date": d, "name": name, "ext": ext, "mime": mime,
+        "file_id": file_id,
         "ok": ext in OPT_EXTS and 0 < (f.size or 0) <= OPT_MAX_BYTES_ADMIN,
     }
 
@@ -11136,7 +11266,9 @@ async def _tga_download_async(job_id: str, ref: str, msg_id: int) -> None:
         dl["state"] = "done"
         try:
             j2 = _opt_load(job_id) or {}
-            tga_done_mark(j2.get("tg_chat_id"), j2.get("tg_msg"), downloaded=True, job=job_id)
+            tga_done_mark(j2.get("tg_chat_id"), j2.get("tg_msg"), downloaded=True, job=job_id,
+                          file_id=j2.get("tg_file_id") or "")
+            tga_files_mark(j2.get("tg_file_id"), j2.get("tg_chat_id"), j2.get("tg_msg"), downloaded=True, job=job_id)
         except Exception as exc:  # noqa: BLE001
             _tga_log("mark", exc)
     except Exception as exc:  # noqa: BLE001
@@ -11203,6 +11335,7 @@ def _tga_q_dict(item: "TgAudioQueueItem") -> dict:
         "status": item.status or "queued",
         "error": item.error or "",
         "retries": int(item.retries or 0),
+        "auto_import": bool(getattr(item, "auto_import", False)),
     }
 
 
@@ -11249,6 +11382,11 @@ def _tga_q_enrich(it: dict) -> dict:
         _tga_q_update(int(it["id"]), status=new_status, error=error, progress=progress,
                       received=int(it["received"] or 0), size=int(it["size"] or 0),
                       name=it.get("name") or "")
+    if new_status == "done" and it.get("auto_import") and jid:
+        try:
+            _opt_maybe_auto_import(str(jid))
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("auto-import-enrich", exc)
     return it
 
 
@@ -11353,7 +11491,7 @@ async def _tga_throttle_async(wait_flood: bool = False) -> None:
         await asyncio.sleep(gap)
 
 
-async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str) -> tuple:
+async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str, auto_import: bool = False) -> tuple:
     """Create the optimize job and fill the download slot. Must run on the Telethon loop."""
     from telethon import errors
     cl = await _tga_client_async()
@@ -11384,6 +11522,9 @@ async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str) -> 
         "source": "telegram", "size": item["size"], "received": 0, "state": "downloading",
         "stage": "从 Telegram 下载中", "progress": 0, "target": target, "created": time.time(),
         "tg_chat": chat.get("title"), "tg_msg": msg_id, "tg_chat_id": int(chat["key"][3:]),
+        "tg_file_id": item.get("file_id") or "",
+        "auto_import": bool(auto_import),
+        "keep_flac": True if auto_import else None,
     }
     with _opt_lock:
         _opt_save(job)
@@ -11451,7 +11592,7 @@ async def _tga_q_run_item(nxt: dict) -> None:
         while True:
             try:
                 await _tga_throttle_async(wait_flood=True)
-                job_id, name, size = await _tga_prepare_job(user_id, ref, msg_id, target)
+                job_id, name, size = await _tga_prepare_job(user_id, ref, msg_id, target, bool(nxt.get("auto_import")))
                 await asyncio.to_thread(
                     _tga_q_update, item_id, job_id=job_id, name=name, size=size, status="downloading", error=""
                 )
@@ -11463,6 +11604,8 @@ async def _tga_q_run_item(nxt: dict) -> None:
                     return
                 if js == "done":
                     await asyncio.to_thread(_tga_q_update, item_id, status="done", progress=100, error="", name=name, size=size)
+                    if nxt.get("auto_import"):
+                        await asyncio.to_thread(_opt_maybe_auto_import, job_id)
                     return
                 last_err = job.get("error") or ((_tga.get("download") or {}).get("error")) or "下载失败"
                 if not _tga_q_retryable(last_err):
@@ -11516,11 +11659,14 @@ async def _tga_q_run_item(nxt: dict) -> None:
                     _tga["download"]["active"] = False
 
 
-def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
+def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str, *,
+                 auto_import: bool = False, raise_if_empty: bool = True, limit: int = 200,
+                 chat_id: Optional[int] = None, chat_title: str = "") -> dict:
     """Append items to the persistent queue and start the worker if needed. Never rejects for a daily cap."""
     parsed = []
     seen: set[int] = set()
-    for raw in (raw_items or [])[:200]:
+    cap = max(1, min(int(limit or 200), 2000))
+    for raw in (raw_items or [])[:cap]:
         if not isinstance(raw, dict):
             continue
         try:
@@ -11534,38 +11680,39 @@ def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
             "msg_id": mid,
             "force": bool(raw.get("force")),
             "title": str(raw.get("title") or "")[:200],
+            "file_id": str(raw.get("file_id") or "").strip(),
         })
     if not parsed:
-        raise HTTPException(status_code=400, detail="请先勾选要下载的音频")
+        if raise_if_empty:
+            raise HTTPException(status_code=400, detail="请先勾选要下载的音频")
+        return {
+            "queued": 0, "skipped": 0, "already": 0, "capped": 0, "message": "没有可加入队列的条目",
+        }
 
     def _marks():
         try:
             tga_sync_marks_from_jobs()
         except Exception as exc:  # noqa: BLE001
             _tga_log("sync-marks", exc)
-        chat_id = None
-        chat_title = ""
-        if ref.startswith("id:"):
+        known_id, known_title = chat_id, chat_title
+        if known_id is None and ref.startswith("id:"):
             try:
-                chat_id = int(ref[3:])
+                known_id = int(ref[3:])
             except ValueError:
-                chat_id = None
-        if chat_id is None:
+                known_id = None
+        if known_id is None:
             async def resolve():
                 cl = await _tga_client_async()
                 ent = await _tga_entity(cl, ref)
                 pub = _tga_chat_public(ent)
                 return int(ent.id), pub.get("title") or ""
             _tga_throttle()
-            chat_id, chat_title = _tga_run(resolve(), 40)
-        else:
-            try:
-                rec = [r for r in tga_recent_load() if int(r.get("id") or 0) == chat_id]
-                if rec:
-                    chat_title = rec[0].get("title") or ""
-            except Exception:  # noqa: BLE001
-                pass
-        return tga_done_map(chat_id), chat_id, chat_title
+            known_id, known_title = _tga_run(resolve(), 40)
+        elif not known_title:
+            rec = next((r for r in tga_recent_load() if r.get("key") == f"id:{known_id}"), None)
+            if rec:
+                known_title = rec.get("title") or ""
+        return tga_done_map(known_id), known_id, known_title or ""
 
     done_map, chat_id, chat_title = _marks()
     skipped, already, queued_n, revived_n = [], [], 0, 0
@@ -11587,7 +11734,8 @@ def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
         for it in parsed:
             mark = done_map.get(it["msg_id"]) or {}
             was_done = bool(mark.get("downloaded") or mark.get("track_id"))
-            if was_done and not it["force"]:
+            file_dup = bool(it.get("file_id") and tga_file_seen(it["file_id"]) and not it["force"])
+            if (was_done or file_dup) and not it["force"]:
                 skipped.append(it)
                 continue
             existing = by_msg.get(it["msg_id"])
@@ -11604,6 +11752,7 @@ def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
                 existing.user_id = user_id
                 existing.chat_ref = ref
                 existing.title = it["title"] or existing.title
+                existing.auto_import = bool(auto_import) or bool(getattr(existing, "auto_import", False))
                 existing.updated_at = now
                 revived_n += 1
                 queued_n += 1
@@ -11612,6 +11761,7 @@ def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
                 chat_ref=ref, chat_id=chat_id, chat_title=chat_title or "",
                 msg_id=it["msg_id"], title=it["title"], name=it["title"],
                 force=bool(it["force"]), target=target, user_id=user_id,
+                auto_import=bool(auto_import),
                 status="queued", error="", created_at=now, updated_at=now,
             ))
             queued_n += 1
@@ -11627,7 +11777,17 @@ def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str) -> dict:
         parts.append(f"跳过 {len(skipped)} 首已下载/已导入（如需重新下载请单独勾选）")
     message = "；".join(parts) + "。" if parts else ""
     if not queued_n:
-        raise HTTPException(status_code=400, detail=message or "没有可加入队列的条目")
+        if raise_if_empty:
+            raise HTTPException(status_code=400, detail=message or "没有可加入队列的条目")
+        status = tga_status()
+        return {
+            "queued": 0,
+            "skipped": len(skipped),
+            "already": len(already),
+            "capped": 0,
+            "message": message or "没有可加入队列的条目",
+            **status,
+        }
     _tga_queue_kick()
     status = tga_status()
     return {
@@ -11724,6 +11884,615 @@ async def tga_queue_clear_ep(request: Request, db: Session = Depends(get_db)):
     return {"ok": True, "removed": n, "message": msg, **tga_status()}
 
 
+def _tga_fmt_myt(ts: float) -> str:
+    try:
+        ts = float(ts or 0)
+    except (TypeError, ValueError):
+        ts = 0
+    if ts <= 0:
+        return ""
+    return datetime.fromtimestamp(ts, timezone.utc).astimezone(TZ_CN).strftime("%Y-%m-%d %H:%M:%S") + " MYT"
+
+
+def _tga_default_admin_id() -> int:
+    db = SessionLocal()
+    try:
+        user = db.scalar(select(User).where(User.is_admin.is_(True)).order_by(User.id.asc()))
+        return int(user.id) if user else 0
+    except Exception:  # noqa: BLE001
+        return 0
+    finally:
+        db.close()
+
+
+def _tga_auto_default() -> dict:
+    return {
+        "interval_minutes": TGA_AUTO_INTERVAL_DEFAULT,
+        "last_check": 0.0,
+        "last_result": "",
+        "last_error": "",
+        "checking": False,
+        "admin_user_id": 0,
+        "channels": [],
+    }
+
+
+def tga_auto_load() -> dict:
+    raw = _tga_json_load(TGA_AUTO_PATH, {})
+    st = _tga_auto_default()
+    if not isinstance(raw, dict):
+        return st
+    try:
+        mins = int(raw.get("interval_minutes") or TGA_AUTO_INTERVAL_DEFAULT)
+    except (TypeError, ValueError):
+        mins = TGA_AUTO_INTERVAL_DEFAULT
+    st["interval_minutes"] = max(TGA_AUTO_INTERVAL_MIN, min(TGA_AUTO_INTERVAL_MAX, mins))
+    try:
+        st["last_check"] = float(raw.get("last_check") or 0)
+    except (TypeError, ValueError):
+        st["last_check"] = 0.0
+    st["last_result"] = str(raw.get("last_result") or "")[:400]
+    st["last_error"] = str(raw.get("last_error") or "")[:400]
+    st["checking"] = bool(raw.get("checking"))
+    try:
+        st["admin_user_id"] = int(raw.get("admin_user_id") or 0)
+    except (TypeError, ValueError):
+        st["admin_user_id"] = 0
+    channels = []
+    for ch in raw.get("channels") or []:
+        if not isinstance(ch, dict) or not ch.get("key"):
+            continue
+        try:
+            last_seen = int(ch.get("last_seen_id") or 0)
+        except (TypeError, ValueError):
+            last_seen = 0
+        try:
+            offset = int(ch.get("backfill_offset") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            last_chk = float(ch.get("last_check") or 0)
+        except (TypeError, ValueError):
+            last_chk = 0.0
+        channels.append({
+            "key": str(ch.get("key") or ""),
+            "ref": str(ch.get("ref") or ch.get("key") or ""),
+            "title": str(ch.get("title") or "")[:200],
+            "username": str(ch.get("username") or ""),
+            "enabled": bool(ch.get("enabled", True)),
+            "backfill_done": bool(ch.get("backfill_done")),
+            "backfill_offset": max(0, offset),
+            "last_seen_id": max(0, last_seen),
+            "last_check": last_chk,
+            "last_result": str(ch.get("last_result") or "")[:400],
+            "last_error": str(ch.get("last_error") or "")[:400],
+            "added": float(ch.get("added") or 0) if ch.get("added") else 0.0,
+            "user_id": int(ch.get("user_id") or 0) if ch.get("user_id") else 0,
+        })
+    st["channels"] = channels
+    return st
+
+
+def tga_auto_save(st: dict) -> None:
+    out = {
+        "interval_minutes": int(st.get("interval_minutes") or TGA_AUTO_INTERVAL_DEFAULT),
+        "last_check": float(st.get("last_check") or 0),
+        "last_result": str(st.get("last_result") or "")[:400],
+        "last_error": str(st.get("last_error") or "")[:400],
+        "checking": bool(st.get("checking")),
+        "admin_user_id": int(st.get("admin_user_id") or 0),
+        "channels": st.get("channels") or [],
+    }
+    _tga_write_private(TGA_AUTO_PATH, json.dumps(out, ensure_ascii=False).encode("utf-8"))
+
+
+def tga_auto_public(queue: Optional[dict] = None) -> dict:
+    st = tga_auto_load()
+    interval = int(st["interval_minutes"])
+    last = float(st.get("last_check") or 0)
+    next_ts = (last + interval * 60) if last else 0
+    q = queue or _tga_queue_public()
+    counts = q.get("counts") or {}
+    channels = []
+    for ch in st.get("channels") or []:
+        channels.append({
+            "key": ch["key"],
+            "ref": ch.get("ref") or "",
+            "title": ch.get("title") or "",
+            "username": ch.get("username") or "",
+            "enabled": bool(ch.get("enabled")),
+            "backfill_done": bool(ch.get("backfill_done")),
+            "last_seen_id": int(ch.get("last_seen_id") or 0),
+            "last_check": _tga_fmt_myt(ch.get("last_check") or 0),
+            "last_result": ch.get("last_result") or "",
+            "last_error": ch.get("last_error") or "",
+        })
+    return {
+        "interval_minutes": interval,
+        "interval_min": TGA_AUTO_INTERVAL_MIN,
+        "interval_max": TGA_AUTO_INTERVAL_MAX,
+        "checking": bool(st.get("checking")) or bool(_tga.get("auto_running")),
+        "last_check": _tga_fmt_myt(last),
+        "next_check": _tga_fmt_myt(next_ts),
+        "last_result": st.get("last_result") or "",
+        "last_error": st.get("last_error") or "",
+        "queue": {
+            "queued": int(counts.get("queued") or 0),
+            "downloading": int(counts.get("downloading") or 0),
+            "optimizing": int(counts.get("optimizing") or 0),
+            "failed": int(counts.get("failed") or 0),
+        },
+        "channels": channels,
+    }
+
+
+def tga_auto_set_interval(minutes: int) -> dict:
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="请输入检测间隔（分钟）")
+    if minutes < TGA_AUTO_INTERVAL_MIN or minutes > TGA_AUTO_INTERVAL_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"检测间隔需在 {TGA_AUTO_INTERVAL_MIN}–{TGA_AUTO_INTERVAL_MAX} 分钟之间",
+        )
+    with _tga_lock:
+        st = tga_auto_load()
+        st["interval_minutes"] = minutes
+        tga_auto_save(st)
+    tga_auto_wake()
+    return tga_auto_public()
+
+
+def tga_auto_wake() -> None:
+    ev = _tga.get("auto_wake")
+    if ev is not None:
+        ev.set()
+
+
+def _tga_auto_update_channel(key: str, **fields) -> None:
+    with _tga_lock:
+        st = tga_auto_load()
+        for ch in st.get("channels") or []:
+            if ch.get("key") == key:
+                ch.update(fields)
+                break
+        tga_auto_save(st)
+
+
+def tga_auto_add_channel(ref_raw: str, user_id: int) -> dict:
+    ref = _tga_chat_ref(ref_raw)
+    _tga_need_login()
+    _tga_throttle()
+
+    async def resolve():
+        cl = await _tga_client_async()
+        ent = await _tga_entity(cl, ref)
+        return ent, _tga_chat_public(ent)
+
+    ent, pub = _tga_run(resolve(), 40)
+    key = pub["key"]
+    open_ref = ("@" + pub["username"]) if pub.get("username") else key
+    now = time.time()
+    with _tga_lock:
+        st = tga_auto_load()
+        st["admin_user_id"] = int(user_id or st.get("admin_user_id") or 0)
+        existing = next((c for c in st["channels"] if c.get("key") == key), None)
+        if existing:
+            existing["ref"] = open_ref
+            existing["title"] = pub.get("title") or existing.get("title") or ""
+            existing["username"] = pub.get("username") or existing.get("username") or ""
+            existing["enabled"] = True
+            existing["user_id"] = int(user_id or existing.get("user_id") or 0)
+            # Re-adding an already-enrolled channel just resumes / enables it; do not reset last_seen.
+            created = False
+        else:
+            st["channels"].append({
+                "key": key,
+                "ref": open_ref,
+                "title": pub.get("title") or "",
+                "username": pub.get("username") or "",
+                "enabled": True,
+                "backfill_done": False,
+                "backfill_offset": 0,
+                "last_seen_id": 0,
+                "last_check": 0.0,
+                "last_result": "已加入，正在采集全部音频",
+                "last_error": "",
+                "added": now,
+                "user_id": int(user_id or 0),
+            })
+            created = True
+        tga_auto_save(st)
+    try:
+        tga_recent_record(ent, None)
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("auto-recent", exc)
+    tga_auto_kick(reason="add" if created else "enable")
+    return {
+        "ok": True,
+        "created": created,
+        "message": "已加入自动采集，正在后台采集该频道全部尚未导入的音频。" if created else "该频道已在自动采集列表中，已重新启用。",
+        "auto": tga_auto_public(),
+    }
+
+
+def tga_auto_edit_channel(key: str, action: str, user_id: int = 0) -> dict:
+    if not re.fullmatch(r"id:\d{1,20}", key or "") or action not in ("enable", "pause", "remove", "check"):
+        raise HTTPException(status_code=400, detail="参数错误")
+    with _tga_lock:
+        st = tga_auto_load()
+        ch = next((c for c in st["channels"] if c.get("key") == key), None)
+        if not ch:
+            raise HTTPException(status_code=404, detail="频道不在自动采集列表中")
+        if action == "remove":
+            st["channels"] = [c for c in st["channels"] if c.get("key") != key]
+            tga_auto_save(st)
+            return {"ok": True, "message": "已从自动采集列表移除。", "auto": tga_auto_public()}
+        if action == "enable":
+            ch["enabled"] = True
+            ch["last_error"] = ""
+            msg = "已启用自动采集。"
+        elif action == "pause":
+            ch["enabled"] = False
+            msg = "已暂停该频道的自动采集。"
+        else:
+            if not ch.get("enabled"):
+                ch["enabled"] = True
+            if user_id:
+                ch["user_id"] = int(user_id)
+            msg = "已开始检查该频道。"
+        tga_auto_save(st)
+    if action in ("enable", "check"):
+        tga_auto_kick(reason="check", only_key=key)
+    return {"ok": True, "message": msg, "auto": tga_auto_public()}
+
+
+def tga_auto_kick(reason: str = "now", only_key: Optional[str] = None) -> None:
+    with _tga_lock:
+        _tga["auto_reason"] = reason
+        if only_key:
+            _tga["auto_only_key"] = only_key
+        else:
+            _tga.pop("auto_only_key", None)
+    tga_auto_wake()
+
+
+def _tga_is_flood_exc(exc: BaseException) -> int:
+    """Return wait seconds if this looks like a Telegram flood-wait error, else 0."""
+    name = type(exc).__name__
+    secs = int(getattr(exc, "seconds", 0) or 0)
+    if secs > 0 and ("Flood" in name or name.endswith("WaitError")):
+        return secs
+    if isinstance(exc, HTTPException) and "限流" in str(exc.detail):
+        m = re.search(r"(\d+)\s*秒", str(exc.detail))
+        return int(m.group(1)) if m else max(1, int(_tga.get("flood_until") - time.time()))
+    return 0
+
+
+async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
+    """Collect new (or all, if backfill not done) audio from one channel and enqueue it."""
+    from telethon import errors
+    from telethon.tl.types import InputMessagesFilterMusic
+
+    ref = ch.get("ref") or ch.get("key") or ""
+    full = not bool(ch.get("backfill_done"))
+    last_seen = int(ch.get("last_seen_id") or 0)
+    offset_id = int(ch.get("backfill_offset") or 0) if full else 0
+    cl = await _tga_client_async()
+    ent = await _tga_entity(cl, ref)
+    pub = _tga_chat_public(ent)
+    open_ref = ("@" + pub["username"]) if pub.get("username") else pub["key"]
+    try:
+        tga_sync_marks_from_jobs()
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("auto-sync-marks", exc)
+    done = tga_done_map(ent.id)
+    max_seen = last_seen
+    queued_total = skipped = found = 0
+    pending: list[dict] = []
+    pages = 0
+    backfill_done = bool(ch.get("backfill_done"))
+    last_err = ""
+
+    def flush():
+        nonlocal pending, queued_total, skipped, last_err
+        if not pending:
+            return
+        batch = pending
+        pending = []
+        try:
+            result = _tga_enqueue(
+                user_id, pub["key"], batch, OPT_DEFAULT_TARGET,
+                auto_import=True, raise_if_empty=False, limit=len(batch),
+                chat_id=int(ent.id), chat_title=pub.get("title") or "",
+            )
+            queued_total += int(result.get("queued") or 0)
+            skipped += int(result.get("skipped") or 0) + int(result.get("already") or 0)
+        except HTTPException as exc:
+            last = str(exc.detail)
+            logging.info("auto enqueue issue chat=%s detail=%s", pub["key"], last)
+            if "限流" in last:
+                raise
+            last_err = last[:300]
+            pending = batch + pending
+
+    while True:
+        await _tga_throttle_async(wait_flood=True)
+        try:
+            msgs = await cl.get_messages(ent, limit=TGA_PAGE, offset_id=offset_id, filter=InputMessagesFilterMusic)
+        except errors.FloodWaitError as exc:
+            secs = int(exc.seconds or 0) or 30
+            _tga["flood_until"] = time.time() + secs
+            await asyncio.sleep(secs + 1)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            secs = _tga_is_flood_exc(exc)
+            if secs:
+                _tga["flood_until"] = time.time() + secs
+                await asyncio.sleep(secs + 1)
+                continue
+            if isinstance(exc, (errors.ChannelPrivateError, errors.ChatAdminRequiredError)):
+                raise HTTPException(status_code=403, detail="该账号无权读取这个频道（私有频道需先加入）")
+            if isinstance(exc, errors.RPCError):
+                _tga_log("auto-list", exc)
+                raise HTTPException(status_code=400, detail=f"读取失败（{type(exc).__name__}）")
+            raise
+        pages += 1
+        if not msgs:
+            if full:
+                backfill_done = True
+            break
+        stop = False
+        for msg in msgs:
+            try:
+                mid = int(msg.id)
+            except (TypeError, ValueError):
+                continue
+            if mid > max_seen:
+                max_seen = mid
+            if not full and last_seen and mid <= last_seen:
+                stop = True
+                break
+            item = _tga_audio_item(msg)
+            if not item:
+                continue
+            found += 1
+            mark = done.get(item["id"]) or {}
+            if mark.get("downloaded") or mark.get("track_id") or tga_file_seen(item.get("file_id")):
+                skipped += 1
+                continue
+            if not item.get("ok"):
+                skipped += 1
+                continue
+            pending.append({
+                "msg_id": item["id"],
+                "title": item.get("title") or "",
+                "file_id": item.get("file_id") or "",
+                "force": False,
+            })
+            if len(pending) >= 100:
+                flush()
+        if stop:
+            break
+        if not full and last_seen and msgs[-1].id <= last_seen:
+            break
+        if len(msgs) < TGA_PAGE:
+            if full:
+                backfill_done = True
+            break
+        offset_id = msgs[-1].id
+        _tga_auto_update_channel(
+            ch["key"],
+            ref=open_ref, title=pub.get("title") or ch.get("title") or "",
+            username=pub.get("username") or "",
+            backfill_offset=offset_id if full else ch.get("backfill_offset") or 0,
+            last_seen_id=max_seen,
+        )
+        if pages > 400:
+            last_err = "已达到单次翻页上限，将在下次继续"
+            break
+    flush()
+    if full and not last_err and pages and (len(msgs) if msgs else 0) < TGA_PAGE:
+        backfill_done = True
+    parts = []
+    if full and not backfill_done:
+        parts.append("历史采集进行中")
+    parts.append(f"扫描 {found} 首音频")
+    if queued_total:
+        parts.append(f"新加入 {queued_total} 首")
+    if skipped:
+        parts.append(f"跳过 {skipped} 首已导入或已在队列")
+    if last_err:
+        parts.append(last_err)
+    result = "，".join(parts) + "。" if parts else "没有发现新音频。"
+    final_seen = last_seen if (last_err and not full) else max_seen
+    _tga_auto_update_channel(
+        ch["key"],
+        ref=open_ref, title=pub.get("title") or ch.get("title") or "",
+        username=pub.get("username") or "",
+        backfill_done=backfill_done,
+        backfill_offset=0 if backfill_done else offset_id,
+        last_seen_id=final_seen,
+        last_check=time.time(),
+        last_result=result,
+        last_error=last_err,
+    )
+    return {"queued": queued_total, "skipped": skipped, "found": found, "result": result, "error": last_err}
+
+
+def _tga_auto_run_check(reason: str = "schedule", only_key: Optional[str] = None) -> dict:
+    if _tga.get("auto_running"):
+        return {"ok": False, "message": "正在检查中"}
+    _tga["auto_running"] = True
+    with _tga_lock:
+        st = tga_auto_load()
+        st["checking"] = True
+        tga_auto_save(st)
+    summary = {"ok": True, "queued": 0, "skipped": 0, "found": 0, "channels": 0, "errors": []}
+    try:
+        try:
+            _tga_need_login()
+        except HTTPException as exc:
+            with _tga_lock:
+                st = tga_auto_load()
+                st["checking"] = False
+                st["last_error"] = str(exc.detail)
+                st["last_result"] = "未检查：请先登录 Telegram 账号"
+                tga_auto_save(st)
+            summary["ok"] = False
+            summary["message"] = str(exc.detail)
+            return summary
+        st = tga_auto_load()
+        targets = []
+        for ch in st.get("channels") or []:
+            if only_key and ch.get("key") != only_key:
+                continue
+            if not ch.get("enabled"):
+                continue
+            targets.append(ch)
+        if not targets:
+            with _tga_lock:
+                st = tga_auto_load()
+                st["checking"] = False
+                st["last_check"] = time.time()
+                st["last_error"] = ""
+                st["last_result"] = "没有已启用的自动采集频道。"
+                tga_auto_save(st)
+            summary["message"] = "没有已启用的自动采集频道。"
+            return summary
+        admin_id = int(st.get("admin_user_id") or 0) or _tga_default_admin_id()
+        for ch in targets:
+            uid = int(ch.get("user_id") or 0) or admin_id
+            try:
+                info = _tga_run(_tga_auto_scan_channel(ch, uid), 1800)
+                summary["queued"] += int(info.get("queued") or 0)
+                summary["skipped"] += int(info.get("skipped") or 0)
+                summary["found"] += int(info.get("found") or 0)
+                summary["channels"] += 1
+                if info.get("error"):
+                    summary["errors"].append(f"{ch.get('title') or ch.get('key')}: {info['error']}")
+            except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, HTTPException):
+                    err = str(exc.detail)
+                else:
+                    _tga_log("auto-scan", exc)
+                    err = f"检查失败（{type(exc).__name__}）"
+                _tga_auto_update_channel(ch["key"], last_check=time.time(), last_error=err[:400])
+                summary["errors"].append(f"{ch.get('title') or ch.get('key')}: {err}")
+        parts = [f"已检查 {summary['channels']} 个频道"]
+        if summary["found"]:
+            parts.append(f"扫描到 {summary['found']} 首音频")
+        if summary["queued"]:
+            parts.append(f"新加入 {summary['queued']} 首到队列")
+        if summary["skipped"]:
+            parts.append(f"跳过 {summary['skipped']} 首")
+        if summary["errors"]:
+            parts.append("错误：" + "；".join(summary["errors"][:3]))
+        result = "，".join(parts) + "。"
+        with _tga_lock:
+            st = tga_auto_load()
+            st["checking"] = False
+            st["last_check"] = time.time()
+            st["last_result"] = result
+            st["last_error"] = "；".join(summary["errors"][:3])
+            tga_auto_save(st)
+        summary["message"] = result
+        return summary
+    finally:
+        _tga["auto_running"] = False
+        with _tga_lock:
+            st = tga_auto_load()
+            if st.get("checking"):
+                st["checking"] = False
+                tga_auto_save(st)
+
+
+def _tga_auto_scheduler() -> None:
+    ev = _tga.get("auto_wake")
+    # First pass after startup: clear a stale "checking" flag left by a crash.
+    with _tga_lock:
+        st = tga_auto_load()
+        if st.get("checking"):
+            st["checking"] = False
+            tga_auto_save(st)
+    while True:
+        st = tga_auto_load()
+        interval = max(TGA_AUTO_INTERVAL_MIN, int(st.get("interval_minutes") or TGA_AUTO_INTERVAL_DEFAULT)) * 60
+        last = float(st.get("last_check") or 0)
+        delay = max(0.0, last + interval - time.time()) if last else 8.0
+        if any(c.get("enabled") and not c.get("backfill_done") for c in (st.get("channels") or [])):
+            delay = min(delay, 10.0)
+        if ev is not None:
+            ev.wait(timeout=delay)
+            ev.clear()
+        reason = _tga.pop("auto_reason", None) or "schedule"
+        only_key = _tga.pop("auto_only_key", None)
+        try:
+            if tga_auto_load().get("channels"):
+                _tga_auto_run_check(reason=reason, only_key=only_key)
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("auto-scheduler", exc)
+
+
+def tga_auto_start() -> None:
+    with _tga_lock:
+        if _tga.get("auto_thread") is not None and _tga["auto_thread"].is_alive():
+            return
+        ev = threading.Event()
+        _tga["auto_wake"] = ev
+        th = threading.Thread(target=_tga_auto_scheduler, name="tga-auto", daemon=True)
+        _tga["auto_thread"] = th
+        th.start()
+
+
+@app.post("/admin/tg-audio/auto/interval")
+async def tga_auto_interval_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    user = _tga_admin(request, db)
+    data = await _tga_json(request)
+    with _tga_lock:
+        st = tga_auto_load()
+        st["admin_user_id"] = user.id
+        tga_auto_save(st)
+    auto = tga_auto_set_interval(data.get("interval_minutes"))
+    return {"ok": True, "message": f"已将检测间隔设为 {auto['interval_minutes']} 分钟。", "auto": auto}
+
+
+@app.post("/admin/tg-audio/auto/channels")
+async def tga_auto_add_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    user = _tga_admin(request, db)
+    data = await _tga_json(request)
+    await asyncio.to_thread(_tga_need_login)
+    result = await asyncio.to_thread(tga_auto_add_channel, str(data.get("chat") or data.get("ref") or ""), user.id)
+    return result
+
+
+@app.post("/admin/tg-audio/auto/channels/edit")
+async def tga_auto_edit_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    user = _tga_admin(request, db)
+    data = await _tga_json(request)
+    return tga_auto_edit_channel(str(data.get("key") or ""), str(data.get("action") or ""), user.id)
+
+
+@app.post("/admin/tg-audio/auto/check")
+async def tga_auto_check_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    user = _tga_admin(request, db)
+    with _tga_lock:
+        st = tga_auto_load()
+        st["admin_user_id"] = user.id
+        tga_auto_save(st)
+    if _tga.get("auto_running"):
+        return {"ok": True, "message": "正在检查中，请稍候。", "auto": tga_auto_public()}
+    tga_auto_kick(reason="now")
+    return {"ok": True, "message": "已开始检查已启用的频道。", "auto": tga_auto_public()}
+
+
+
+
 def tga_start() -> None:
     """Recover the persistent TG import queue after a restart and resume work."""
     for job in _opt_all_jobs():
@@ -11808,6 +12577,10 @@ def tga_start() -> None:
         pass
     if has_work:
         _tga_queue_kick()
+    try:
+        tga_auto_start()
+    except Exception:  # noqa: BLE001
+        logging.exception("tga auto collector failed to start")
 
 
 @app.get("/uploads/{filename}")

@@ -349,3 +349,31 @@ body[data-page="mixer"] { padding-bottom: 24px; }
 .tga-queue-list .tga-q-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tga-queue-list .tga-q-bar { grid-column: 1 / -1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 4px; }
 .tga-queue-list .tga-q-bar > i { display: block; height: 100%; width: 0; background: var(--cyan); border-radius: 4px; }
+
+.tga-auto { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid rgba(60, 239, 255, 0.28); border-radius: 12px; background: rgba(8, 18, 28, 0.45); }
+.tga-auto-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+.tga-auto-head h3 { margin: 0; font-size: 1rem; color: var(--cyan); }
+.tga-auto-status { margin: 0; font-size: 0.85rem; }
+.tga-auto-tip { margin: 0; font-size: 0.82rem; line-height: 1.55; }
+.tga-auto-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+.tga-auto-controls label { display: grid; gap: 4px; font-size: 0.85rem; color: var(--muted); }
+.tga-auto-controls input[type=number] {
+  width: 8rem; background: #120e1b; color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+}
+.tga-auto-counts { margin: 0; font-size: 0.88rem; color: var(--muted); }
+.tga-auto-counts b { color: var(--text); }
+.tga-auto-error { margin: 0; font-size: 0.85rem; color: #ff6b8b; }
+.tga-auto-error[hidden], .tga-auto-table[hidden] { display: none !important; }
+.tga-auto-table .tga-auto-title { display: grid; gap: 1px; min-width: 0; }
+.tga-auto-table .tga-auto-title b { font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tga-auto-table .tga-auto-title span { font-size: 0.76rem; color: var(--muted); }
+.tga-auto-table .tga-auto-result { max-width: 18rem; font-size: 0.8rem; color: var(--muted); }
+.tga-en { font-size: 0.8rem; color: var(--ok); }
+.tga-en.is-off { color: var(--gold); }
+.tga-auto-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.tga-list-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 6px; }
+.tga-list-head h3 { margin: 0; font-size: 1rem; flex: 1 1 auto; }
+@media (max-width: 640px) {
+  .tga-auto-controls { flex-direction: column; align-items: stretch; }
+  .tga-auto-table .tga-auto-result { max-width: 12rem; }
+}

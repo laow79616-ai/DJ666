@@ -116,9 +116,11 @@
       $("#tgaDlText").textContent = "✅ " + dl.name + " 已下载，正在下方「上传优化」中处理";
     } else box.hidden = true;
     paintBatch(st);
+    paintAuto(st);
     var batchBusy = batchIsBusy(st.queue || st.batch);
+    var autoBusy = !!(st.auto && st.auto.checking);
     clearTimeout(pollTimer);
-    if ((dl && dl.active) || batchBusy) pollTimer = setTimeout(load, 2000);
+    if ((dl && dl.active) || batchBusy || autoBusy) pollTimer = setTimeout(load, 2000);
   }
   function batchIsBusy(b) {
     if (!b) return false;
@@ -260,6 +262,58 @@
     Array.prototype.forEach.call(root.querySelectorAll("#tgaRows tr[data-msg-id]"), paintRowStatus);
     if (window.DJOpt && window.DJOpt.watch) {
       items.forEach(function (it) { if (it.job_id) window.DJOpt.watch(it.job_id); });
+    }
+  }
+  function paintAuto(st) {
+    var box = $("#tgaAuto");
+    if (!box) return;
+    var auto = (st && st.auto) || {};
+    var inp = $("#tgaAutoInterval");
+    if (inp && document.activeElement !== inp) {
+      inp.value = auto.interval_minutes || 60;
+      if (auto.interval_min) inp.min = auto.interval_min;
+      if (auto.interval_max) inp.max = auto.interval_max;
+    }
+    var status = $("#tgaAutoStatus");
+    if (status) {
+      if (auto.checking) status.textContent = "正在检查…";
+      else if (auto.last_check) {
+        status.textContent = "上次检查：" + auto.last_check + (auto.next_check ? " · 下次约 " + auto.next_check : "");
+      } else status.textContent = "尚未检查（默认每 " + (auto.interval_minutes || 60) + " 分钟）";
+    }
+    var counts = $("#tgaAutoCounts");
+    if (counts) {
+      var q = auto.queue || {};
+      var bits = [];
+      if (auto.last_result) bits.push(auto.last_result);
+      bits.push("队列：排队 " + (q.queued || 0) + " · 下载 " + (q.downloading || 0) + " · 优化 " + (q.optimizing || 0) + " · 失败 " + (q.failed || 0));
+      counts.innerHTML = bits.join(" · ");
+    }
+    var err = $("#tgaAutoError");
+    if (err) {
+      if (auto.last_error) { err.hidden = false; err.textContent = auto.last_error; }
+      else { err.hidden = true; err.textContent = ""; }
+    }
+    var rows = $("#tgaAutoRows");
+    var table = $("#tgaAutoTable");
+    var list = auto.channels || [];
+    if (table) table.hidden = !list.length;
+    if (rows) {
+      rows.innerHTML = list.map(function (ch) {
+        var name = esc(ch.title || ch.ref || ch.key);
+        var uname = ch.username ? ("@" + ch.username) : (ch.ref || ch.key);
+        var en = ch.enabled ? '<span class="tga-en">采集中</span>' : '<span class="tga-en is-off">已暂停</span>';
+        if (ch.enabled && !ch.backfill_done) en += ' <span class="muted">历史采集中</span>';
+        var acts = ch.enabled
+          ? '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="pause" data-key="' + esc(ch.key) + '">暂停</button>'
+          : '<button type="button" class="btn btn-sm" data-auto-act="enable" data-key="' + esc(ch.key) + '">启用</button>';
+        acts += '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="check" data-key="' + esc(ch.key) + '">立即检查</button>';
+        acts += '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="remove" data-key="' + esc(ch.key) + '">移除</button>';
+        return '<tr><td><div class="tga-auto-title"><b>' + name + "</b><span>" + esc(uname) + "</span></div></td>" +
+          "<td>" + en + "</td><td class=\"tga-num\">" + esc(ch.last_check || "—") + "</td>" +
+          '<td class="tga-auto-result">' + esc(ch.last_result || ch.last_error || "—") + "</td>" +
+          '<td><div class="tga-auto-acts">' + acts + "</div></td></tr>";
+      }).join("");
     }
   }
   function load(force) {
@@ -460,6 +514,50 @@
     $(sel).addEventListener("keydown", function (e) {
       if (e.key === "Enter") { e.preventDefault(); root.querySelector(sel === "#tgaChat" ? "[data-tga-open]" : "[data-tga-search]").click(); }
     });
+  });
+
+  function autoAction(btn, url, body, label) {
+    return act(btn, "POST", url, body, label).then(function (d) {
+      if (d && d.auto && lastStatus) { lastStatus.auto = d.auto; paintAuto(lastStatus); }
+      load();
+      return d;
+    }).catch(function () {});
+  }
+  var autoSave = $("#tgaAutoIntervalSave");
+  if (autoSave) autoSave.addEventListener("click", function () {
+    var mins = parseInt($("#tgaAutoInterval").value, 10);
+    autoAction(this, "/admin/tg-audio/auto/interval", { interval_minutes: mins }, "保存中…");
+  });
+  var autoNow = $("#tgaAutoCheckNow");
+  if (autoNow) autoNow.addEventListener("click", function () {
+    autoAction(this, "/admin/tg-audio/auto/check", {}, "开始检查…");
+  });
+  var autoAdd = $("#tgaAutoAdd");
+  if (autoAdd) autoAdd.addEventListener("click", function () {
+    var v = ($("#tgaAutoChat") && $("#tgaAutoChat").value.trim()) || ($("#tgaChat") && $("#tgaChat").value.trim()) || "";
+    if (!v) { say("请输入要自动采集的频道链接或 @用户名", "err"); return; }
+    autoAction(this, "/admin/tg-audio/auto/channels", { chat: v }, "添加中…").then(function () {
+      if ($("#tgaAutoChat")) $("#tgaAutoChat").value = "";
+    });
+  });
+  var autoChat = $("#tgaAutoChat");
+  if (autoChat) autoChat.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); if (autoAdd) autoAdd.click(); }
+  });
+  var autoCur = $("#tgaAutoAddCurrent");
+  if (autoCur) autoCur.addEventListener("click", function () {
+    var v = chatRef || ($("#tgaChat") && $("#tgaChat").value.trim()) || "";
+    if (!v) { say("请先打开一个频道", "err"); return; }
+    autoAction(this, "/admin/tg-audio/auto/channels", { chat: v }, "添加中…");
+  });
+  var autoRows = $("#tgaAutoRows");
+  if (autoRows) autoRows.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-auto-act]");
+    if (!btn) return;
+    var action = btn.getAttribute("data-auto-act");
+    var key = btn.getAttribute("data-key") || "";
+    if (action === "remove" && !confirm("从自动采集列表移除这个频道？已导入的曲目不会删除。")) return;
+    autoAction(btn, "/admin/tg-audio/auto/channels/edit", { key: key, action: action }, "处理中…");
   });
 
   load();
