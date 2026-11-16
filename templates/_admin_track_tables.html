@@ -17,7 +17,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+              <tr><th>标题</th><th>试听</th><th>收藏</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
             </thead>
             <tbody>
               {% for track in importing_tracks %}
@@ -26,6 +26,8 @@
                   <span>{{ track.title }}</span>
                   <span class="status-badge status-importing">导入中</span>
                 </td>
+                <td class="muted">{{ (track.play_count or 0)|stat_count }}</td>
+                <td class="muted">{{ (track.favorite_count or 0)|stat_count }}</td>
                 <td>{{ display_name(track.uploader, "未知") }}</td>
                 <td>{{ track.pack_name or "—" }}</td>
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
@@ -43,7 +45,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+              <tr><th>标题</th><th>试听</th><th>收藏</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
             </thead>
             <tbody>
               {% for track in pending_tracks %}
@@ -59,6 +61,8 @@
                     <button type="submit" class="btn btn-sm">保存</button>
                   </form>
                 </td>
+                <td class="muted">{{ (track.play_count or 0)|stat_count }}</td>
+                <td class="muted">{{ (track.favorite_count or 0)|stat_count }}</td>
                 <td>{{ display_name(track.uploader, "未知") }}</td>
                 <td>{{ track.pack_name or "—" }}</td>
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
@@ -94,7 +98,7 @@
                 </td>
               </tr>
               {% else %}
-              <tr><td colspan="6" class="muted">暂无待审核曲目。</td></tr>
+              <tr><td colspan="8" class="muted">暂无待审核曲目。</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -106,7 +110,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+              <tr><th>标题</th><th>试听</th><th>收藏</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
             </thead>
             <tbody>
               {% for track in published_tracks %}
@@ -122,6 +126,8 @@
                     <button type="submit" class="btn btn-sm">保存</button>
                   </form>
                 </td>
+                <td class="muted">{{ (track.play_count or 0)|stat_count }}</td>
+                <td class="muted">{{ (track.favorite_count or 0)|stat_count }}</td>
                 <td>{{ display_name(track.uploader, "未知") }}</td>
                 <td>{{ track.pack_name or "—" }}</td>
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>
@@ -149,7 +155,7 @@
                 </td>
               </tr>
               {% else %}
-              <tr><td colspan="6" class="muted">暂无已发布曲目。</td></tr>
+              <tr><td colspan="8" class="muted">暂无已发布曲目。</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -162,7 +168,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>标题</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
+              <tr><th>标题</th><th>试听</th><th>收藏</th><th>上传者</th><th>音乐包</th><th>分类</th><th>时间</th><th></th></tr>
             </thead>
             <tbody>
               {% for track in rejected_tracks %}
@@ -178,6 +184,8 @@
                     <button type="submit" class="btn btn-sm">保存</button>
                   </form>
                 </td>
+                <td class="muted">{{ (track.play_count or 0)|stat_count }}</td>
+                <td class="muted">{{ (track.favorite_count or 0)|stat_count }}</td>
                 <td>{{ display_name(track.uploader, "未知") }}</td>
                 <td>{{ track.pack_name or "—" }}</td>
                 <td class="track-cat-cell">{{ track_cat_select(track) }}</td>

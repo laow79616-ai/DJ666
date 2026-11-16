@@ -94,12 +94,16 @@
     $("#tgaCfgState").textContent = st.configured ? "api_id / api_hash：已配置 ✓" : "未配置 api_id / api_hash";
     $("#tgaCfgState").classList.toggle("is-ok", !!st.configured);
     if (!st.configured) { $("#tgaCfgBox").open = true; }
-    $("#tgaLogin").hidden = !st.configured || st.logged_in;
-    $("#tgaMain").hidden = !st.logged_in;
+    var pending = !!(st.login_stage);
+    var addPending = pending && (st.login_new || st.logged_in);
+    $("#tgaLogin").hidden = !st.configured || (st.logged_in && !pending) || addPending;
+    $("#tgaMain").hidden = !st.logged_in && !addPending;
     var accn = (st.accounts || []).length;
     badge.className = "tga-badge" + (st.logged_in ? " is-ok" : st.configured ? " is-warn" : "");
     badge.textContent = !st.configured ? "未配置 api_id / api_hash" : st.logged_in ? ("已登录 " + accn + " 个账号") : "未登录";
-    if (st.configured && !st.logged_in) step(st.login_stage || "phone");
+    if (st.configured && pending && !addPending) step(st.login_stage || "phone");
+    else if (st.configured && !st.logged_in && !pending) step("phone");
+    paintLoginStatus(st);
     paintAccounts(st);
     $("#tgaQuota").textContent = "今日已下载 " + (st.today || 0) + (st.flood_wait ? " · 有账号限流中，最长还需 " + st.flood_wait + " 秒（将自动换号或等待后继续）" : "");
     if (st.error) say(st.error, "err");
@@ -274,6 +278,22 @@
     if (a.username) bits.push("@" + a.username);
     return bits.join(" · ");
   }
+  function paintLoginStatus(st) {
+    var msg = st && (st.login_message || "");
+    var bits = [];
+    if (st && st.login_phone_mask) bits.push("号码 " + st.login_phone_mask);
+    if (msg) bits.push(msg);
+    if (st && st.login_expires && st.login_stage) bits.push("有效至 " + st.login_expires);
+    var text = bits.join(" · ");
+    Array.prototype.forEach.call(root.querySelectorAll("[data-tga-login-status]"), function (el) {
+      el.hidden = !text;
+      el.textContent = text;
+    });
+    var canSms = !!(st && st.login_can_sms);
+    Array.prototype.forEach.call(root.querySelectorAll("[data-tga-resend-sms], [data-tga-add-resend-sms]"), function (el) {
+      el.hidden = !canSms && !!(st && st.login_delivery === "sms");
+    });
+  }
   function paintAccounts(st) {
     var cur = st.current_account;
     var curEl = $("#tgaCurrentAcct");
@@ -335,7 +355,7 @@
       body.appendChild(tr);
     });
     var addBox = $("#tgaAcctAdd");
-    if (addBox && st.login_new && st.login_stage && st.logged_in) {
+    if (addBox && st.login_stage && (st.login_new || st.logged_in)) {
       addBox.hidden = false;
       addStep(st.login_stage);
     }
@@ -425,20 +445,33 @@
   });
   // login
   $("[data-tga-send]").addEventListener("click", function () {
-    var inp = root.querySelector("[data-step=phone] input[name=phone]");
-    act(this, "POST", "/admin/tg-audio/login/send-code", { phone: inp.value.trim() }, "发送中…").then(function () {
-      step("code"); var c = root.querySelector("[data-step=code] input"); c.value = ""; c.focus();
+    var inp = root.querySelector("#tgaLogin [data-step=phone] input[name=phone]");
+    act(this, "POST", "/admin/tg-audio/login/send-code", { phone: inp.value.trim() }, "发送中…").then(function (d) {
+      step(d.stage || "code"); var c = root.querySelector("#tgaLogin [data-step=code] input"); c.value = ""; c.focus();
     }).catch(function () {});
   });
   $("[data-tga-code]").addEventListener("click", function () {
-    var inp = root.querySelector("[data-step=code] input[name=code]");
-    act(this, "POST", "/admin/tg-audio/login/code", { code: inp.value.trim() }, "登录中…").then(function (d) {
+    var inp = root.querySelector("#tgaLogin [data-step=code] input[name=code]");
+    var code = (inp.value || "").trim();
+    if (!code) { say("请输入 Telegram 客户端里收到的验证码", "err"); return; }
+    act(this, "POST", "/admin/tg-audio/login/code", { code: code }, "登录中…").then(function (d) {
       inp.value = "";
-      root.querySelector("[data-step=phone] input").value = "";
-      if (d.stage === "password") { step("password"); root.querySelector("[data-step=password] input").focus(); }
+      if (d.stage === "password") { step("password"); root.querySelector("#tgaLogin [data-step=password] input").focus(); }
     }).catch(function () {});
   });
-  $("[data-tga-restart]").addEventListener("click", function () { step("phone"); });
+  $("[data-tga-resend]").addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/resend", {}, "重发中…").then(function (d) {
+      step(d.stage || "code");
+    }).catch(function () {});
+  });
+  $("[data-tga-resend-sms]").addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/resend", { sms: true }, "改发短信…").then(function (d) {
+      step(d.stage || "code");
+    }).catch(function () {});
+  });
+  $("[data-tga-restart]").addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/cancel", {}, "取消中…").then(function () { step("phone"); }).catch(function () { step("phone"); });
+  });
   $("[data-tga-pw]").addEventListener("click", function () {
     var inp = root.querySelector("[data-step=password] input[name=password]");
     var v = inp.value; inp.value = "";
@@ -659,26 +692,46 @@
     addStep("phone");
   });
   var addCancel = $("[data-tga-add-cancel]");
-  if (addCancel) addCancel.addEventListener("click", function () { var b = $("#tgaAcctAdd"); if (b) b.hidden = true; });
+  if (addCancel) addCancel.addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/cancel", {}, "取消中…").then(function () {
+      var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone");
+    }).catch(function () { var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone"); });
+  });
   var addRestart = $("[data-tga-add-restart]");
-  if (addRestart) addRestart.addEventListener("click", function () { addStep("phone"); });
+  if (addRestart) addRestart.addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/cancel", {}, "取消中…").then(function () { addStep("phone"); }).catch(function () { addStep("phone"); });
+  });
   var addSend = $("[data-tga-add-send]");
   if (addSend) addSend.addEventListener("click", function () {
     var form = $("#tgaAcctAdd").querySelector('[data-step="phone"]');
     var phone = form.querySelector("input[name=phone]").value.trim();
     var label = ($("#tgaAcctLabel") && $("#tgaAcctLabel").value.trim()) || "";
-    act(this, "POST", "/admin/tg-audio/login/send-code", { phone: phone, new: true, label: label }, "发送中…").then(function () {
-      addStep("code");
+    act(this, "POST", "/admin/tg-audio/login/send-code", { phone: phone, new: true, label: label }, "发送中…").then(function (d) {
+      addStep(d.stage || "code");
+      var c = $("#tgaAcctAdd").querySelector('[data-step="code"] input');
+      if (c) { c.value = ""; c.focus(); }
     });
   });
   var addCode = $("[data-tga-add-code]");
   if (addCode) addCode.addEventListener("click", function () {
     var form = $("#tgaAcctAdd").querySelector('[data-step="code"]');
     var code = form.querySelector("input[name=code]").value.trim();
+    if (!code) { say("请输入 Telegram 客户端里收到的验证码", "err"); return; }
     act(this, "POST", "/admin/tg-audio/login/code", { code: code, new: true }, "登录中…").then(function (d) {
-      if (d.stage === "password") addStep("password");
-      else { var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone"); }
+      if (d.stage === "password") {
+        addStep("password");
+        var pwin = $("#tgaAcctAdd").querySelector('[data-step="password"] input');
+        if (pwin) pwin.focus();
+      } else { var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone"); }
     });
+  });
+  var addResend = $("[data-tga-add-resend]");
+  if (addResend) addResend.addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/resend", {}, "重发中…").then(function (d) { addStep(d.stage || "code"); });
+  });
+  var addResendSms = $("[data-tga-add-resend-sms]");
+  if (addResendSms) addResendSms.addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/login/resend", { sms: true }, "改发短信…").then(function (d) { addStep(d.stage || "code"); });
   });
   var addPw = $("[data-tga-add-pw]");
   if (addPw) addPw.addEventListener("click", function () {

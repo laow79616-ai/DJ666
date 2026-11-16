@@ -58,11 +58,14 @@ a.admin-dj-entry {
   <div class="stat"><b>{{ ann_total if ann_total is defined else announcements|length }}</b><span>公告</span></div>
   <div class="stat"><b>{{ chat_count }}</b><span>聊天消息</span></div>
   <div class="stat"><b>{{ ann_comment_total }}</b><span>公告评论</span></div>
+  <div class="stat"><b id="anTodayUv">{{ analytics.today_unique if analytics is defined else 0 }}</b><span>今日访客</span></div>
+  <div class="stat"><b id="anTotalUv">{{ analytics.total_unique if analytics is defined else 0 }}</b><span>总访客</span></div>
 </section>
 
 <nav class="admin-tabs" id="adminTabs" role="tablist" aria-label="后台类目">
   <div class="admin-tabs-inner">
   <div class="admin-tabs-track">
+    <a class="admin-tab" role="tab" href="#stats" data-tab="stats" aria-controls="stats" aria-selected="false">数据统计</a>
     <a class="admin-tab" role="tab" href="#upload" data-tab="upload" aria-controls="upload" aria-selected="false">上传音乐</a>
     <a class="admin-tab" role="tab" href="#tracks" data-tab="tracks" aria-controls="tracks" aria-selected="false">曲目{% if pending_tracks %}<span class="tab-badge">{{ pending_tracks|length }}</span>{% endif %}</a>
     <a class="admin-tab" role="tab" href="#contact" data-tab="contact" aria-controls="contact" aria-selected="false">投稿联系人</a>
@@ -82,6 +85,86 @@ a.admin-dj-entry {
   </div>
 </nav>
 <div class="admin-panes" id="adminPanes">
+
+<section class="panel admin-pane" role="tabpanel" id="stats">
+  <div class="admin-pane-inner">
+    <div class="admin-pane-head">
+      <h2>数据统计</h2>
+      <p class="muted an-note">第一方统计，不计搜索引擎爬虫{% if analytics is defined and analytics.exclude_admin %}，也不计入管理员访问{% endif %}。播放与收藏均为真实数据，不会预填虚假数字。</p>
+    </div>
+    <div class="admin-pane-body" id="anDash" data-an-dash="1">
+      {% set a = analytics if analytics is defined else None %}
+      <div class="an-kpis">
+        <div class="an-kpi"><b id="anKpiToday">{{ a.today_unique if a else 0 }}</b><span>今日独立访客（{{ a.today if a else "" }} MYT）</span></div>
+        <div class="an-kpi"><b id="anKpiTotal">{{ a.total_unique if a else 0 }}</b><span>累计独立访客</span></div>
+        <div class="an-kpi"><b id="anKpiVisits">{{ a.today_visits if a else 0 }}</b><span>今日访问次数</span></div>
+        <div class="an-kpi"><b id="anKpiNew">{{ a.today_new_pct if a else 0 }}%</b><span>今日新访客 {{ a.today_new if a else 0 }} · 回访 {{ a.today_returning if a else 0 }}（{{ a.today_returning_pct if a else 0 }}%）</span></div>
+      </div>
+      <div class="an-grid">
+        <section class="an-card">
+          <div class="an-card-head">
+            <h3>访客趋势</h3>
+            <div class="an-toggle" role="group" aria-label="趋势区间">
+              <button type="button" class="btn btn-sm is-on" data-an-range="7">近 7 天</button>
+              <button type="button" class="btn btn-sm btn-ghost" data-an-range="30">近 30 天</button>
+            </div>
+          </div>
+          <div class="an-bars" id="anTrend" aria-label="每日独立访客"></div>
+          <p class="muted an-foot" id="anTrendFoot"></p>
+        </section>
+        <section class="an-card">
+          <h3>访问次数比率</h3>
+          <p class="muted an-foot">按独立访客的累计访问次数（30 分钟无操作算新一次访问）</p>
+          <ul class="an-bars-h" id="anFreq">
+            {% if a %}
+            {% for b in a.freq.buckets %}
+            <li><span>{{ b.label }}</span><i><b style="width:{{ b.pct }}%"></b></i><em>{{ b.count }}（{{ b.pct }}%）</em></li>
+            {% endfor %}
+            {% endif %}
+          </ul>
+        </section>
+        <section class="an-card">
+          <h3>停留时间</h3>
+          <p class="an-dwell"><b id="anDwellAvg">{{ a.dwell_avg if a else "0 秒" }}</b> 平均　·　<b id="anDwellMed">{{ a.dwell_median if a else "0 秒" }}</b> 中位数</p>
+          <p class="muted an-foot" id="anDwellFoot">统计近 30 天、停留不少于 3 秒的会话（样本 <span id="anDwellN">{{ a.dwell_sample if a else 0 }}</span>）</p>
+        </section>
+        <section class="an-card">
+          <h3>分享平台比率</h3>
+          <p class="muted an-foot">按钮点击（曲目/播放器分享）</p>
+          <ul class="an-bars-h" id="anShareClicks"></ul>
+          <p class="muted an-foot">来路 / UTM 归因</p>
+          <ul class="an-bars-h" id="anShareIn"></ul>
+        </section>
+      </div>
+      <section class="an-card an-sessions">
+        <h3>最近会话停留</h3>
+        <p class="muted an-foot">登录用户显示用户名；未登录显示访客编号。</p>
+        <div class="table-wrap">
+          <table class="an-table" id="anSessTable">
+            <thead><tr><th>访客</th><th>停留</th><th>开始（MYT）</th><th>最近活动</th><th>落地页</th><th>来路</th></tr></thead>
+            <tbody>
+              {% if a and a.sessions %}
+              {% for s in a.sessions %}
+              <tr>
+                <td>{{ s.who }}</td>
+                <td>{{ s.dwell }}</td>
+                <td>{{ s.started }}</td>
+                <td>{{ s.last }}</td>
+                <td class="muted">{{ s.landing }}</td>
+                <td class="muted">{{ s.referrer }}</td>
+              </tr>
+              {% endfor %}
+              {% else %}
+              <tr><td colspan="6" class="muted">还没有会话数据。统计从本次上线开始记录真实访问。</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
 
 <section class="panel admin-pane" role="tabpanel" id="upload">
   <div class="admin-pane-inner">
@@ -1068,14 +1151,18 @@ a.admin-dj-entry {
 
         <div class="tga-box" id="tgaLogin" hidden>
           <h3>登录 Telegram 账号 <small class="muted">建议使用专门的小号</small></h3>
+          <p class="hint tga-login-hint">Telegram 通常把验证码发到该号码<strong>已登录的 Telegram 客户端</strong>（手机或电脑上的 App 通知 /「Telegram」对话），而不是短信。请先看已登录设备；只有点「改用短信发送」后才会尝试短信。</p>
+          <p class="tga-login-status muted" data-tga-login-status hidden></p>
           <form class="tga-form tga-step" data-step="phone" autocomplete="off" onsubmit="return false">
             <label>手机号 <input type="tel" name="phone" autocomplete="off" placeholder="+60123456789（带国家区号）"></label>
             <button type="button" class="btn btn-sm" data-tga-send>发送验证码</button>
           </form>
           <form class="tga-form tga-step" data-step="code" autocomplete="off" onsubmit="return false" hidden>
-            <label>验证码 <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Telegram 里收到的验证码"></label>
+            <label>验证码 <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Telegram 客户端里的 5 位数字"></label>
             <button type="button" class="btn btn-sm" data-tga-code>登录</button>
-            <button type="button" class="link-btn" data-tga-restart>换手机号 / 重新发送</button>
+            <button type="button" class="btn btn-sm btn-ghost" data-tga-resend>重新发送验证码</button>
+            <button type="button" class="btn btn-sm btn-ghost" data-tga-resend-sms>改用短信发送</button>
+            <button type="button" class="link-btn" data-tga-restart>换手机号</button>
           </form>
           <form class="tga-form tga-step" data-step="password" autocomplete="off" onsubmit="return false" hidden>
             <label>两步验证密码 <input type="password" name="password" autocomplete="off"></label>
@@ -1110,15 +1197,19 @@ a.admin-dj-entry {
             </div>
             <div class="tga-acct-add" id="tgaAcctAdd" hidden>
               <p class="hint">新账号将使用上方已保存的 api_id / api_hash，登录流程与首次登录相同（手机号、验证码、可选两步验证）。</p>
+              <p class="hint tga-login-hint">验证码通常发到该新号码<strong>已登录的 Telegram 客户端</strong>，不是短信。添加过程不会改动或下线已有账号。</p>
+              <p class="tga-login-status muted" data-tga-login-status hidden></p>
               <form class="tga-form tga-add-step" data-step="phone" autocomplete="off" onsubmit="return false">
                 <label>手机号 <input type="tel" name="phone" autocomplete="off" placeholder="+60123456789（带国家区号）"></label>
                 <button type="button" class="btn btn-sm" data-tga-add-send>发送验证码</button>
                 <button type="button" class="link-btn" data-tga-add-cancel>取消</button>
               </form>
               <form class="tga-form tga-add-step" data-step="code" autocomplete="off" onsubmit="return false" hidden>
-                <label>验证码 <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Telegram 里收到的验证码"></label>
+                <label>验证码 <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Telegram 客户端里的 5 位数字"></label>
                 <button type="button" class="btn btn-sm" data-tga-add-code>登录</button>
-                <button type="button" class="link-btn" data-tga-add-restart>换手机号 / 重新发送</button>
+                <button type="button" class="btn btn-sm btn-ghost" data-tga-add-resend>重新发送验证码</button>
+                <button type="button" class="btn btn-sm btn-ghost" data-tga-add-resend-sms>改用短信发送</button>
+                <button type="button" class="link-btn" data-tga-add-restart>换手机号</button>
               </form>
               <form class="tga-form tga-add-step" data-step="password" autocomplete="off" onsubmit="return false" hidden>
                 <label>两步验证密码 <input type="password" name="password" autocomplete="off"></label>
@@ -1210,7 +1301,8 @@ a.admin-dj-entry {
         </div>
         <p class="hint tga-limits">限制：全站一次只下载一个文件，队列在后台按顺序处理（条目之间至少间隔 5 秒），不阻塞本页，也可在进行中继续追加。下载次数不再设每日上限。单个文件最大 500MB。遇到 Telegram 限流会自动等待后继续。</p>
       </section>
-      <script src="/static/tg_audio.js?v=t183multi1" defer></script>
+      <script src="/static/tg_audio.js?v=t185login1" defer></script>
+      <script src="/static/admin_analytics.js?v=t184a" defer></script>
       <script src="/static/admin_backup.js?v=bak3" defer></script>
       {% endif %}
     </div>

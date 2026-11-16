@@ -12,7 +12,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=t181a">
+  <link rel="stylesheet" href="/static/style.css?v=t184a">
   {% block extra_head %}{% endblock %}
 </head>
 {% set p = request.url.path %}
@@ -107,13 +107,15 @@
       <button type="button" class="player-btn player-main" id="plToggle" title="播放" aria-label="播放" aria-pressed="false"><span class="pl-disc" aria-hidden="true"><span class="pl-disc-label">DJ666</span></span><span class="pl-icon" id="plToggleIcon" aria-hidden="true">▶</span></button>
       <button type="button" class="player-btn" id="plNext" title="下一首" aria-label="下一首">⏭</button>
       <button type="button" class="player-btn" id="plMute" title="静音" aria-label="静音" aria-pressed="false">🔊</button>
+      <button type="button" class="player-btn" id="plShare" title="分享当前曲目" aria-label="分享当前曲目" hidden>分享</button>
     </div>
     <audio id="audio" controls preload="none"></audio>
     <button type="button" class="player-btn player-close" id="plClose" title="收起播放器（继续播放）" aria-label="收起播放器">×</button>
   </div>
 
   <script src="/static/tg.js?v=1" defer></script>
-  <script src="/static/app.js?v=t176a" defer></script>
+  <script src="/static/app.js?v=t184a" defer></script>
+  <script src="/static/analytics.js?v=t184a" defer></script>
   <script src="/static/ann_interact.js?v=tgc1" defer></script>
   <div id="pageScripts">{% block scripts %}{% endblock %}</div>
 </body>

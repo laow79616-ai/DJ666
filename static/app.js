@@ -157,6 +157,17 @@
     if ("mediaSession" in navigator && t) {
       try { navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: "DJ666" }); } catch (e) {}
     }
+    var shareBtn = document.getElementById("plShare");
+    if (shareBtn) {
+      if (t && t.id) {
+        shareBtn.hidden = false;
+        shareBtn.setAttribute("data-track-id", t.id);
+        shareBtn.setAttribute("data-title", t.title || "");
+      } else {
+        shareBtn.hidden = true;
+        shareBtn.removeAttribute("data-track-id");
+      }
+    }
   }
   function markPlaying() {
     var t = cur();
@@ -210,7 +221,7 @@
   }
   function listItems(listEl) {
     return Array.prototype.map.call(listEl.querySelectorAll(".track-item[data-src]:not([hidden])"), function (el) {
-      return { src: el.dataset.src, title: el.dataset.title || "未命名" };
+      return { src: el.dataset.src, title: el.dataset.title || "未命名", id: el.dataset.trackId || "" };
     });
   }
 
@@ -398,6 +409,9 @@
       if (d && d.login) { location.href = d.login; return; }
       if (!d || !d.ok) { alert((d && d.error) || "收藏失败"); return; }
       markFav(String(d.track_id), !!d.favorited);
+      if (window.dj666Analytics && window.dj666Analytics.updateCounts) {
+        window.dj666Analytics.updateCounts(d.track_id, d);
+      }
     }).catch(function () { btn.disabled = false; alert("网络错误，请重试"); });
   }, true);
 
@@ -415,7 +429,7 @@
     }
     var item = e.target.closest("[data-playlist] .track-item[data-src]");
     if (!item) return;
-    if (e.target.closest("form, input, textarea, select, a, button.btn, .track-fav, [data-fav-toggle], [data-fav-login]")) return;
+    if (e.target.closest("form, input, textarea, select, a, button.btn, .track-fav, [data-fav-toggle], [data-fav-login], .track-share, [data-share-track], .share-pop, .track-actions")) return;
     var list = item.closest("[data-playlist]");
     var els = Array.prototype.slice.call(list.querySelectorAll(".track-item[data-src]:not([hidden])"));
     var t = cur();
@@ -443,7 +457,21 @@
   audio.addEventListener("play", function () { st.playing = true; render(); save(true); });
   audio.addEventListener("pause", function () { if (!audio.ended) { st.playing = false; } render(); save(true); });
   audio.addEventListener("ended", function () { step(1, true); });
-  audio.addEventListener("timeupdate", function () { save(false); });
+  var playSent = {};
+  audio.addEventListener("timeupdate", function () {
+    save(false);
+    var t = cur();
+    if (!t || !t.id || playSent[t.id]) return;
+    var dur = audio.duration;
+    if (!isFinite(dur) || dur <= 0) return;
+    var need = Math.min(30, dur * 0.5);
+    if (audio.currentTime >= need) {
+      playSent[t.id] = 1;
+      if (window.dj666Analytics && window.dj666Analytics.reportPlay) {
+        window.dj666Analytics.reportPlay(t.id);
+      }
+    }
+  });
   audio.addEventListener("volumechange", function () { save(true); });
   audio.addEventListener("error", function () {
     if (cur()) { subEl.textContent = "无法播放此曲目（可能已下架或需要登录）"; }
@@ -752,4 +780,18 @@
     if (supported) { history.replaceState({ pjax: true }, "", dest); visit(dest, { push: false }); }
     else location.replace(dest);
   })();
+
+  function openSharedTrack() {
+    var params = new URLSearchParams(location.search);
+    var tid = params.get("t");
+    if (!tid) return;
+    var item = document.getElementById("t-" + tid) || document.querySelector('.track-item[data-track-id="' + tid + '"]');
+    if (!item) return;
+    try { item.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { item.scrollIntoView(true); }
+    item.classList.add("is-shared");
+    var btn = item.querySelector(".play-btn");
+    if (btn) btn.click();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", openSharedTrack);
+  else setTimeout(openSharedTrack, 0);
 })();

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import hashlib
+import hmac
 import html as html_lib
 import json
 import concurrent.futures
@@ -482,6 +483,8 @@ class Track(Base):
     storage: Mapped[str] = mapped_column(String(10), default="local")
     r2_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     flac_r2_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    play_count: Mapped[int] = mapped_column(Integer, default=0)
+    favorite_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
@@ -498,6 +501,807 @@ class UserFavorite(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
+
+
+# --- first-party analytics (no third-party trackers; real counts only) ---
+
+AN_VID_COOKIE = "dj666_vid"
+AN_VID_RE = re.compile(r"^[A-Za-z0-9_-]{12,64}$")
+AN_SALT_PATH = DATA_DIR / "analytics_salt.key"
+AN_SESSION_IDLE = 30 * 60          # new visit after 30 min idle
+AN_PLAY_DEDUP = 30 * 60            # one counted play per visitor per track per 30 min
+AN_PLAY_SEC = 30.0
+AN_PLAY_RATIO = 0.5
+AN_HEARTBEAT_MAX_MS = 60_000
+AN_EXCLUDE_ADMIN = True
+AN_BOT_RE = re.compile(
+    r"bot|spider|crawl|slurp|curl|wget|python-requests|python-urllib|go-http|okhttp|"
+    r"facebookexternalhit|preview|headless|lighthouse|pingdom|uptimerobot|bytespider|"
+    r"ahrefs|semrush|yandexbot|applebot|bingbot|googlebot|duckduckbot",
+    re.I,
+)
+AN_SHARE_PLATFORMS = ("telegram", "whatsapp", "x", "facebook", "copy", "native", "inbound")
+AN_SKIP_PREFIXES = (
+    "/admin", "/api/", "/static", "/uploads", "/favicon", "/bot/",
+    "/dj/optimize", "/admin/",
+)
+
+
+def format_stat_count(n: int) -> str:
+    """Compact 1.2k-style counts for track rows (real numbers only)."""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 0:
+        n = 0
+    if n < 1000:
+        return str(n)
+    if n < 100_000:
+        s = f"{n / 1000:.1f}".rstrip("0").rstrip(".")
+        return f"{s}k"
+    return format_cn_count(n)
+
+
+def format_dwell(ms: int) -> str:
+    try:
+        sec = max(0, int(round(int(ms or 0) / 1000)))
+    except (TypeError, ValueError):
+        sec = 0
+    if sec < 60:
+        return f"{sec} 秒"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m} 分 {s} 秒" if s else f"{m} 分钟"
+    h, m = divmod(m, 60)
+    return f"{h} 小时 {m} 分钟"
+
+
+class AnalyticsVisitor(Base):
+    __tablename__ = "analytics_visitors"
+    visitor_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    visit_count: Mapped[int] = mapped_column(Integer, default=0)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class AnalyticsSession(Base):
+    __tablename__ = "analytics_sessions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    visitor_key: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    username: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    dwell_ms: Mapped[int] = mapped_column(Integer, default=0)
+    landing: Mapped[str] = mapped_column(String(200), default="")
+    referrer: Mapped[str] = mapped_column(String(200), default="")
+    utm_source: Mapped[str] = mapped_column(String(80), default="")
+    utm_medium: Mapped[str] = mapped_column(String(80), default="")
+    utm_campaign: Mapped[str] = mapped_column(String(80), default="")
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    day: Mapped[str] = mapped_column(String(10), default="", index=True)
+
+
+class AnalyticsDaily(Base):
+    __tablename__ = "analytics_daily"
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    unique_visitors: Mapped[int] = mapped_column(Integer, default=0)
+    visits: Mapped[int] = mapped_column(Integer, default=0)
+    new_visitors: Mapped[int] = mapped_column(Integer, default=0)
+    returning_visitors: Mapped[int] = mapped_column(Integer, default=0)
+    dwell_ms_sum: Mapped[int] = mapped_column(Integer, default=0)
+    dwell_sessions: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AnalyticsDailyVisitor(Base):
+    __tablename__ = "analytics_daily_visitors"
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    visitor_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    is_new: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class AnalyticsShare(Base):
+    __tablename__ = "analytics_shares"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    day: Mapped[str] = mapped_column(String(10), default="", index=True)
+    platform: Mapped[str] = mapped_column(String(40), default="", index=True)
+    track_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    visitor_key: Mapped[str] = mapped_column(String(64), default="")
+    kind: Mapped[str] = mapped_column(String(20), default="click")  # click | inbound
+    source: Mapped[str] = mapped_column(String(200), default="")
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class TrackPlayEvent(Base):
+    __tablename__ = "track_play_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    track_id: Mapped[int] = mapped_column(Integer, index=True)
+    visitor_key: Mapped[str] = mapped_column(String(64), default="")
+    counted_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+_an_lock = threading.RLock()
+_an_queue: list[dict] = []
+_an_thread = None
+_an_salt = b""
+_an_open_sessions: dict[str, int] = {}  # visitor_key -> session id (memory hint)
+
+
+def _an_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _an_day(ts: Optional[datetime] = None) -> str:
+    t = ts or _an_now()
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.astimezone(TZ_CN).strftime("%Y-%m-%d")
+
+
+def _an_get_salt() -> bytes:
+    global _an_salt
+    if _an_salt:
+        return _an_salt
+    with _an_lock:
+        if _an_salt:
+            return _an_salt
+        try:
+            raw = AN_SALT_PATH.read_bytes()
+            if len(raw) >= 16:
+                _an_salt = raw
+                return _an_salt
+        except OSError:
+            pass
+        raw = secrets.token_bytes(32)
+        AN_SALT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(AN_SALT_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, raw)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(str(AN_SALT_PATH), 0o600)
+        except OSError:
+            pass
+        _an_salt = raw
+        return _an_salt
+
+
+def _an_hash_ip(ip: str) -> str:
+    """HMAC of the IP; never persisted long-term, only used in-process if needed."""
+    ip = (ip or "").strip()
+    if not ip:
+        return ""
+    return hmac.new(_an_get_salt(), ip.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _an_is_bot(request: Request) -> bool:
+    ua = request.headers.get("user-agent") or ""
+    if not ua or len(ua) < 8:
+        return True
+    return bool(AN_BOT_RE.search(ua))
+
+
+def _an_skip_path(path: str) -> bool:
+    path = path or "/"
+    if path.startswith("/static") or path.startswith("/uploads") or path.startswith("/api/"):
+        return True
+    if path.startswith("/admin"):
+        return True
+    if path.startswith("/dj/"):
+        return True
+    if "." in path.rsplit("/", 1)[-1] and path.rsplit(".", 1)[-1].lower() in {
+        "css", "js", "png", "jpg", "jpeg", "webp", "gif", "ico", "svg", "map", "woff", "woff2", "mp3", "flac", "wav"
+    }:
+        return True
+    return False
+
+
+def _an_valid_vid(raw: str) -> bool:
+    return bool(raw and AN_VID_RE.match(raw))
+
+
+def analytics_ensure_vid(request: Request) -> str:
+    vid = request.cookies.get(AN_VID_COOKIE) or request.session.get("vid") or ""
+    if not _an_valid_vid(vid):
+        vid = secrets.token_urlsafe(16)
+    request.session["vid"] = vid
+    try:
+        request.state.an_vid = vid
+        request.state.an_set_cookie = True
+    except Exception:  # noqa: BLE001
+        pass
+    return vid
+
+
+def migrate_analytics_schema(db: Session) -> None:
+    cols = {row[1] for row in db.execute(text("PRAGMA table_info(tracks)")).fetchall()}
+    for col, ddl in (("play_count", "INTEGER DEFAULT 0"), ("favorite_count", "INTEGER DEFAULT 0")):
+        if col not in cols:
+            db.execute(text(f"ALTER TABLE tracks ADD COLUMN {col} {ddl}"))
+            db.commit()
+    db.execute(text("UPDATE tracks SET play_count = 0 WHERE play_count IS NULL"))
+    db.execute(text("UPDATE tracks SET favorite_count = 0 WHERE favorite_count IS NULL"))
+    db.commit()
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_tracks_play_count ON tracks (play_count)"))
+    db.commit()
+    # Real favorite backfill only (no invented play counts).
+    db.execute(text(
+        "UPDATE tracks SET favorite_count = ("
+        "SELECT COUNT(*) FROM user_favorites WHERE user_favorites.track_id = tracks.id)"
+    ))
+    db.commit()
+    db.execute(text(
+        """CREATE TABLE IF NOT EXISTS analytics_visitors (
+            visitor_key VARCHAR(64) PRIMARY KEY,
+            first_seen DATETIME, last_seen DATETIME, visit_count INTEGER DEFAULT 0,
+            user_id INTEGER, is_admin BOOLEAN DEFAULT 0
+        )"""
+    ))
+    db.execute(text(
+        """CREATE TABLE IF NOT EXISTS analytics_sessions (
+            id INTEGER PRIMARY KEY,
+            visitor_key VARCHAR(64), user_id INTEGER, username VARCHAR(40),
+            started_at DATETIME, last_seen DATETIME, dwell_ms INTEGER DEFAULT 0,
+            landing VARCHAR(200) DEFAULT '', referrer VARCHAR(200) DEFAULT '',
+            utm_source VARCHAR(80) DEFAULT '', utm_medium VARCHAR(80) DEFAULT '',
+            utm_campaign VARCHAR(80) DEFAULT '',
+            is_admin BOOLEAN DEFAULT 0, day VARCHAR(10) DEFAULT ''
+        )"""
+    ))
+    db.execute(text(
+        """CREATE TABLE IF NOT EXISTS analytics_daily (
+            day VARCHAR(10) PRIMARY KEY,
+            unique_visitors INTEGER DEFAULT 0, visits INTEGER DEFAULT 0,
+            new_visitors INTEGER DEFAULT 0, returning_visitors INTEGER DEFAULT 0,
+            dwell_ms_sum INTEGER DEFAULT 0, dwell_sessions INTEGER DEFAULT 0
+        )"""
+    ))
+    db.execute(text(
+        """CREATE TABLE IF NOT EXISTS analytics_daily_visitors (
+            day VARCHAR(10) NOT NULL, visitor_key VARCHAR(64) NOT NULL,
+            is_new BOOLEAN DEFAULT 0, is_admin BOOLEAN DEFAULT 0,
+            PRIMARY KEY (day, visitor_key)
+        )"""
+    ))
+    db.execute(text(
+        """CREATE TABLE IF NOT EXISTS analytics_shares (
+            id INTEGER PRIMARY KEY, created_at DATETIME, day VARCHAR(10) DEFAULT '',
+            platform VARCHAR(40) DEFAULT '', track_id INTEGER, visitor_key VARCHAR(64) DEFAULT '',
+            kind VARCHAR(20) DEFAULT 'click', source VARCHAR(200) DEFAULT '',
+            is_admin BOOLEAN DEFAULT 0
+        )"""
+    ))
+    db.execute(text(
+        """CREATE TABLE IF NOT EXISTS track_play_events (
+            id INTEGER PRIMARY KEY, track_id INTEGER, visitor_key VARCHAR(64) DEFAULT '',
+            counted_at DATETIME
+        )"""
+    ))
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_an_sess_vid ON analytics_sessions (visitor_key)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_an_sess_day ON analytics_sessions (day)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_an_sess_last ON analytics_sessions (last_seen)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_an_share_plat ON analytics_shares (platform, day)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_play_ev_track ON track_play_events (track_id, visitor_key, counted_at)"))
+    db.commit()
+    # No play-count backfill: there are no qualified historical play logs.
+
+
+def _an_enqueue(evt: dict) -> None:
+    with _an_lock:
+        if len(_an_queue) > 4000:
+            _an_queue.pop(0)
+        _an_queue.append(evt)
+        th = _an_thread
+    if th is None or not th.is_alive():
+        try:
+            analytics_start()
+        except Exception:  # noqa: BLE001
+            logging.exception("analytics lazy start")
+
+
+def _an_clean_ref(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        u = urllib.parse.urlparse(raw)
+    except Exception:
+        return ""
+    host = (u.hostname or "").lower()
+    if not host:
+        return ""
+    if host in {"www.dj666.pw", "dj666.pw", "localhost", "127.0.0.1"}:
+        return ""
+    if host.endswith(".dj666.pw"):
+        return ""
+    return host[:200]
+
+
+def _an_inbound_platform(host: str, utm: str) -> str:
+    u = (utm or "").strip().lower()
+    known = {
+        "telegram": "telegram", "tg": "telegram", "t.me": "telegram",
+        "whatsapp": "whatsapp", "wa": "whatsapp",
+        "twitter": "x", "x": "x", "x.com": "x",
+        "facebook": "facebook", "fb": "facebook",
+    }
+    if u in known:
+        return known[u]
+    h = (host or "").lower()
+    if "t.me" in h or "telegram" in h:
+        return "telegram"
+    if "whatsapp" in h or h.endswith("wa.me"):
+        return "whatsapp"
+    if h in {"x.com", "twitter.com", "t.co"} or h.endswith(".twitter.com"):
+        return "x"
+    if "facebook" in h or "fb.com" in h or h == "fb.me":
+        return "facebook"
+    return "inbound"
+
+
+def _an_daily_row(db: Session, day: str) -> AnalyticsDaily:
+    row = db.get(AnalyticsDaily, day)
+    if row is None:
+        row = AnalyticsDaily(day=day)
+        db.add(row)
+        db.flush()
+    return row
+
+
+def _an_flush_page(db: Session, evt: dict) -> None:
+    vid = evt.get("visitor_key") or ""
+    if not _an_valid_vid(vid):
+        return
+    now = _an_now()
+    day = _an_day(now)
+    is_admin = bool(evt.get("is_admin"))
+    user_id = evt.get("user_id")
+    username = (evt.get("username") or "")[:40]
+    vis = db.get(AnalyticsVisitor, vid)
+    is_new_visitor = vis is None
+    if vis is None:
+        vis = AnalyticsVisitor(
+            visitor_key=vid, first_seen=now, last_seen=now, visit_count=0,
+            user_id=user_id, is_admin=is_admin,
+        )
+        db.add(vis)
+        db.flush()
+    else:
+        vis.last_seen = now
+        if user_id:
+            vis.user_id = user_id
+        if is_admin:
+            vis.is_admin = True
+    sid = _an_open_sessions.get(vid)
+    sess = db.get(AnalyticsSession, sid) if sid else None
+    new_session = False
+    if sess is None or sess.visitor_key != vid:
+        sess = db.scalar(
+            select(AnalyticsSession)
+            .where(AnalyticsSession.visitor_key == vid)
+            .order_by(AnalyticsSession.last_seen.desc())
+            .limit(1)
+        )
+    if sess is None or (now - (sess.last_seen.replace(tzinfo=timezone.utc) if sess.last_seen and sess.last_seen.tzinfo is None else (sess.last_seen or now))).total_seconds() > AN_SESSION_IDLE:
+        sess = AnalyticsSession(
+            visitor_key=vid, user_id=user_id, username=username,
+            started_at=now, last_seen=now, dwell_ms=0,
+            landing=(evt.get("path") or "")[:200],
+            referrer=(evt.get("referrer") or "")[:200],
+            utm_source=(evt.get("utm_source") or "")[:80],
+            utm_medium=(evt.get("utm_medium") or "")[:80],
+            utm_campaign=(evt.get("utm_campaign") or "")[:80],
+            is_admin=is_admin, day=day,
+        )
+        db.add(sess)
+        db.flush()
+        vis.visit_count = int(vis.visit_count or 0) + 1
+        new_session = True
+    else:
+        sess.last_seen = now
+        if user_id:
+            sess.user_id = user_id
+            sess.username = username or sess.username
+        if is_admin:
+            sess.is_admin = True
+    _an_open_sessions[vid] = sess.id
+    # daily unique / visits (public only if we still record admin rows but dashboard filters)
+    existed = db.get(AnalyticsDailyVisitor, (day, vid))
+    daily = _an_daily_row(db, day)
+    if existed is None:
+        first_day = _an_day(vis.first_seen)
+        is_new = first_day == day
+        db.add(AnalyticsDailyVisitor(day=day, visitor_key=vid, is_new=is_new, is_admin=is_admin))
+        if not (is_admin and AN_EXCLUDE_ADMIN):
+            daily.unique_visitors = int(daily.unique_visitors or 0) + 1
+            if is_new:
+                daily.new_visitors = int(daily.new_visitors or 0) + 1
+            else:
+                daily.returning_visitors = int(daily.returning_visitors or 0) + 1
+    elif is_admin:
+        existed.is_admin = True
+    if new_session and not (is_admin and AN_EXCLUDE_ADMIN):
+        daily.visits = int(daily.visits or 0) + 1
+    # inbound attribution once per session start
+    if new_session and not (is_admin and AN_EXCLUDE_ADMIN):
+        host = evt.get("referrer") or ""
+        utm = (evt.get("utm_source") or "").strip()
+        if host or utm:
+            plat = _an_inbound_platform(host, utm)
+            db.add(AnalyticsShare(
+                created_at=now, day=day, platform=plat, visitor_key=vid,
+                kind="inbound", source=(utm or host)[:200], is_admin=False,
+            ))
+
+
+def _an_flush_heartbeat(db: Session, evt: dict) -> None:
+    vid = evt.get("visitor_key") or ""
+    if not _an_valid_vid(vid):
+        return
+    try:
+        delta = int(evt.get("dwell_ms") or 0)
+    except (TypeError, ValueError):
+        delta = 0
+    if delta <= 0:
+        return
+    delta = min(delta, AN_HEARTBEAT_MAX_MS)
+    now = _an_now()
+    sid = _an_open_sessions.get(vid)
+    sess = db.get(AnalyticsSession, sid) if sid else None
+    if sess is None:
+        sess = db.scalar(
+            select(AnalyticsSession)
+            .where(AnalyticsSession.visitor_key == vid)
+            .order_by(AnalyticsSession.last_seen.desc())
+            .limit(1)
+        )
+    if sess is None:
+        return
+    last = sess.last_seen
+    if last and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if last and (now - last).total_seconds() > AN_SESSION_IDLE:
+        return
+    prev = int(sess.dwell_ms or 0)
+    sess.dwell_ms = prev + delta
+    sess.last_seen = now
+    if prev < 3000 <= sess.dwell_ms and not (sess.is_admin and AN_EXCLUDE_ADMIN):
+        daily = _an_daily_row(db, sess.day or _an_day(sess.started_at))
+        daily.dwell_ms_sum = int(daily.dwell_ms_sum or 0) + sess.dwell_ms
+        daily.dwell_sessions = int(daily.dwell_sessions or 0) + 1
+    elif prev >= 3000 and not (sess.is_admin and AN_EXCLUDE_ADMIN):
+        daily = _an_daily_row(db, sess.day or _an_day(sess.started_at))
+        daily.dwell_ms_sum = int(daily.dwell_ms_sum or 0) + delta
+    _an_open_sessions[vid] = sess.id
+
+
+def _an_flush_play(db: Session, evt: dict) -> Optional[int]:
+    vid = evt.get("visitor_key") or ""
+    try:
+        tid = int(evt.get("track_id") or 0)
+    except (TypeError, ValueError):
+        tid = 0
+    if tid <= 0 or not _an_valid_vid(vid):
+        return None
+    if evt.get("is_admin") and AN_EXCLUDE_ADMIN:
+        return None
+    now = _an_now()
+    recent = db.scalar(
+        select(TrackPlayEvent).where(
+            TrackPlayEvent.track_id == tid,
+            TrackPlayEvent.visitor_key == vid,
+        ).order_by(TrackPlayEvent.counted_at.desc()).limit(1)
+    )
+    if recent is not None:
+        ts = recent.counted_at
+        if ts and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts and (now - ts).total_seconds() < AN_PLAY_DEDUP:
+            track = db.get(Track, tid)
+            return int(getattr(track, "play_count", 0) or 0) if track else None
+    db.add(TrackPlayEvent(track_id=tid, visitor_key=vid, counted_at=now))
+    track = db.get(Track, tid)
+    if track is None:
+        return None
+    track.play_count = int(getattr(track, "play_count", 0) or 0) + 1
+    return int(track.play_count)
+
+
+def _an_flush_share(db: Session, evt: dict) -> None:
+    if evt.get("is_admin") and AN_EXCLUDE_ADMIN:
+        return
+    plat = str(evt.get("platform") or "").strip().lower()
+    if plat in {"twitter", "tweet"}:
+        plat = "x"
+    if plat not in AN_SHARE_PLATFORMS:
+        return
+    try:
+        tid = int(evt.get("track_id") or 0) or None
+    except (TypeError, ValueError):
+        tid = None
+    db.add(AnalyticsShare(
+        created_at=_an_now(), day=_an_day(), platform=plat,
+        track_id=tid, visitor_key=evt.get("visitor_key") or "",
+        kind="click", source=(evt.get("source") or "")[:200], is_admin=False,
+    ))
+
+
+def _an_flush_batch(batch: list[dict]) -> dict:
+    """Apply a batch of events. Returns last play_count by track_id."""
+    plays: dict[int, int] = {}
+    db = SessionLocal()
+    try:
+        for evt in batch:
+            kind = evt.get("type")
+            try:
+                if kind == "page":
+                    _an_flush_page(db, evt)
+                elif kind == "heartbeat":
+                    _an_flush_heartbeat(db, evt)
+                elif kind == "play":
+                    tid = int(evt.get("track_id") or 0)
+                    n = _an_flush_play(db, evt)
+                    if tid and n is not None:
+                        plays[tid] = n
+                elif kind == "share":
+                    _an_flush_share(db, evt)
+            except Exception:  # noqa: BLE001
+                logging.exception("analytics event failed kind=%s", kind)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logging.exception("analytics flush batch failed")
+    finally:
+        db.close()
+    return plays
+
+
+def _an_flush_loop() -> None:
+    while True:
+        time.sleep(2.0)
+        with _an_lock:
+            if not _an_queue:
+                continue
+            batch = list(_an_queue)
+            _an_queue.clear()
+        try:
+            _an_flush_batch(batch)
+        except Exception:  # noqa: BLE001
+            logging.exception("analytics flush loop")
+
+
+def analytics_start() -> None:
+    try:
+        _an_get_salt()
+    except Exception:  # noqa: BLE001
+        logging.exception("analytics salt")
+    db = SessionLocal()
+    try:
+        migrate_analytics_schema(db)
+    except Exception:  # noqa: BLE001
+        logging.exception("analytics migrate")
+    finally:
+        db.close()
+    global _an_thread
+    with _an_lock:
+        if _an_thread is not None and _an_thread.is_alive():
+            return
+        _an_thread = threading.Thread(target=_an_flush_loop, name="analytics", daemon=True)
+        _an_thread.start()
+
+
+def analytics_on_page(request: Request, user: Optional["User"] = None) -> None:
+    """Record a real page view (non-blocking). Admin pages and bots are skipped."""
+    try:
+        vid = analytics_ensure_vid(request)
+        if _an_skip_path(request.url.path) or _an_is_bot(request):
+            return
+        is_admin = bool(user and getattr(user, "is_admin", False))
+        if is_admin and AN_EXCLUDE_ADMIN:
+            return
+        q = request.query_params
+        ref = _an_clean_ref(request.headers.get("referer") or request.headers.get("referrer") or "")
+        _an_enqueue({
+            "type": "page",
+            "visitor_key": vid,
+            "path": (request.url.path or "/")[:200],
+            "referrer": ref,
+            "utm_source": (q.get("utm_source") or "")[:80],
+            "utm_medium": (q.get("utm_medium") or "")[:80],
+            "utm_campaign": (q.get("utm_campaign") or "")[:80],
+            "user_id": int(user.id) if user else None,
+            "username": (getattr(user, "username", "") or "")[:40] if user else "",
+            "is_admin": is_admin,
+        })
+        # Raw IP is never written to the database; a salted HMAC helper exists for in-process caps only.
+    except Exception:  # noqa: BLE001
+        logging.exception("analytics page touch")
+
+
+def analytics_dashboard(db: Session, *, session_limit: int = 60) -> dict:
+    """Public (non-admin, non-bot) aggregates for the admin dashboard."""
+    today = _an_day()
+    daily = db.get(AnalyticsDaily, today)
+    today_uv = int(daily.unique_visitors or 0) if daily else 0
+    today_visits = int(daily.visits or 0) if daily else 0
+    today_new = int(daily.new_visitors or 0) if daily else 0
+    today_ret = int(daily.returning_visitors or 0) if daily else 0
+    total_uv = db.scalar(
+        select(func.count()).select_from(AnalyticsVisitor).where(AnalyticsVisitor.is_admin.is_(False))
+    ) or 0
+    # 30-day trend
+    start30 = (datetime.now(TZ_CN) - timedelta(days=29)).strftime("%Y-%m-%d")
+    rows = db.scalars(select(AnalyticsDaily).where(AnalyticsDaily.day >= start30).order_by(AnalyticsDaily.day.asc())).all()
+    by_day = {r.day: r for r in rows}
+    trend = []
+    cur = datetime.now(TZ_CN).replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(29, -1, -1):
+        d = (cur - timedelta(days=i)).strftime("%Y-%m-%d")
+        r = by_day.get(d)
+        trend.append({
+            "day": d,
+            "unique": int(r.unique_visitors or 0) if r else 0,
+            "visits": int(r.visits or 0) if r else 0,
+        })
+    # visit frequency (non-admin visitors)
+    buckets = {"1": 0, "2-5": 0, "6+": 0}
+    freq_rows = db.execute(
+        text("SELECT visit_count, COUNT(*) FROM analytics_visitors WHERE is_admin = 0 OR is_admin IS NULL GROUP BY visit_count")
+    ).fetchall()
+    freq_total = 0
+    for count, n in freq_rows:
+        c = int(count or 0)
+        n = int(n or 0)
+        freq_total += n
+        if c <= 1:
+            buckets["1"] += n
+        elif c <= 5:
+            buckets["2-5"] += n
+        else:
+            buckets["6+"] += n
+    def _pct(n):
+        return round(100.0 * n / freq_total, 1) if freq_total else 0.0
+    # dwell: last 30 days, sessions >= 3s, non-admin
+    since = datetime.now(timezone.utc) - timedelta(days=30)
+    dwells = db.scalars(
+        select(AnalyticsSession.dwell_ms).where(
+            AnalyticsSession.is_admin.is_(False),
+            AnalyticsSession.dwell_ms >= 3000,
+            AnalyticsSession.started_at >= since.replace(tzinfo=None),
+        )
+    ).all()
+    dwell_vals = sorted(int(x or 0) for x in dwells)
+    if dwell_vals:
+        avg_ms = int(sum(dwell_vals) / len(dwell_vals))
+        mid = len(dwell_vals) // 2
+        med_ms = dwell_vals[mid] if len(dwell_vals) % 2 else int((dwell_vals[mid - 1] + dwell_vals[mid]) / 2)
+    else:
+        avg_ms = med_ms = 0
+    sess_rows = db.scalars(
+        select(AnalyticsSession)
+        .where(AnalyticsSession.is_admin.is_(False))
+        .order_by(AnalyticsSession.last_seen.desc())
+        .limit(session_limit)
+    ).all()
+    sessions = []
+    for s in sess_rows:
+        label = (s.username or "").strip()
+        vis = (s.visitor_key or "")[:8]
+        sessions.append({
+            "id": s.id,
+            "who": label or f"访客 {vis}",
+            "logged_in": bool(label),
+            "started": fmt_time(s.started_at),
+            "last": fmt_time(s.last_seen),
+            "dwell": format_dwell(s.dwell_ms or 0),
+            "dwell_ms": int(s.dwell_ms or 0),
+            "landing": s.landing or "",
+            "referrer": s.referrer or "",
+        })
+    share_rows = db.execute(
+        text(
+            "SELECT kind, platform, COUNT(*) FROM analytics_shares "
+            "WHERE is_admin = 0 OR is_admin IS NULL GROUP BY kind, platform"
+        )
+    ).fetchall()
+    clicks = {p: 0 for p in AN_SHARE_PLATFORMS if p != "inbound"}
+    inbound = {}
+    click_total = 0
+    inbound_total = 0
+    for kind, plat, n in share_rows:
+        n = int(n or 0)
+        plat = plat or "inbound"
+        if kind == "inbound":
+            inbound[plat] = inbound.get(plat, 0) + n
+            inbound_total += n
+        else:
+            if plat not in clicks:
+                clicks[plat] = 0
+            clicks[plat] += n
+            click_total += n
+    def _ratio(d, total):
+        return [
+            {"platform": k, "count": v, "pct": (round(100.0 * v / total, 1) if total else 0.0)}
+            for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+    today_total_people = today_new + today_ret
+    return {
+        "today": today,
+        "today_unique": today_uv,
+        "today_visits": today_visits,
+        "total_unique": int(total_uv),
+        "today_new": today_new,
+        "today_returning": today_ret,
+        "today_new_pct": (round(100.0 * today_new / today_total_people, 1) if today_total_people else 0.0),
+        "today_returning_pct": (round(100.0 * today_ret / today_total_people, 1) if today_total_people else 0.0),
+        "trend": trend,
+        "freq": {
+            "total": freq_total,
+            "buckets": [
+                {"key": "1", "label": "1 次", "count": buckets["1"], "pct": _pct(buckets["1"])},
+                {"key": "2-5", "label": "2–5 次", "count": buckets["2-5"], "pct": _pct(buckets["2-5"])},
+                {"key": "6+", "label": "6 次及以上", "count": buckets["6+"], "pct": _pct(buckets["6+"])},
+            ],
+        },
+        "dwell_avg": format_dwell(avg_ms),
+        "dwell_median": format_dwell(med_ms),
+        "dwell_avg_ms": avg_ms,
+        "dwell_median_ms": med_ms,
+        "dwell_sample": len(dwell_vals),
+        "sessions": sessions,
+        "share_clicks": _ratio(clicks, click_total),
+        "share_click_total": click_total,
+        "share_inbound": _ratio(inbound, inbound_total),
+        "share_inbound_total": inbound_total,
+        "exclude_admin": AN_EXCLUDE_ADMIN,
+        "play_rule": "同一访客对同一曲目 30 分钟内计 1 次；需播放满 30 秒或时长的 50%（取较短者）",
+    }
+
+
+class AnalyticsCookieMiddleware:
+    """Attach the durable visitor cookie after a page sets request.state.an_vid."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                vid = scope.get("state", {}).get("an_vid") if isinstance(scope.get("state"), dict) else None
+                # Starlette stores request.state on scope["state"]
+                state = scope.get("state")
+                set_cookie = False
+                if state is not None:
+                    vid = getattr(state, "an_vid", None) or (state.get("an_vid") if isinstance(state, dict) else None)
+                    set_cookie = bool(getattr(state, "an_set_cookie", False) or (state.get("an_set_cookie") if isinstance(state, dict) else False))
+                if set_cookie and _an_valid_vid(vid or ""):
+                    from starlette.datastructures import MutableHeaders
+                    headers = MutableHeaders(scope=message)
+                    cookie = (
+                        f"{AN_VID_COOKIE}={vid}; Path=/; Max-Age=34560000; HttpOnly; SameSite=Lax"
+                    )
+                    # Secure when served over HTTPS (nginx terminates TLS).
+                    proto = ""
+                    for k, v in scope.get("headers") or []:
+                        if k == b"x-forwarded-proto":
+                            proto = v.decode("latin-1", "ignore")
+                            break
+                    if proto == "https" or (scope.get("scheme") == "https"):
+                        cookie += "; Secure"
+                    headers.append("set-cookie", cookie)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
 
 
 class ChatMessage(Base):
@@ -902,6 +1706,7 @@ def migrate_schema(db: Session) -> None:
     migrate_tracks_schema(db)
     migrate_announcements_schema(db)
     migrate_tga_queue_schema(db)
+    migrate_analytics_schema(db)
 
 
 def migrate_tga_queue_schema(db: Session) -> None:
@@ -1829,7 +2634,7 @@ def approved_tracks(db: Session):
             select(Track)
             .options(joinedload(Track.uploader))
             .where(Track.status == TRACK_STATUS_APPROVED)
-            .order_by(Track.created_at.desc())
+            .order_by(Track.play_count.desc(), Track.created_at.desc())
         )
         .unique()
         .all()
@@ -4240,6 +5045,10 @@ async def lifespan(app: FastAPI):
         start_duration_backfill()
     except Exception:  # noqa: BLE001
         logging.exception("duration backfill failed to start")
+    try:
+        analytics_start()
+    except Exception:  # noqa: BLE001
+        logging.exception("analytics failed to start")
     task = asyncio.create_task(telegram_scheduler())
     asyncio.get_running_loop().run_in_executor(None, _bot_webhook_on_startup)
     try:
@@ -4257,6 +5066,7 @@ app.add_middleware(
     https_only=False,
     max_age=60 * 60 * 24 * 14,
 )
+app.add_middleware(AnalyticsCookieMiddleware)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -4381,6 +5191,7 @@ templates.env.globals["chat_excerpt"] = chat_excerpt
 templates.env.filters["linkify"] = linkify
 templates.env.filters["tg_eng_line"] = tg_eng_line
 templates.env.filters["cn_count"] = lambda n: format_cn_count(int(n or 0))
+templates.env.filters["stat_count"] = lambda n: format_stat_count(int(n or 0))
 
 
 @app.exception_handler(MultiPartException)
@@ -4501,6 +5312,7 @@ def ctx(request: Request, db: Session, **extra):
         favorite_ids = set(
             db.scalars(select(UserFavorite.track_id).where(UserFavorite.user_id == user.id)).all()
         )
+    analytics_on_page(request, user)
     data = {
         "request": request,
         "user": user,
@@ -4699,6 +5511,95 @@ def music_page(request: Request, db: Session = Depends(get_db)):
     return music_listing(request, db)
 
 
+@app.get("/admin/analytics.json")
+def admin_analytics_json(request: Request, db: Session = Depends(get_db)):
+    require_admin(request, db)
+    return JSONResponse(
+        analytics_dashboard(db),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
+@app.post("/api/analytics/beacon")
+async def analytics_beacon(request: Request, db: Session = Depends(get_db)):
+    """Lightweight first-party beacon (heartbeat, play, share). Raw IPs are not stored."""
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    token = str(data.get("csrf") or data.get("csrf_token") or request.headers.get("x-csrf-token") or "")
+    try:
+        require_csrf(request, token)
+    except HTTPException:
+        return JSONResponse({"ok": False, "error": "csrf"}, status_code=400)
+    if _an_is_bot(request):
+        return JSONResponse({"ok": True, "ignored": "bot"})
+    user = current_user(request, db)
+    is_admin = bool(user and user.is_admin)
+    vid = analytics_ensure_vid(request)
+    events = data.get("events")
+    if not isinstance(events, list):
+        events = [data]
+    plays: dict[int, int] = {}
+    batch = []
+    for raw in events[:20]:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("type") or "").strip()
+        if kind not in ("heartbeat", "play", "share", "page"):
+            continue
+        evt = {
+            "type": kind,
+            "visitor_key": vid,
+            "is_admin": is_admin,
+            "user_id": int(user.id) if user else None,
+            "username": (getattr(user, "username", "") or "")[:40] if user else "",
+        }
+        if kind == "heartbeat":
+            try:
+                evt["dwell_ms"] = int(raw.get("dwell_ms") or raw.get("ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            if evt["dwell_ms"] <= 0:
+                continue
+        elif kind == "play":
+            try:
+                evt["track_id"] = int(raw.get("track_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if evt["track_id"] <= 0:
+                continue
+        elif kind == "share":
+            evt["platform"] = str(raw.get("platform") or "")[:40]
+            try:
+                evt["track_id"] = int(raw.get("track_id") or 0) or None
+            except (TypeError, ValueError):
+                evt["track_id"] = None
+            evt["source"] = str(raw.get("source") or "")[:200]
+        elif kind == "page":
+            # Server already records HTML page views; ignore duplicate page beacons.
+            continue
+        batch.append(evt)
+    if batch:
+        # Heartbeats/shares enqueue; play events flush immediately so the UI can update the count.
+        delayed, immediate = [], []
+        for evt in batch:
+            (immediate if evt["type"] == "play" else delayed).append(evt)
+        if delayed:
+            for evt in delayed:
+                _an_enqueue(evt)
+        if immediate:
+            plays = _an_flush_batch(immediate)
+    out_plays = [
+        {"track_id": tid, "play_count": n, "play_label": format_stat_count(n)}
+        for tid, n in plays.items()
+    ]
+    return JSONResponse({"ok": True, "plays": out_plays})
+
+
+
 @app.get("/news", response_class=HTMLResponse)
 def news_page(request: Request, db: Session = Depends(get_db)):
     return news_listing(request, db)
@@ -4741,11 +5642,23 @@ def favorite_toggle(track_id: int, request: Request, csrf_token: str = Form(""),
     row = db.get(UserFavorite, (user.id, track_id))
     if row:
         db.delete(row)
-        db.commit()
-        return JSONResponse({"ok": True, "favorited": False, "track_id": track_id})
-    db.add(UserFavorite(user_id=user.id, track_id=track_id))
+        favorited = False
+    else:
+        db.add(UserFavorite(user_id=user.id, track_id=track_id))
+        favorited = True
+    db.flush()
+    fav_n = int(db.scalar(select(func.count()).select_from(UserFavorite).where(UserFavorite.track_id == track_id)) or 0)
+    track.favorite_count = fav_n
     db.commit()
-    return JSONResponse({"ok": True, "favorited": True, "track_id": track_id})
+    return JSONResponse({
+        "ok": True,
+        "favorited": favorited,
+        "track_id": track_id,
+        "favorite_count": fav_n,
+        "favorite_label": format_stat_count(fav_n),
+        "play_count": int(getattr(track, "play_count", 0) or 0),
+        "play_label": format_stat_count(int(getattr(track, "play_count", 0) or 0)),
+    })
 
 
 def dj_mixer_ctx(db: Session, user=None) -> dict:
@@ -6779,6 +7692,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
         ctx(
             request,
             db,
+            analytics=analytics_dashboard(db),
             **dj_mixer_ctx(db, current_user(request, db)),
             announcements=announcements,
             ann_total=ann_total,
@@ -10856,37 +11770,137 @@ async def _tga_drop_client_for(aid: int, log_out: bool = False) -> None:
         pass
 
 
-async def _tga_drop_all_clients(log_out: bool = False) -> None:
+async def _tga_drop_all_clients(log_out: bool = False, include_login: bool = False) -> None:
     ids = list(_tga["clients"].keys()) or [int(a["id"]) for a in tga_accounts_load()["accounts"]]
     for aid in ids:
         try:
             await _tga_drop_client_for(int(aid), log_out=log_out)
         except Exception as exc:  # noqa: BLE001
             _tga_log("drop-client", exc)
-    login_cl = _tga.get("login_client")
+    if include_login:
+        await _tga_drop_pending_login()
+
+
+
+def _tga_mask_login_phone(phone: str) -> str:
+    try:
+        return _tga_mask_phone(phone)
+    except Exception:  # noqa: BLE001
+        digits = re.sub(r"\D", "", phone or "")
+        if len(digits) >= 4:
+            return ("+" if (phone or "").startswith("+") else "") + ("*" * max(0, len(digits) - 4)) + digits[-4:]
+        return "****"
+
+
+def _tga_login_until_text(seconds: int) -> str:
+    seconds = max(1, int(seconds or 0))
+    when = datetime.now(TZ_CN) + timedelta(seconds=seconds)
+    return when.strftime("%Y-%m-%d %H:%M:%S") + " MYT"
+
+
+def _tga_sent_delivery(sent) -> dict:
+    typ = getattr(sent, "type", None)
+    raw = type(typ).__name__ if typ is not None else ""
+    table = {
+        "SentCodeTypeApp": ("app", "验证码已发到该号码已登录的 Telegram 客户端（不是短信）。请打开那台手机或电脑上的 Telegram 查看系统通知或「Telegram」对话。"),
+        "SentCodeTypeSms": ("sms", "验证码已通过短信发送，请查收短信。"),
+        "SentCodeTypeCall": ("call", "Telegram 将通过电话语音播报验证码，请留意来电。"),
+        "SentCodeTypeFlashCall": ("flash_call", "Telegram 将通过闪信来电验证，请留意来电号码。"),
+        "SentCodeTypeMissedCall": ("missed_call", "Telegram 将通过未接来电验证，请留意来电。"),
+        "SentCodeTypeEmailCode": ("email", "验证码已发到该账号绑定的邮箱，请查收邮件。"),
+        "SentCodeTypeFragmentSms": ("sms", "验证码已通过 Fragment 短信发送，请查收短信。"),
+        "SentCodeTypeFirebaseSms": ("sms", "验证码已通过短信发送，请查收短信。"),
+        "SentCodeTypeSetUpEmailRequired": ("email_setup", "Telegram 要求先设置邮箱才能继续登录。"),
+    }
+    kind, msg = table.get(raw, ("unknown", "验证码已发出。Telegram 通常把验证码发到该号码已登录的 Telegram 客户端，而不是短信。"))
+    next_typ = getattr(sent, "next_type", None)
+    next_raw = type(next_typ).__name__ if next_typ is not None else ""
+    next_kind = ""
+    if "Sms" in next_raw:
+        next_kind = "sms"
+    elif "Call" in next_raw:
+        next_kind = "call"
+    elif "App" in next_raw:
+        next_kind = "app"
+    timeout = int(getattr(sent, "timeout", 0) or 0)
+    return {"kind": kind, "message": msg, "raw": raw, "next": next_kind, "timeout": timeout}
+
+
+def _tga_login_public() -> dict:
+    login = _tga.get("login") or {}
+    if not login or time.time() - float(login.get("ts") or 0) > 900:
+        return {
+            "login_stage": None,
+            "login_new": False,
+            "login_delivery": "",
+            "login_message": "",
+            "login_phone_mask": "",
+            "login_attempt": "",
+            "login_can_resend": False,
+            "login_can_sms": False,
+            "login_expires": "",
+        }
+    left = max(0, int(900 - (time.time() - float(login.get("ts") or 0))))
+    expires = (datetime.now(TZ_CN) + timedelta(seconds=left)).strftime("%Y-%m-%d %H:%M:%S") + " MYT" if left else ""
+    return {
+        "login_stage": login.get("stage"),
+        "login_new": bool(login.get("is_new")),
+        "login_delivery": login.get("delivery") or "",
+        "login_message": login.get("message") or "",
+        "login_phone_mask": login.get("phone_mask") or "",
+        "login_attempt": login.get("attempt") or "",
+        "login_can_resend": login.get("stage") == "code",
+        "login_can_sms": bool(login.get("can_sms")) or (login.get("delivery") == "app"),
+        "login_expires": expires,
+    }
+
+
+def _tga_login_http_exc(exc: BaseException) -> HTTPException:
+    from telethon import errors
+    name = type(exc).__name__
+    secs = int(getattr(exc, "seconds", 0) or 0)
+    if isinstance(exc, errors.FloodWaitError) or "FloodWait" in name or "FloodPremium" in name:
+        secs = secs or 30
+        return HTTPException(status_code=429, detail=f"Telegram 限流，请等到 {_tga_login_until_text(secs)} 后再试（需等待约 {secs} 秒）")
+    if name == "PhoneNumberFloodError":
+        return HTTPException(status_code=429, detail="这个号码请求验证码过于频繁，请稍后再试，或在已登录的 Telegram 客户端里查看是否已有验证码")
+    if name == "PhoneNumberInvalidError":
+        return HTTPException(status_code=400, detail="手机号无效，请带国家区号，如 +60123456789")
+    if name == "PhoneNumberBannedError":
+        return HTTPException(status_code=400, detail="这个手机号已被 Telegram 封禁，无法登录")
+    if name in {"ApiIdInvalidError", "ApiIdPublishedFloodError"}:
+        return HTTPException(status_code=400, detail="api_id / api_hash 无效或被限制，请检查配置")
+    if name == "PhoneNumberUnoccupiedError":
+        return HTTPException(status_code=400, detail="这个手机号还没有注册 Telegram")
+    if name == "AuthRestartError":
+        return HTTPException(status_code=409, detail="登录状态已失效，请重新发送验证码")
+    return HTTPException(status_code=400, detail=f"Telegram 拒绝该操作（{name}）")
+
+
+async def _tga_drop_pending_login() -> None:
+    cl = _tga.get("login_client")
     _tga["login_client"] = None
     _tga["login"] = None
-    if login_cl is not None:
-        try:
-            await login_cl.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+    _tga["login_is_new"] = False
+    if cl is None:
+        return
+    try:
+        await cl.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _tga_ensure_login_client(reset: bool = False):
+    """Dedicated in-memory Telethon client for a login attempt. Never opens account session files."""
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     cfg = tga_cfg_load()
     if not tga_configured(cfg):
         raise HTTPException(status_code=409, detail="未配置 api_id / api_hash")
     cl = _tga.get("login_client")
-    if reset and cl is not None:
-        try:
-            await cl.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+    if reset:
+        await _tga_drop_pending_login()
         cl = None
-        _tga["login_client"] = None
     if cl is None:
         cl = TelegramClient(
             StringSession(None), int(cfg["api_id"]), str(cfg["api_hash"]),
@@ -11098,8 +12112,6 @@ async def _tga_client_async():
     if until > time.time():
         left = int(until - time.time())
         raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {left} 秒后再试")
-    if _tga.get("login_client") is not None or not tga_accounts_load()["accounts"]:
-        return await _tga_ensure_login_client()
     raise HTTPException(status_code=409, detail="请先登录 Telegram 账号")
 
 
@@ -11218,8 +12230,7 @@ def tga_status(force: bool = False) -> dict:
         "configured": configured,
         "logged_in": bool(configured and logged_in),
         "me": me if logged_in else None,
-        "login_stage": (login or {}).get("stage") if login and time.time() - login.get("ts", 0) < 900 else None,
-        "login_new": bool((login or {}).get("is_new")) if login else False,
+        **_tga_login_public(),
         "daily_cap": 0,
         "daily_unlimited": True,
         "today": _tga_count_today(),
@@ -11300,7 +12311,7 @@ async def tga_config_ep(request: Request, db: Session = Depends(get_db)):
     data = await _tga_json(request)
     cfg = tga_cfg_load()
     if data.get("action") == "clear":
-        await asyncio.to_thread(_tga_run, _tga_drop_all_clients(True), 30)
+        await asyncio.to_thread(_tga_run, _tga_drop_all_clients(True, include_login=True), 30)
         for a in list(tga_accounts_load()["accounts"]):
             tga_session_delete_for(int(a["id"]))
         tga_session_delete()
@@ -11322,13 +12333,14 @@ async def tga_config_ep(request: Request, db: Session = Depends(get_db)):
         if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
             raise HTTPException(status_code=400, detail="api_hash 应为 32 位十六进制字符串")
         if (str(cfg.get("api_id")), str(cfg.get("api_hash"))) != (api_id, api_hash):
-            await asyncio.to_thread(_tga_run, _tga_drop_all_clients(False), 30)
+            await asyncio.to_thread(_tga_run, _tga_drop_all_clients(False, include_login=True), 30)
         cfg["api_id"], cfg["api_hash"] = int(api_id), api_hash.lower()
     elif not tga_configured(cfg):
         raise HTTPException(status_code=400, detail="请填写 api_id 和 api_hash")
     cfg.pop("daily_cap", None)
     tga_cfg_save(cfg)
     return {"ok": True, "message": "已保存", **tga_status()}
+
 
 
 @app.post("/admin/tg-audio/login/send-code")
@@ -11345,32 +12357,96 @@ async def tga_send_code_ep(request: Request, db: Session = Depends(get_db)):
     if is_new and len(tga_accounts_load()["accounts"]) >= TGA_ACCT_MAX:
         raise HTTPException(status_code=400, detail=f"最多添加 {TGA_ACCT_MAX} 个 Telegram 账号")
     label = str(data.get("label") or "").strip()[:40]
-    _tga_check_flood()
     _tga_rate("send")
 
     async def go():
         from telethon import errors
+        # Fresh in-memory session only. Never opens or writes account #1 (or any account) session files.
         cl = await _tga_ensure_login_client(reset=True)
         try:
             sent = await cl.send_code_request(phone)
-        except errors.FloodWaitError as exc:
-            raise _tga_flood(exc)
-        except errors.PhoneNumberInvalidError:
-            raise HTTPException(status_code=400, detail="手机号无效")
-        except errors.PhoneNumberBannedError:
-            raise HTTPException(status_code=400, detail="这个手机号已被 Telegram 封禁")
-        except errors.ApiIdInvalidError:
-            raise HTTPException(status_code=400, detail="api_id / api_hash 无效，请检查配置")
-        except errors.RPCError as exc:
-            raise HTTPException(status_code=400, detail=f"Telegram 拒绝发送验证码（{type(exc).__name__}）")
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("login-send-code", exc)
+            await _tga_drop_pending_login()
+            raise _tga_login_http_exc(exc)
+        info = _tga_sent_delivery(sent)
+        attempt = secrets.token_urlsafe(8)
         _tga["login"] = {
-            "phone": phone, "hash": sent.phone_code_hash, "stage": "code",
-            "ts": time.time(), "is_new": bool(is_new), "label": label,
+            "phone": phone,
+            "hash": sent.phone_code_hash,
+            "stage": "code",
+            "ts": time.time(),
+            "is_new": bool(is_new),
+            "label": label,
+            "attempt": attempt,
+            "delivery": info["kind"],
+            "delivery_raw": info["raw"],
+            "message": info["message"],
+            "can_sms": info["kind"] != "sms" or info["next"] == "sms",
+            "phone_mask": _tga_mask_login_phone(phone),
         }
         _tga["login_is_new"] = bool(is_new)
+        print(f"[tg-audio] login send-code ok delivery={info['kind']} next={info['next'] or '-'} new={int(bool(is_new))}", flush=True)
+        return info
 
-    await asyncio.to_thread(_tga_run, go(), 40)
-    return {"ok": True, "stage": "code", "message": "验证码已发送到你的 Telegram（或短信），请在 15 分钟内输入"}
+    info = await asyncio.to_thread(_tga_run, go(), 40)
+    pub = _tga_login_public()
+    return {"ok": True, "stage": "code", "message": info["message"], **pub, **tga_status()}
+
+
+@app.post("/admin/tg-audio/login/resend")
+async def tga_resend_code_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    _tga_admin(request, db)
+    data = await _tga_json(request)
+    login = _tga["login"]
+    if not login or login.get("stage") not in {"code", "password"} or time.time() - login.get("ts", 0) > 900:
+        raise HTTPException(status_code=409, detail="请先发送验证码")
+    force_sms = bool(data.get("sms") or data.get("force_sms"))
+    _tga_rate("send")
+
+    async def go():
+        from telethon import errors
+        cl = await _tga_ensure_login_client()
+        phone = login["phone"]
+        try:
+            if force_sms:
+                try:
+                    sent = await cl.send_code_request(phone, force_sms=True)
+                except TypeError:
+                    sent = await cl.resend_code(phone, login["hash"])
+            else:
+                try:
+                    sent = await cl.resend_code(phone, login["hash"])
+                except Exception as exc:  # noqa: BLE001
+                    _tga_log("login-resend", exc)
+                    sent = await cl.send_code_request(phone)
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("login-resend", exc)
+            raise _tga_login_http_exc(exc)
+        info = _tga_sent_delivery(sent)
+        if getattr(sent, "phone_code_hash", None):
+            login["hash"] = sent.phone_code_hash
+        login["stage"] = "code"
+        login["ts"] = time.time()
+        login["delivery"] = info["kind"]
+        login["delivery_raw"] = info["raw"]
+        login["message"] = info["message"]
+        login["can_sms"] = info["kind"] != "sms" or info["next"] == "sms"
+        print(f"[tg-audio] login resend ok delivery={info['kind']} sms={int(force_sms)}", flush=True)
+        return info
+
+    info = await asyncio.to_thread(_tga_run, go(), 40)
+    pub = _tga_login_public()
+    return {"ok": True, "stage": "code", "message": info["message"], **pub, **tga_status()}
+
+
+@app.post("/admin/tg-audio/login/cancel")
+async def tga_login_cancel_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    _tga_admin(request, db)
+    await asyncio.to_thread(_tga_run, _tga_drop_pending_login(), 20)
+    return {"ok": True, "stage": None, "message": "已取消本次登录，未改动已保存的账号", **tga_status()}
 
 
 @app.post("/admin/tg-audio/login/code")
@@ -11381,10 +12457,11 @@ async def tga_code_ep(request: Request, db: Session = Depends(get_db)):
     code = re.sub(r"\D", "", str(data.get("code") or ""))
     login = _tga["login"]
     if not login or login.get("stage") != "code" or time.time() - login.get("ts", 0) > 900:
-        raise HTTPException(status_code=409, detail="请先发送验证码")
+        raise HTTPException(status_code=409, detail="请先发送验证码后再填写。若页面回到了手机号步骤，请重新发送一次。")
+    if not code:
+        raise HTTPException(status_code=400, detail="请输入 Telegram 客户端里收到的验证码（一般为 5 位数字）")
     if not 4 <= len(code) <= 8:
-        raise HTTPException(status_code=400, detail="验证码格式不对")
-    _tga_check_flood()
+        raise HTTPException(status_code=400, detail="验证码应为 4–8 位数字。请填写 Telegram 客户端里的验证码，通常不是短信。")
     _tga_rate("signin")
 
     async def go():
@@ -11395,21 +12472,25 @@ async def tga_code_ep(request: Request, db: Session = Depends(get_db)):
         except errors.SessionPasswordNeededError:
             login["stage"] = "password"
             login["ts"] = time.time()
+            login["message"] = "此账号开启了两步验证，请输入两步验证密码"
             return "password"
-        except errors.FloodWaitError as exc:
-            raise _tga_flood(exc)
-        except (errors.PhoneCodeInvalidError, errors.PhoneCodeEmptyError):
-            raise HTTPException(status_code=400, detail="验证码错误")
+        except errors.PhoneCodeInvalidError:
+            raise HTTPException(status_code=400, detail="验证码错误。请确认填写的是该号码已登录的 Telegram 客户端里的数字（通常不是短信）。")
+        except errors.PhoneCodeEmptyError:
+            raise HTTPException(status_code=400, detail="请输入验证码")
         except errors.PhoneCodeExpiredError:
-            _tga["login"] = None
+            await _tga_drop_pending_login()
             raise HTTPException(status_code=400, detail="验证码已过期，请重新发送")
-        except errors.RPCError as exc:
-            raise HTTPException(status_code=400, detail=f"登录失败（{type(exc).__name__}）")
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("login-code", exc)
+            if "Flood" in type(exc).__name__ or "PhoneCode" in type(exc).__name__:
+                raise _tga_login_http_exc(exc)
+            raise _tga_login_http_exc(exc)
         return "ok"
 
     res = await asyncio.to_thread(_tga_run, go(), 40)
     if res == "password":
-        return {"ok": True, "stage": "password", "message": "此账号开启了两步验证，请输入两步验证密码"}
+        return {"ok": True, "stage": "password", "message": "此账号开启了两步验证，请输入两步验证密码", **_tga_login_public(), **tga_status()}
     await asyncio.to_thread(_tga_finish_login)
     return {"ok": True, "stage": "done", "message": "登录成功", **tga_status()}
 
@@ -11425,7 +12506,6 @@ async def tga_password_ep(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="请先完成验证码步骤")
     if not pw or len(pw) > 256:
         raise HTTPException(status_code=400, detail="请输入两步验证密码")
-    _tga_check_flood()
     _tga_rate("signin")
 
     async def go():
@@ -11433,16 +12513,16 @@ async def tga_password_ep(request: Request, db: Session = Depends(get_db)):
         cl = await _tga_ensure_login_client()
         try:
             await cl.sign_in(password=pw)
-        except errors.FloodWaitError as exc:
-            raise _tga_flood(exc)
         except errors.PasswordHashInvalidError:
             raise HTTPException(status_code=400, detail="两步验证密码错误")
-        except errors.RPCError as exc:
-            raise HTTPException(status_code=400, detail=f"登录失败（{type(exc).__name__}）")
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("login-password", exc)
+            raise _tga_login_http_exc(exc)
 
     await asyncio.to_thread(_tga_run, go(), 40)
     await asyncio.to_thread(_tga_finish_login)
     return {"ok": True, "stage": "done", "message": "登录成功", **tga_status()}
+
 
 
 def _tga_finish_login() -> None:

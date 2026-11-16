@@ -8,14 +8,14 @@
 #music .track-list { padding-right: 8px; padding-bottom: 108px; }
 #music .track-item {
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr) 44px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
   column-gap: 8px;
   align-items: center;
   overflow: visible !important;
 }
 #music .play-btn { grid-column: 1; grid-row: 1; }
 #music .track-meta { grid-column: 2; grid-row: 1; min-width: 0; }
-#music .track-fav { grid-column: 3; grid-row: 1; }
+#music .track-actions { grid-column: 3; grid-row: 1; }
 </style>
 {% endblock %}
 {% block content %}

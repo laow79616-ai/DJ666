@@ -19,17 +19,24 @@
 <ul class="track-list" id="{{ list_id }}" data-playlist="{{ name }}">
   {% for track in tracks %}
   {% set fav = user and track.id in favorite_ids %}
-  <li class="track-item" data-src="{{ track_audio_url(track) }}" data-title="{{ track.title }}" data-track-id="{{ track.id }}" data-track-cat="{{ track.category or '' }}" data-fav="{{ '1' if fav else '0' }}">
+  <li class="track-item" data-src="{{ track_audio_url(track) }}" data-title="{{ track.title }}" data-track-id="{{ track.id }}" data-track-cat="{{ track.category or '' }}" data-fav="{{ '1' if fav else '0' }}" data-plays="{{ track.play_count or 0 }}" data-favs="{{ track.favorite_count or 0 }}" id="t-{{ track.id }}">
     <button type="button" class="play-btn" aria-label="播放 {{ track.title }}">▶</button>
     <div class="track-meta">
       <strong class="track-title"><span class="track-title-text">{{ track.title }}</span></strong>
       <span class="track-now" hidden><i class="track-eq" aria-hidden="true"><b></b><b></b><b></b></i><span class="track-now-text">正在播放</span></span>
+      <span class="track-stats" aria-label="试听 {{ (track.play_count or 0)|stat_count }}，收藏 {{ (track.favorite_count or 0)|stat_count }}">
+        <span class="track-stat" title="试听次数（真实播放）"><i aria-hidden="true">▶</i><b data-play-count="{{ track.id }}">{{ (track.play_count or 0)|stat_count }}</b></span>
+        <span class="track-stat" title="收藏次数"><i aria-hidden="true">♥</i><b data-fav-count="{{ track.id }}">{{ (track.favorite_count or 0)|stat_count }}</b></span>
+      </span>
     </div>
+    <div class="track-actions">
+      <button type="button" class="track-share" data-share-track="{{ track.id }}" data-share-title="{{ track.title }}" aria-haspopup="true" aria-expanded="false" aria-label="分享 {{ track.title }}" title="分享">分享</button>
     {% if user %}
     <button type="button" class="track-fav{% if fav %} is-on{% endif %}" data-fav-toggle="{{ track.id }}" aria-pressed="{{ 'true' if fav else 'false' }}" aria-label="{{ '取消收藏' if fav else '收藏' }} {{ track.title }}" title="{{ '取消收藏' if fav else '收藏' }}"><span class="track-fav-ico" aria-hidden="true">{{ '♥' if fav else '♡' }}</span><span class="track-fav-label">收藏</span></button>
     {% else %}
     <button type="button" class="track-fav" data-fav-login aria-label="登录后收藏 {{ track.title }}" title="登录后收藏"><span class="track-fav-ico" aria-hidden="true">♡</span><span class="track-fav-label">收藏</span></button>
     {% endif %}
+    </div>
   </li>
   {% endfor %}
 </ul>
