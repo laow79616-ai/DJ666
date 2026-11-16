@@ -319,8 +319,15 @@
       stTxt.push(a.authorized ? "已授权" : "未授权");
       stTxt.push(a.enabled ? "启用" : "已暂停");
       if (a.busy) stTxt.push("使用中");
+      if (!a.enabled) stTxt.push("管理员已暂停");
       var cool = a.cooling ? ((a.cooling_until || "") + (a.cooling_reason ? "（" + a.cooling_reason + "）" : "")) : "—";
       var counts = "成功 " + (a.ok_count || 0) + " / 失败 " + (a.fail_count || 0);
+      var chStatus = (a.channels || []).map(function (c) {
+        var lab = { readable: "可读", joined: "已加入", need_join: "需加入", need_invite: "需邀请链接", flood: "短暂限流", error: "失败", unknown: "未检查" }[c.status] || c.status;
+        var extra = c.error_name && c.status !== "readable" && c.status !== "joined" ? ("（" + c.error_name + "）") : "";
+        return esc(c.key) + "：" + esc(lab) + esc(extra);
+      }).join("<br>");
+      if (!chStatus) chStatus = "尚未检查";
       tr.innerHTML =
         "<td class='tga-acct-who'><b>" + esc(a.label || ("账号 " + a.id)) + "</b>" +
           "<span>" + esc(a.phone_mask || "号码未记录") + (a.name ? " · " + esc(a.name) : "") +
@@ -329,6 +336,7 @@
         "<td class='tga-acct-cool'>" + esc(cool) + "</td>" +
         "<td>" + esc(a.last_used || "—") + "</td>" +
         "<td>" + esc(counts) + "</td>" +
+        "<td class='tga-acct-ch'>" + chStatus + "</td>" +
         "<td class='tga-acct-err'>" + esc(a.last_error || "") + "</td>" +
         "<td class='tga-auto-acts'></td>";
       var acts = tr.querySelector(".tga-auto-acts");
@@ -417,6 +425,7 @@
           ? '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="pause" data-key="' + esc(ch.key) + '">暂停</button>'
           : '<button type="button" class="btn btn-sm" data-auto-act="enable" data-key="' + esc(ch.key) + '">启用</button>';
         acts += '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="check" data-key="' + esc(ch.key) + '">立即检查</button>';
+        acts += '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="invite" data-key="' + esc(ch.key) + '">' + (ch.has_invite ? "更新邀请链接" : "邀请链接") + "</button>";
         acts += '<button type="button" class="btn btn-sm btn-ghost" data-auto-act="remove" data-key="' + esc(ch.key) + '">移除</button>';
         return '<tr><td><div class="tga-auto-title"><b>' + name + "</b><span>" + esc(uname) + "</span></div></td>" +
           "<td>" + en + "</td><td class=\"tga-num\">" + esc(ch.last_check || "—") + "</td>" +
@@ -680,6 +689,12 @@
     var action = btn.getAttribute("data-auto-act");
     var key = btn.getAttribute("data-key") || "";
     if (action === "remove" && !confirm("从自动采集列表移除这个频道？已导入的曲目不会删除。")) return;
+    if (action === "invite") {
+      var link = window.prompt("私有频道请粘贴邀请链接（https://t.me/+…）。公开频道通常不需要。", "");
+      if (link == null) return;
+      autoAction(btn, "/admin/tg-audio/auto/channels/edit", { key: key, action: "invite", invite: link }, "保存中…");
+      return;
+    }
     autoAction(btn, "/admin/tg-audio/auto/channels/edit", { key: key, action: action }, "处理中…");
   });
 
@@ -740,6 +755,11 @@
     act(this, "POST", "/admin/tg-audio/login/password", { password: password, new: true }, "登录中…").then(function () {
       var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone");
     });
+  });
+
+  var accBtn = $("#tgaAcctAccessBtn");
+  if (accBtn) accBtn.addEventListener("click", function () {
+    act(this, "POST", "/admin/tg-audio/accounts/access-check", {}, "检查中…");
   });
 
   load();

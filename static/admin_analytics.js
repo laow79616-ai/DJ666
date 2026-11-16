@@ -86,3 +86,27 @@
     if (location.hash === "#stats") load();
   }, 30000);
 })();
+
+
+  (function settingsForm() {
+    var form = document.getElementById("anAdminPlaysForm");
+    if (!form) return;
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var csrfEl = form.querySelector('input[name="csrf_token"]');
+      var box = document.getElementById("anCountAdminPlays");
+      var body = { csrf_token: csrfEl ? csrfEl.value : "", count_admin_plays: box && box.checked ? "1" : "0" };
+      fetch("/admin/analytics/settings", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "Accept": "application/json", "X-CSRF-Token": body.csrf_token },
+        body: JSON.stringify(body)
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        var msg = document.getElementById("anAdminPlaysMsg");
+        if (msg) msg.textContent = (d && d.message) || (d && d.ok ? "已保存" : "保存失败");
+      }).catch(function () {
+        var msg = document.getElementById("anAdminPlaysMsg");
+        if (msg) msg.textContent = "保存失败，请重试";
+      });
+    });
+  })();

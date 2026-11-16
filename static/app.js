@@ -15,6 +15,7 @@
   var MODES = [["loop", "🔁", "列表循环"], ["one", "🔂", "单曲循环"], ["shuffle", "🔀", "随机播放"]];
 
   var st = { queue: [], index: -1, time: 0, playing: false, volume: 1, muted: false, mode: "loop" };
+  var playSent = {};
   try {
     var saved = JSON.parse(sessionStorage.getItem(KEY) || "null");
     if (saved && Array.isArray(saved.queue)) st = Object.assign(st, saved);
@@ -30,6 +31,25 @@
     try { sessionStorage.setItem(KEY, JSON.stringify(st)); } catch (e) {}
   }
   function cur() { return st.queue[st.index] || null; }
+  function resolveTrackId(t) {
+    if (!t) return "";
+    if (t.id) return String(t.id);
+    var found = "";
+    document.querySelectorAll(".track-item[data-track-id][data-src]").forEach(function (el) {
+      if (!found && sameSrc(el.dataset.src, t.src)) found = el.dataset.trackId || "";
+    });
+    if (found) t.id = found;
+    return found;
+  }
+  function reportStartedPlay() {
+    var t = cur();
+    var id = resolveTrackId(t);
+    if (!id || playSent[id]) return;
+    playSent[id] = 1;
+    if (window.dj666Analytics && window.dj666Analytics.reportPlay) {
+      window.dj666Analytics.reportPlay(id);
+    }
+  }
   function sameSrc(a, b) {
     try { return new URL(a, location.href).pathname === new URL(b, location.href).pathname; } catch (e) { return a === b; }
   }
@@ -455,23 +475,11 @@
     render();
   });
   audio.addEventListener("play", function () { st.playing = true; render(); save(true); });
+  // Count a play when playback actually starts (not merely when play() is called).
+  audio.addEventListener("playing", function () { reportStartedPlay(); });
   audio.addEventListener("pause", function () { if (!audio.ended) { st.playing = false; } render(); save(true); });
   audio.addEventListener("ended", function () { step(1, true); });
-  var playSent = {};
-  audio.addEventListener("timeupdate", function () {
-    save(false);
-    var t = cur();
-    if (!t || !t.id || playSent[t.id]) return;
-    var dur = audio.duration;
-    if (!isFinite(dur) || dur <= 0) return;
-    var need = Math.min(30, dur * 0.5);
-    if (audio.currentTime >= need) {
-      playSent[t.id] = 1;
-      if (window.dj666Analytics && window.dj666Analytics.reportPlay) {
-        window.dj666Analytics.reportPlay(t.id);
-      }
-    }
-  });
+  audio.addEventListener("timeupdate", function () { save(false); });
   audio.addEventListener("volumechange", function () { save(true); });
   audio.addEventListener("error", function () {
     if (cur()) { subEl.textContent = "无法播放此曲目（可能已下架或需要登录）"; }

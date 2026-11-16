@@ -513,7 +513,8 @@ AN_PLAY_DEDUP = 30 * 60            # one counted play per visitor per track per 
 AN_PLAY_SEC = 30.0
 AN_PLAY_RATIO = 0.5
 AN_HEARTBEAT_MAX_MS = 60_000
-AN_EXCLUDE_ADMIN = True
+AN_EXCLUDE_ADMIN = True            # visits/dwell/shares: never count admin by default
+AN_SETTING_ADMIN_PLAYS = "analytics_count_admin_plays"  # "1" to count admin 试听; default off
 AN_BOT_RE = re.compile(
     r"bot|spider|crawl|slurp|curl|wget|python-requests|python-urllib|go-http|okhttp|"
     r"facebookexternalhit|preview|headless|lighthouse|pingdom|uptimerobot|bytespider|"
@@ -981,6 +982,24 @@ def _an_flush_heartbeat(db: Session, evt: dict) -> None:
     _an_open_sessions[vid] = sess.id
 
 
+def an_count_admin_plays(db: Optional["Session"] = None) -> bool:
+    """Admin 试听 are excluded unless the dashboard toggle is on (default off)."""
+    close = False
+    if db is None:
+        db = SessionLocal()
+        close = True
+    try:
+        return get_setting(db, AN_SETTING_ADMIN_PLAYS, "0") == "1"
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if close:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _an_flush_play(db: Session, evt: dict) -> Optional[int]:
     vid = evt.get("visitor_key") or ""
     try:
@@ -989,7 +1008,7 @@ def _an_flush_play(db: Session, evt: dict) -> Optional[int]:
         tid = 0
     if tid <= 0 or not _an_valid_vid(vid):
         return None
-    if evt.get("is_admin") and AN_EXCLUDE_ADMIN:
+    if evt.get("is_admin") and not an_count_admin_plays(db):
         return None
     now = _an_now()
     recent = db.scalar(
@@ -1260,7 +1279,8 @@ def analytics_dashboard(db: Session, *, session_limit: int = 60) -> dict:
         "share_inbound": _ratio(inbound, inbound_total),
         "share_inbound_total": inbound_total,
         "exclude_admin": AN_EXCLUDE_ADMIN,
-        "play_rule": "同一访客对同一曲目 30 分钟内计 1 次；需播放满 30 秒或时长的 50%（取较短者）",
+        "count_admin_plays": an_count_admin_plays(db),
+        "play_rule": "同一访客对同一曲目 30 分钟内计 1 次；在实际开始播放时立即记录（playing）",
     }
 
 
@@ -5520,6 +5540,35 @@ def admin_analytics_json(request: Request, db: Session = Depends(get_db)):
     )
 
 
+@app.post("/admin/analytics/settings")
+async def admin_analytics_settings(request: Request, db: Session = Depends(get_db)):
+    """Toggle whether logged-in admin plays are counted. Default is off."""
+    require_admin(request, db)
+    data = {}
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        token = str(data.get("csrf") or data.get("csrf_token") or request.headers.get("x-csrf-token") or "")
+    else:
+        form = await request.form()
+        data = dict(form)
+        token = str(data.get("csrf_token") or data.get("csrf") or request.headers.get("x-csrf-token") or "")
+    require_csrf(request, token)
+    raw = data.get("count_admin_plays")
+    on = str(raw).strip().lower() in {"1", "true", "on", "yes"}
+    set_setting(db, AN_SETTING_ADMIN_PLAYS, "1" if on else "0")
+    return JSONResponse({
+        "ok": True,
+        "count_admin_plays": on,
+        "message": "已开启：管理员试听会计入次数" if on else "已关闭：管理员试听不计入前台次数（默认）",
+    })
+
+
 @app.post("/api/analytics/beacon")
 async def analytics_beacon(request: Request, db: Session = Depends(get_db)):
     """Lightweight first-party beacon (heartbeat, play, share). Raw IPs are not stored."""
@@ -5596,7 +5645,14 @@ async def analytics_beacon(request: Request, db: Session = Depends(get_db)):
         {"track_id": tid, "play_count": n, "play_label": format_stat_count(n)}
         for tid, n in plays.items()
     ]
-    return JSONResponse({"ok": True, "plays": out_plays})
+    ignored = ""
+    if any(evt.get("type") == "play" for evt in batch) and not out_plays:
+        if is_admin and not an_count_admin_plays(db):
+            ignored = "admin"
+    body = {"ok": True, "plays": out_plays}
+    if ignored:
+        body["ignored"] = ignored
+    return JSONResponse(body)
 
 
 
@@ -11487,7 +11543,25 @@ def _tga_touch_current(aid: Optional[int]) -> None:
     )
 
 
-def tga_acct_pick(exclude=None, *, require_idle: bool = False) -> Optional[dict]:
+def tga_acct_channel_blocked(aid: int, ref: str = "", ch: Optional[dict] = None) -> bool:
+    """True when a recent access check showed this account cannot read the channel (not a temporary flood)."""
+    if not aid or not (ref or ch):
+        return False
+    key = tga_access_chan_key(ref or "", ch=ch)
+    rec = ((tga_access_load().get(str(int(aid))) or {}).get(key) or {})
+    status = rec.get("status") or ""
+    ename = rec.get("error_name") or ""
+    if status in {"need_invite", "need_join"}:
+        return True
+    if status == "error" and ename in {
+        "UserBannedInChannelError", "ChannelBannedError", "ChannelsTooMuchError",
+        "UsernameNotOccupiedError", "AuthKeyUnregisteredError",
+    }:
+        return True
+    return False
+
+
+def tga_acct_pick(exclude=None, *, require_idle: bool = False, for_ref: str = "", for_ch: Optional[dict] = None) -> Optional[dict]:
     now = time.time()
     exclude = {int(x) for x in (exclude or ()) if x}
     with _tga_lock:
@@ -11503,6 +11577,8 @@ def tga_acct_pick(exclude=None, *, require_idle: bool = False) -> Optional[dict]
             if fu > now:
                 continue
             if require_idle and aid in _tga["busy_accounts"]:
+                continue
+            if (for_ref or for_ch) and tga_acct_channel_blocked(aid, for_ref, for_ch):
                 continue
             cands.append(a)
         if not cands:
@@ -12002,7 +12078,9 @@ def tga_accounts_public() -> list[dict]:
             "last_used": _tga_fmt_myt(float(a.get("last_used") or 0)) if a.get("last_used") else "",
             "ok_count": int(a.get("ok_count") or 0),
             "fail_count": int(a.get("fail_count") or 0),
-            "last_error": a.get("last_error") or "",
+            "last_error": ("" if (not cooling and (("限流" in str(a.get("last_error") or "")) or ("Flood" in str(a.get("last_error") or "")))) else (a.get("last_error") or "")),
+            "paused_by_admin": (not bool(a.get("enabled", True))),
+            "channels": tga_access_for_account(aid),
             "in_use": (int(current) == aid) if current else False,
             "busy": aid in busy,
         })
@@ -12756,38 +12834,364 @@ def _tga_chat_public(ent) -> dict:
             "members": getattr(ent, "participants_count", None)}
 
 
+
+TGA_ACCESS_PATH = DATA_DIR / "tga_channel_access.json"
+
+
+def _tga_invite_hash(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("+") and re.fullmatch(r"\+[A-Za-z0-9_-]{8,64}", raw):
+        return raw[1:]
+    m = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/\+([A-Za-z0-9_-]{8,64})", raw, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"joinchat/([A-Za-z0-9_-]{8,64})", raw, re.I)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _tga_username_for_id(cid: int) -> str:
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return ""
+    aliases = _tga_id_aliases(cid)
+    try:
+        for ch in (tga_auto_load().get("channels") or []):
+            key = str(ch.get("key") or "")
+            if key.startswith("id:"):
+                try:
+                    if int(key[3:]) in aliases:
+                        u = (ch.get("username") or "").lstrip("@")
+                        if u:
+                            return u
+                except (TypeError, ValueError):
+                    pass
+            u = (ch.get("username") or "").lstrip("@")
+            if u and str(ch.get("chat_id") or "") in {str(cid), str(abs(cid))}:
+                return u
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for e in tga_recent_load():
+            if str(e.get("key") or "") == f"id:{cid}" or str(e.get("key") or "") == f"id:{abs(cid)}":
+                u = (e.get("username") or "").lstrip("@")
+                if u:
+                    return u
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _tga_invite_for_id(cid: int) -> str:
+    aliases = _tga_id_aliases(cid)
+    try:
+        for ch in (tga_auto_load().get("channels") or []):
+            key = str(ch.get("key") or "")
+            try:
+                kid = int(key[3:]) if key.startswith("id:") else 0
+            except (TypeError, ValueError):
+                kid = 0
+            if kid in aliases or kid == cid:
+                inv = (ch.get("invite") or "").strip()
+                if inv:
+                    return inv
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _tga_best_ref(ref: str, ch: Optional[dict] = None) -> str:
+    """Prefer @username (or an invite) over id:, so we never reuse another account's access_hash."""
+    if ch:
+        u = (ch.get("username") or "").lstrip("@")
+        if u:
+            return "@" + u
+        inv = (ch.get("invite") or "").strip()
+        h = _tga_invite_hash(inv)
+        if h:
+            return "+" + h
+        r2 = (ch.get("ref") or "").strip()
+        if r2.startswith("@") or _tga_invite_hash(r2):
+            return ("+" + _tga_invite_hash(r2)) if _tga_invite_hash(r2) and not r2.startswith("@") else r2
+    raw = (ref or "").strip()
+    h = _tga_invite_hash(raw)
+    if h:
+        return "+" + h
+    if raw.startswith("@"):
+        return raw
+    if raw.startswith("id:"):
+        try:
+            cid = int(raw[3:])
+        except (TypeError, ValueError):
+            return raw
+        u = _tga_username_for_id(cid)
+        if u:
+            return "@" + u
+        inv = _tga_invite_for_id(cid)
+        h = _tga_invite_hash(inv)
+        if h:
+            return "+" + h
+    if re.fullmatch(r"[A-Za-z0-9_]{4,64}", raw.lstrip("@")):
+        return "@" + raw.lstrip("@")
+    return raw
+
+
+def _tga_peer_hash(aid: Optional[int], cid: int) -> Optional[int]:
+    """Per-account access_hash only. Never fall back to another account's hash."""
+    if not aid:
+        return None
+    peers = tga_acct_rt(int(aid)).setdefault("peers", {})
+    try:
+        ah = peers.get(int(cid))
+        return int(ah) if ah is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _tga_peer_remember(aid: Optional[int], ent) -> None:
+    if not aid or ent is None:
+        return
+    ah = getattr(ent, "access_hash", None)
+    eid = getattr(ent, "id", None)
+    if ah is None or eid is None:
+        return
+    try:
+        tga_acct_rt(int(aid)).setdefault("peers", {})[int(eid)] = int(ah)
+    except (TypeError, ValueError):
+        pass
+
+
+def tga_access_load() -> dict:
+    data = _tga_json_load(TGA_ACCESS_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+
+def tga_access_save(data: dict) -> None:
+    try:
+        _tga_write_private(TGA_ACCESS_PATH, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tga_access_chan_key(ref: str = "", ent=None, ch: Optional[dict] = None) -> str:
+    if ch and ch.get("username"):
+        return "@" + str(ch.get("username")).lstrip("@").lower()
+    u = (getattr(ent, "username", None) or "").lstrip("@").lower() if ent is not None else ""
+    if u:
+        return "@" + u
+    raw = _tga_best_ref(ref or "", ch)
+    if raw.startswith("@"):
+        return raw.lower()
+    if raw.startswith("id:"):
+        return raw
+    if ent is not None and getattr(ent, "id", None):
+        return f"id:{int(ent.id)}"
+    return (ref or "")[:80]
+
+
+def tga_access_set(aid: Optional[int], channel_key: str, *, status: str, reason: str = "", error_name: str = "", joined: Optional[bool] = None) -> None:
+    if not aid or not channel_key:
+        return
+    with _tga_lock:
+        data = tga_access_load()
+        acc = data.setdefault(str(int(aid)), {})
+        rec = acc.get(channel_key) if isinstance(acc.get(channel_key), dict) else {}
+        rec.update({
+            "status": status,
+            "reason": (reason or "")[:200],
+            "error_name": (error_name or "")[:80],
+            "checked": time.time(),
+        })
+        if joined is not None:
+            rec["joined"] = bool(joined)
+        acc[channel_key] = rec
+        tga_access_save(data)
+
+
+def tga_access_for_account(aid: int) -> list[dict]:
+    data = tga_access_load()
+    acc = data.get(str(int(aid))) or {}
+    rows = []
+    seen = set()
+    keys = []
+    for ch in (tga_auto_load().get("channels") or []):
+        k = tga_access_chan_key(ch.get("ref") or "", ch=ch)
+        if k:
+            keys.append((k, ch.get("title") or ch.get("username") or k))
+    for k, title in keys:
+        rec = acc.get(k) if isinstance(acc.get(k), dict) else {}
+        rows.append({
+            "key": k,
+            "title": title,
+            "status": rec.get("status") or "unknown",
+            "reason": rec.get("reason") or "",
+            "error_name": rec.get("error_name") or "",
+            "joined": rec.get("joined"),
+            "checked": _tga_fmt_myt(rec.get("checked") or 0) if rec.get("checked") else "",
+        })
+        seen.add(k)
+    for k, rec in acc.items():
+        if k in seen or not isinstance(rec, dict):
+            continue
+        rows.append({
+            "key": k,
+            "title": k,
+            "status": rec.get("status") or "unknown",
+            "reason": rec.get("reason") or "",
+            "error_name": rec.get("error_name") or "",
+            "joined": rec.get("joined"),
+            "checked": _tga_fmt_myt(rec.get("checked") or 0) if rec.get("checked") else "",
+        })
+    return rows
+
+
+def tga_acct_tidy_flood() -> None:
+    """Expired short flood waits must not look like a ban or a paused account. Never auto-disable."""
+    with _tga_lock:
+        st = tga_accounts_load()
+        changed = False
+        now = time.time()
+        for a in st["accounts"]:
+            fu = float(a.get("flood_until") or 0)
+            err = str(a.get("last_error") or "")
+            is_flood_err = ("限流" in err) or ("Flood" in err)
+            if fu and fu <= now:
+                a["flood_until"] = 0.0
+                a["flood_reason"] = ""
+                changed = True
+                rt = _tga["acct_rt"].get(int(a["id"]))
+                if rt:
+                    rt["flood_until"] = 0.0
+                    rt["flood_reason"] = ""
+            if is_flood_err and fu <= now:
+                a["last_error"] = ""
+                # Historical FloodPremium failures were counted as fail_count; reset when only a flood is on record.
+                if int(a.get("fail_count") or 0) and not a.get("last_error"):
+                    a["fail_count"] = 0
+                changed = True
+        if changed:
+            tga_accounts_save(st)
+
+
+async def _tga_join_public(cl, ent, ref: str = "", account_id: Optional[int] = None) -> tuple[bool, str]:
+    """Join a public @username channel the admin configured. Returns (ok, reason)."""
+    from telethon import errors
+    from telethon.tl.functions.channels import JoinChannelRequest
+    username = (getattr(ent, "username", None) or "").lstrip("@")
+    if not username:
+        return False, "no_username"
+    if not _tga_channel_is_configured(ent, ref):
+        return False, "not_configured"
+    try:
+        await cl(JoinChannelRequest(ent))
+        return True, "joined"
+    except errors.FloodWaitError as exc:
+        raise
+    except errors.UserAlreadyParticipantError:
+        return True, "already"
+    except errors.ChannelsTooMuchError:
+        return False, "ChannelsTooMuchError"
+    except (errors.UserBannedInChannelError, errors.ChannelBannedError, errors.ChatAdminRequiredError) as exc:
+        return False, type(exc).__name__
+    except errors.ChannelPrivateError:
+        return False, "ChannelPrivateError"
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("join-public", exc)
+        return False, type(exc).__name__
+
+
+async def _tga_import_invite(cl, invite_raw: str, account_id: Optional[int] = None):
+    from telethon import errors
+    from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+    from telethon.tl.types import ChatInviteAlready
+    h = _tga_invite_hash(invite_raw)
+    if not h:
+        raise HTTPException(status_code=400, detail="请提供有效的邀请链接（https://t.me/+… 或 t.me/joinchat/…）")
+    try:
+        checked = await cl(CheckChatInviteRequest(h))
+        if isinstance(checked, ChatInviteAlready):
+            return checked.chat, "already"
+        ent = await cl(ImportChatInviteRequest(h))
+        # Import may return Updates
+        ch = getattr(ent, "chats", None)
+        if ch:
+            return ch[0], "joined"
+        return ent, "joined"
+    except errors.FloodWaitError:
+        raise
+    except errors.UserAlreadyParticipantError:
+        checked = await cl(CheckChatInviteRequest(h))
+        chat = getattr(checked, "chat", None)
+        if chat is not None:
+            return chat, "already"
+        raise HTTPException(status_code=403, detail="已在该频道中，但无法解析频道实体")
+    except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+        raise HTTPException(status_code=404, detail="邀请链接已失效或无效")
+    except errors.ChannelsTooMuchError:
+        raise HTTPException(status_code=400, detail="这个账号加入的频道/群组过多，请先退出一些后再试")
+    except (errors.UserBannedInChannelError, errors.ChannelBannedError) as exc:
+        raise HTTPException(status_code=403, detail=f"这个账号无法加入该频道（{type(exc).__name__}）")
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("import-invite", exc)
+        raise HTTPException(status_code=400, detail=f"加入邀请链接失败（{type(exc).__name__}）")
+
+
+async def _tga_maybe_join_public(cl, ent, ref: str = "") -> bool:
+    """Join a public channel only if the admin already configured it."""
+    ok, _reason = await _tga_join_public(cl, ent, ref)
+    return ok
+
+
 async def _tga_entity(cl, ref: str, account_id: Optional[int] = None, try_join: bool = True):
-    """Resolve a normalised ref to a channel / group entity, raising HTTPException with the real reason."""
+    """Resolve a ref for THIS account only. Never reuse another account's InputPeer/access_hash."""
     from telethon import errors
     from telethon.tl.functions.contacts import ResolveUsernameRequest
     from telethon.tl.functions.messages import CheckChatInviteRequest
-    from telethon.tl.types import ChatInviteAlready, ChatInvitePeek, PeerChannel
+    from telethon.tl.types import ChatInviteAlready, ChatInvitePeek, PeerChannel, InputPeerChannel
     aid = int(account_id) if account_id else _tga.get("current_id")
+    raw_in = ref
+    ref = _tga_best_ref(ref)
     entities = tga_acct_rt(int(aid))["entities"] if aid else _tga["entities"]
+    ent = None
     try:
         if ref.startswith("id:"):
             cid = int(ref[3:])
             ent = entities.get(cid)
             if ent is None:
+                ah = _tga_peer_hash(aid, cid)
                 try:
-                    ah = tga_recent_access_hash(cid)
                     if ah is not None:
-                        from telethon.tl.types import InputPeerChannel
                         ent = await cl.get_entity(InputPeerChannel(cid, ah))
                     else:
+                        # Last resort: no cross-account hash. Ask Telegram via PeerChannel (may fail).
                         ent = await cl.get_entity(PeerChannel(cid))
-                except ValueError:
-                    raise HTTPException(status_code=404, detail="这个频道还没有缓存，请用链接 https://t.me/频道名 打开，或先搜索后点击结果（私有频道需要当前账号已加入）")
+                except (ValueError, TypeError, errors.ChannelInvalidError, errors.ChannelPrivateError, errors.PeerIdInvalidError) as exc:
+                    u = _tga_username_for_id(cid)
+                    if u:
+                        return await _tga_entity(cl, "@" + u, account_id=aid, try_join=try_join)
+                    inv = _tga_invite_for_id(cid)
+                    if inv and try_join:
+                        ent, _st = await _tga_import_invite(cl, inv, account_id=aid)
+                    else:
+                        print(f"[tg-audio] resolve aid={aid or '-'} ref=id:{cid} err={type(exc).__name__} (no per-account hash; will not reuse another account's access_hash)", flush=True)
+                        raise HTTPException(status_code=404, detail="当前账号还没有这个频道的访问凭证。请用 @用户名 打开公开频道，或为私有频道填写邀请链接。")
         elif ref.startswith("+"):
             inv = await cl(CheckChatInviteRequest(ref[1:]))
-            if isinstance(inv, (ChatInviteAlready, ChatInvitePeek)):
+            if isinstance(inv, ChatInviteAlready):
                 ent = inv.chat
+            elif isinstance(inv, ChatInvitePeek) and not try_join:
+                ent = inv.chat
+            elif try_join:
+                ent, _st = await _tga_import_invite(cl, ref, account_id=aid)
             else:
                 title = getattr(inv, "title", "") or "该频道"
-                raise HTTPException(status_code=403, detail=f"这是邀请链接（{title}），当前账号还没有加入。请先在 Telegram 里用该账号加入后再打开；系统不会自动加入频道。")
+                raise HTTPException(status_code=403, detail=f"这是邀请链接（{title}），当前账号还没有加入。请在频道设置里保存邀请链接，系统会按账号加入。")
         else:
             res = await cl(ResolveUsernameRequest(ref.lstrip("@")))
-            ent = None
             peer = res.peer
             pid = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
             if pid is not None:
@@ -12800,35 +13204,76 @@ async def _tga_entity(cl, ref: str, account_id: Optional[int] = None, try_join: 
     except HTTPException:
         raise
     except errors.FloodWaitError as exc:
+        tga_access_set(aid, tga_access_chan_key(ref or raw_in), status="flood", reason=f"限流 {int(getattr(exc, 'seconds', 0) or 0)} 秒", error_name=type(exc).__name__)
         raise _tga_flood(exc)
     except errors.UsernameNotOccupiedError:
+        tga_access_set(aid, tga_access_chan_key(ref or raw_in), status="error", reason="用户名不存在", error_name="UsernameNotOccupiedError")
         raise HTTPException(status_code=404, detail=f"用户名 {ref} 不存在（没有任何频道或用户使用这个用户名），请检查拼写")
     except errors.UsernameInvalidError:
         raise HTTPException(status_code=400, detail=f"用户名 {ref} 格式无效")
     except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+        tga_access_set(aid, tga_access_chan_key(ref or raw_in), status="need_invite", reason="邀请链接无效或已过期", error_name=type(errors.InviteHashInvalidError).__name__)
         raise HTTPException(status_code=404, detail="邀请链接已失效或无效")
-    except (errors.ChannelPrivateError, errors.ChannelInvalidError):
-        raise HTTPException(status_code=403, detail="这是私有频道，或当前账号被移出/封禁，无法读取")
+    except (errors.ChannelPrivateError, errors.ChannelInvalidError) as exc:
+        # Public channels can raise ChannelPrivate when the account has not joined, or when a foreign access_hash was used.
+        u = (ref.lstrip("@") if (ref or "").startswith("@") else _tga_username_for_id(int(ref[3:]) if (ref or "").startswith("id:") else 0))
+        inv = _tga_invite_for_id(int(ref[3:]) if (ref or "").startswith("id:") else 0) if (ref or "").startswith("id:") else ""
+        print(f"[tg-audio] resolve aid={aid or '-'} ref={ref} err={type(exc).__name__}", flush=True)
+        if try_join and u and _tga_channel_is_configured(None, "@" + u):
+            try:
+                res = await cl(ResolveUsernameRequest(u))
+                # If we got here via wrong hash, username retry is handled by _tga_best_ref; this is a true private/min entity case.
+            except Exception:  # noqa: BLE001
+                pass
+        if inv and try_join:
+            try:
+                ent, _st = await _tga_import_invite(cl, inv, account_id=aid)
+            except HTTPException:
+                tga_access_set(aid, tga_access_chan_key(ref or raw_in), status="need_invite", reason="需要有效邀请链接才能加入私有频道", error_name=type(exc).__name__)
+                raise HTTPException(status_code=403, detail="这是私有频道，当前账号还没有加入。请在自动采集里为该频道填写邀请链接。")
+        else:
+            uname = ("@" + u) if u else (ref or raw_in)
+            tga_access_set(aid, tga_access_chan_key(ref or raw_in), status="need_join", reason="频道不可读（尚未加入，或需要邀请）。不是账号被封禁。", error_name=type(exc).__name__)
+            raise HTTPException(
+                status_code=403,
+                detail=f"{uname} 当前账号还不能读取（{type(exc).__name__}）。公开频道会尝试自动加入；私有频道需要邀请链接。这通常不是账号被封禁。",
+            )
     except errors.AuthKeyUnregisteredError as exc:
         _tga_log("resolve", exc)
         tga_acct_mark_unauth(aid or _tga.get("current_id"), type(exc).__name__)
         raise HTTPException(status_code=401, detail="Telegram 登录已失效，请重新登录")
     except errors.RPCError as exc:
         _tga_log("resolve", exc)
+        tga_access_set(aid, tga_access_chan_key(ref or raw_in), status="error", reason=f"打开频道失败（{type(exc).__name__}）", error_name=type(exc).__name__)
         raise HTTPException(status_code=400, detail=f"打开频道失败（{type(exc).__name__}）")
+    if ent is None:
+        raise HTTPException(status_code=404, detail="无法解析这个频道")
+    # Join public configured channels if we are not a member (left=True or never joined).
+    if try_join and getattr(ent, "username", None) and _tga_channel_is_configured(ent, ref):
+        left = getattr(ent, "left", None)
+        # Join when we are not a member (left=True) or membership is unknown (left is None).
+        # UserAlreadyParticipant is treated as success. Skip when left is explicitly False.
+        should_join = left is not False
+        if should_join:
+            ok, jreason = await _tga_join_public(cl, ent, ref, account_id=aid)
+            if ok:
+                try:
+                    ent = await cl.get_entity(ent)
+                except Exception:  # noqa: BLE001
+                    pass
+                tga_access_set(aid, tga_access_chan_key(ref, ent=ent), status="joined", reason="已加入公开频道", joined=True)
+            elif jreason not in {"not_configured", "no_username", "already"}:
+                tga_access_set(aid, tga_access_chan_key(ref, ent=ent), status="error", reason=f"自动加入未成功（{jreason}）", error_name=jreason, joined=False)
     if getattr(ent, "left", False) and not getattr(ent, "username", None) and not getattr(ent, "broadcast", False):
-        raise HTTPException(status_code=403, detail="当前账号不在这个私有群组里，无法读取")
-    if try_join and getattr(ent, "left", False) and getattr(ent, "username", None):
-        if await _tga_maybe_join_public(cl, ent, ref):
-            try:
-                ent = await cl.get_entity(ent)
-            except Exception:  # noqa: BLE001
-                pass
+        tga_access_set(aid, tga_access_chan_key(ref, ent=ent), status="need_invite", reason="当前账号不在这个私有群组里", joined=False)
+        raise HTTPException(status_code=403, detail="当前账号不在这个私有群组里，无法读取。请提供邀请链接。")
     entities[ent.id] = ent
     if aid:
         tga_acct_rt(int(aid))["entities"][ent.id] = ent
+        _tga_peer_remember(aid, ent)
     else:
         _tga["entities"][ent.id] = ent
+    tga_access_set(aid, tga_access_chan_key(ref, ent=ent), status="readable", reason="可读取", joined=not bool(getattr(ent, "left", False)))
     return ent
 
 
@@ -14107,6 +14552,7 @@ def tga_auto_public(queue: Optional[dict] = None) -> dict:
             "last_check": _tga_fmt_myt(ch.get("last_check") or 0),
             "last_result": ch.get("last_result") or "",
             "last_error": ch.get("last_error") or "",
+            "has_invite": bool((ch.get("invite") or "").strip()),
         })
     return {
         "interval_minutes": interval,
@@ -14162,7 +14608,9 @@ def _tga_auto_update_channel(key: str, **fields) -> None:
 
 
 def tga_auto_add_channel(ref_raw: str, user_id: int) -> dict:
-    ref = _tga_chat_ref(ref_raw)
+    invite_raw = (ref_raw or "").strip()
+    invite_h = _tga_invite_hash(invite_raw)
+    ref = ("+" + invite_h) if invite_h else _tga_chat_ref(ref_raw)
     _tga_need_login()
     _tga_throttle()
 
@@ -14204,6 +14652,10 @@ def tga_auto_add_channel(ref_raw: str, user_id: int) -> dict:
                 "user_id": int(user_id or 0),
             })
             created = True
+        if invite_h:
+            row = next((c for c in st["channels"] if c.get("key") == key), None)
+            if row is not None:
+                row["invite"] = "+" + invite_h
         tga_auto_save(st)
     try:
         tga_recent_record(ent, None)
@@ -14218,8 +14670,8 @@ def tga_auto_add_channel(ref_raw: str, user_id: int) -> dict:
     }
 
 
-def tga_auto_edit_channel(key: str, action: str, user_id: int = 0) -> dict:
-    if not re.fullmatch(r"id:\d{1,20}", key or "") or action not in ("enable", "pause", "remove", "check"):
+def tga_auto_edit_channel(key: str, action: str, user_id: int = 0, invite: str = "") -> dict:
+    if not re.fullmatch(r"id:\d{1,20}", key or "") or action not in ("enable", "pause", "remove", "check", "invite"):
         raise HTTPException(status_code=400, detail="参数错误")
     with _tga_lock:
         st = tga_auto_load()
@@ -14230,6 +14682,13 @@ def tga_auto_edit_channel(key: str, action: str, user_id: int = 0) -> dict:
             st["channels"] = [c for c in st["channels"] if c.get("key") != key]
             tga_auto_save(st)
             return {"ok": True, "message": "已从自动采集列表移除。", "auto": tga_auto_public()}
+        if action == "invite":
+            h = _tga_invite_hash(invite)
+            if not h:
+                raise HTTPException(status_code=400, detail="请填写有效的邀请链接（https://t.me/+…）")
+            ch["invite"] = "+" + h
+            tga_auto_save(st)
+            return {"ok": True, "message": "已保存该频道的邀请链接，各账号读取失败时会尝试加入。", "auto": tga_auto_public()}
         if action == "enable":
             ch["enabled"] = True
             ch["last_error"] = ""
@@ -14276,7 +14735,7 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
     from telethon import errors
     from telethon.tl.types import InputMessagesFilterMusic
 
-    ref = ch.get("ref") or ch.get("key") or ""
+    ref = _tga_best_ref(ch.get("ref") or ch.get("key") or "", ch)
     full = not bool(ch.get("backfill_done"))
     last_seen = int(ch.get("last_seen_id") or 0)
     offset_id = int(ch.get("backfill_offset") or 0) if full else 0
@@ -14289,12 +14748,12 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
 
     async def attach(exclude=None):
         nonlocal cl, aid, ent, pub, open_ref
-        acc = tga_acct_pick(exclude=exclude if exclude is not None else tried)
+        acc = tga_acct_pick(exclude=exclude if exclude is not None else tried, for_ref=ref, for_ch=ch)
         if acc is None:
             until = tga_acct_earliest_cooldown()
             if until > time.time():
                 raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {int(until - time.time())} 秒后再试")
-            raise HTTPException(status_code=409, detail="没有可用的 Telegram 账号")
+            raise HTTPException(status_code=409, detail="没有可读取该频道的 Telegram 账号（或都在限流中）")
         aid = int(acc["id"])
         cl = await _tga_client_for(aid)
         ent = await _tga_entity(cl, ref, account_id=aid, try_join=True)
@@ -14322,7 +14781,7 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
         pending = []
         try:
             result = _tga_enqueue(
-                user_id, pub["key"], batch, OPT_DEFAULT_TARGET,
+                user_id, open_ref or pub["key"], batch, OPT_DEFAULT_TARGET,
                 auto_import=True, raise_if_empty=False, limit=len(batch),
                 chat_id=int(ent.id), chat_title=pub.get("title") or "",
             )
@@ -14340,7 +14799,7 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
         tga_acct_mark_flood(aid, secs, reason)
         if aid:
             tried.add(int(aid))
-        if tga_acct_pick(exclude=tried) is not None:
+        if tga_acct_pick(exclude=tried, for_ref=ref, for_ch=ch) is not None:
             await attach(exclude=tried)
             return
         if secs <= TGA_FLOOD_AUTO_WAIT:
@@ -14370,17 +14829,35 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
                 tga_acct_mark_unauth(aid, type(exc).__name__)
                 if aid:
                     tried.add(int(aid))
-                if tga_acct_pick(exclude=tried) is not None:
+                if tga_acct_pick(exclude=tried, for_ref=ref, for_ch=ch) is not None:
                     await attach(exclude=tried)
                     continue
                 raise HTTPException(status_code=401, detail="Telegram 登录已失效，请重新登录")
-            if isinstance(exc, (errors.ChannelPrivateError, errors.ChatAdminRequiredError)) or kind == "access":
+            if isinstance(exc, (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.UserNotParticipantError)) or kind == "access":
+                print(f"[tg-audio] auto-list aid={aid} ch={open_ref or ref} err={type(exc).__name__}", flush=True)
+                retried_join = getattr(attach, "_joined_"+str(aid), False)
+                if not retried_join and ent is not None:
+                    setattr(attach, "_joined_"+str(aid), True)
+                    ok, jreason = await _tga_join_public(cl, ent, open_ref or ref, account_id=aid)
+                    if not ok:
+                        inv = (ch.get("invite") or "")
+                        if inv:
+                            try:
+                                ent, _st = await _tga_import_invite(cl, inv, account_id=aid)
+                                ok = True
+                            except HTTPException as ie:
+                                tga_access_set(aid, tga_access_chan_key(open_ref or ref, ent=ent, ch=ch), status="need_invite", reason=str(ie.detail)[:200], error_name=type(exc).__name__, joined=False)
+                    if ok:
+                        tga_access_set(aid, tga_access_chan_key(open_ref or ref, ent=ent, ch=ch), status="joined", reason="加入后重试读取", joined=True)
+                        continue
+                    tga_access_set(aid, tga_access_chan_key(open_ref or ref, ent=ent, ch=ch), status="need_join", reason=f"还不能读取（{type(exc).__name__}），不是封禁。", error_name=type(exc).__name__, joined=False)
+                tga_acct_note_error(aid, f"{open_ref or ref} 无法读取（{type(exc).__name__}）")
                 if aid:
                     tried.add(int(aid))
-                if tga_acct_pick(exclude=tried) is not None:
+                if tga_acct_pick(exclude=tried, for_ref=ref, for_ch=ch) is not None:
                     await attach(exclude=tried)
                     continue
-                raise HTTPException(status_code=403, detail="该账号无权读取这个频道（私有频道需先加入）")
+                raise HTTPException(status_code=403, detail=f"现有账号都还不能读取 {open_ref or ref}（{type(exc).__name__}）。公开频道会自动加入；私有频道请填写邀请链接。")
             if isinstance(exc, errors.RPCError):
                 _tga_log("auto-list", exc)
                 raise HTTPException(status_code=400, detail=f"读取失败（{type(exc).__name__}）")
@@ -14621,7 +15098,12 @@ async def tga_auto_edit_ep(request: Request, db: Session = Depends(get_db)):
     _opt_csrf(request)
     user = _tga_admin(request, db)
     data = await _tga_json(request)
-    return tga_auto_edit_channel(str(data.get("key") or ""), str(data.get("action") or ""), user.id)
+    return tga_auto_edit_channel(
+        str(data.get("key") or ""),
+        str(data.get("action") or ""),
+        user.id,
+        invite=str(data.get("invite") or data.get("link") or ""),
+    )
 
 
 @app.post("/admin/tg-audio/auto/check")
@@ -14646,6 +15128,10 @@ def tga_start() -> None:
         tga_accounts_migrate()
     except Exception:  # noqa: BLE001
         logging.exception("tga accounts migrate failed")
+    try:
+        tga_acct_tidy_flood()
+    except Exception:  # noqa: BLE001
+        logging.exception("tga flood tidy failed")
     for job in _opt_all_jobs():
         if job.get("state") == "downloading":
             _opt_update(job["id"], state="failed", stage="失败",
@@ -14732,6 +15218,67 @@ def tga_start() -> None:
         tga_auto_start()
     except Exception:  # noqa: BLE001
         logging.exception("tga auto collector failed to start")
+
+
+
+@app.post("/admin/tg-audio/accounts/access-check")
+async def tga_access_check_ep(request: Request, db: Session = Depends(get_db)):
+    """Light per-account x configured-channel access probe. No downloads. Throttled."""
+    _opt_csrf(request)
+    _tga_admin(request, db)
+
+    async def go():
+        from telethon import errors
+        channels = [c for c in (tga_auto_load().get("channels") or []) if c.get("enabled", True)]
+        accounts = [a for a in tga_accounts_load()["accounts"] if a.get("has_session") and a.get("authorized")]
+        results = []
+        for acc in accounts:
+            aid = int(acc["id"])
+            # Include paused accounts in the probe so the admin can see their access, but do not use them for collect.
+            try:
+                cl = await _tga_client_for(aid)
+            except Exception as exc:  # noqa: BLE001
+                _tga_log("access-check-client", exc)
+                for ch in channels:
+                    key = tga_access_chan_key(ch.get("ref") or "", ch=ch)
+                    tga_access_set(aid, key, status="error", reason=f"无法连接此账号（{type(exc).__name__}）", error_name=type(exc).__name__)
+                    results.append({"account_id": aid, "channel": key, "status": "error", "error_name": type(exc).__name__})
+                continue
+            for ch in channels:
+                ref = _tga_best_ref(ch.get("ref") or ch.get("key") or "", ch)
+                key = tga_access_chan_key(ref, ch=ch)
+                try:
+                    await _tga_throttle_async(account_id=aid)
+                    ent = await _tga_entity(cl, ref, account_id=aid, try_join=True)
+                    # One cheap history probe to confirm readability.
+                    await cl.get_messages(ent, limit=1)
+                    tga_access_set(aid, key, status="readable", reason="可读取", joined=not bool(getattr(ent, "left", False)))
+                    tga_acct_update(aid, last_error="", last_used=time.time())
+                    results.append({"account_id": aid, "channel": key, "status": "readable", "error_name": ""})
+                except HTTPException as exc:
+                    detail = str(exc.detail or "")
+                    kind, secs = _tga_classify_exc(exc)
+                    if kind == "flood":
+                        tga_acct_mark_flood(aid, secs or 30, "FloodWait")
+                        tga_access_set(aid, key, status="flood", reason=detail[:200], error_name="FloodWaitError")
+                        results.append({"account_id": aid, "channel": key, "status": "flood", "error_name": "FloodWaitError"})
+                    else:
+                        status = "need_invite" if "邀请" in detail else ("need_join" if "不能读取" in detail or "还没有加入" in detail or "无法读取" in detail else "error")
+                        tga_access_set(aid, key, status=status, reason=detail[:200], error_name="HTTPException")
+                        results.append({"account_id": aid, "channel": key, "status": status, "error_name": "HTTPException"})
+                except errors.FloodWaitError as exc:
+                    tga_acct_mark_flood(aid, int(exc.seconds or 0) or 30, type(exc).__name__)
+                    tga_access_set(aid, key, status="flood", reason=f"限流 {int(exc.seconds or 0)} 秒", error_name=type(exc).__name__)
+                    results.append({"account_id": aid, "channel": key, "status": "flood", "error_name": type(exc).__name__})
+                except Exception as exc:  # noqa: BLE001
+                    _tga_log("access-check", exc)
+                    tga_access_set(aid, key, status="error", reason=f"检查失败（{type(exc).__name__}）", error_name=type(exc).__name__)
+                    results.append({"account_id": aid, "channel": key, "status": "error", "error_name": type(exc).__name__})
+        return results
+
+    rows = await asyncio.to_thread(_tga_run, go(), 180)
+    return {"ok": True, "message": "已检查各账号对已配置频道的读取权限（未下载文件）", "results": rows, **tga_status()}
+
 
 
 @app.get("/uploads/{filename}")

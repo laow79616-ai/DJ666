@@ -12,7 +12,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=t184a">
+  <link rel="stylesheet" href="/static/style.css?v=t186a">
   {% block extra_head %}{% endblock %}
 </head>
 {% set p = request.url.path %}
@@ -113,9 +113,11 @@
     <button type="button" class="player-btn player-close" id="plClose" title="收起播放器（继续播放）" aria-label="收起播放器">×</button>
   </div>
 
+  {# Always expose CSRF for first-party analytics beacons (guests have no logout form). #}
+  <input type="hidden" name="csrf_token" id="csrfToken" value="{{ csrf }}">
   <script src="/static/tg.js?v=1" defer></script>
-  <script src="/static/app.js?v=t184a" defer></script>
-  <script src="/static/analytics.js?v=t184a" defer></script>
+  <script src="/static/app.js?v=t187a" defer></script>
+  <script src="/static/analytics.js?v=t187a" defer></script>
   <script src="/static/ann_interact.js?v=tgc1" defer></script>
   <div id="pageScripts">{% block scripts %}{% endblock %}</div>
 </body>

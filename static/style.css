@@ -2045,3 +2045,8 @@ body[data-page="chat"] .fab-nav {
   .an-kpis { grid-template-columns: 1fr 1fr; }
   .an-bars { height: 96px; }
 }
+
+.an-admin-plays { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 10px; font-size: 0.88rem; }
+.an-admin-plays label { display: inline-flex; align-items: center; gap: 6px; color: #e8e6f0; cursor: pointer; }
+
+.tga-acct-ch { font-size: 0.78rem; color: #c8cdd8; line-height: 1.45; max-width: 16rem; }
