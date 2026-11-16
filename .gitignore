@@ -19,6 +19,8 @@ logs/
 *.session-journal
 tg_session.*
 tg_user.json
+tga_accounts.json
+tga_sessions/
 
 # python / venv
 venv/

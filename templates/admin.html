@@ -1037,7 +1037,7 @@ a.admin-dj-entry {
 <section class="panel admin-pane admin-pane-djmix" role="tabpanel" id="djmix">
   <div class="admin-pane-inner">
     <div class="admin-pane-body">
-      <link rel="stylesheet" href="/static/mixer.css?v=t182auto1">
+      <link rel="stylesheet" href="/static/mixer.css?v=t183multi1">
       {% set mixer_embedded = True %}
       {% set hide_mixer = True %}
       {% include "_mixer.html" %}
@@ -1050,7 +1050,7 @@ a.admin-dj-entry {
           </div>
           <span class="tga-badge" id="tgaBadge">检查中…</span>
         </header>
-        <p class="tga-note">用一个 Telegram 账号读取频道里的音频，服务器下载原文件后自动进入下方「上传优化」（输出 FLAC 与 MP3、A/B 对比；导入曲库保存为 MP3 320k）。<b>仅处理自有或已授权频道的音频。</b></p>
+        <p class="tga-note">用一个或多个 Telegram 账号读取频道里的音频，下载时自动轮换账号以免限流；服务器下载原文件后自动进入下方「上传优化」（输出 FLAC 与 MP3、A/B 对比；导入曲库保存为 MP3 320k）。<b>仅处理自有或已授权频道的音频。</b></p>
         <p class="tga-msg" id="tgaMsg" role="status" hidden></p>
 
         <details class="tga-box" id="tgaCfgBox">
@@ -1084,8 +1084,48 @@ a.admin-dj-entry {
         </div>
 
         <div class="tga-box" id="tgaMain" hidden>
-          <div class="tga-account"><span id="tgaMe"></span><span class="muted" id="tgaQuota"></span>
-            <button type="button" class="btn btn-sm btn-ghost" data-tga-logout>退出登录</button></div>
+          <div class="tga-account"><span id="tgaMe"></span><span class="muted" id="tgaQuota"></span></div>
+          <div class="tga-accounts" id="tgaAccountsBox">
+            <div class="tga-accounts-head">
+              <h3>Telegram 账号</h3>
+              <p class="muted" id="tgaCurrentAcct">当前使用：—</p>
+            </div>
+            <table class="tga-table tga-acct-table" id="tgaAcctTable" hidden>
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>状态</th>
+                  <th>限流</th>
+                  <th>最近使用</th>
+                  <th>下载</th>
+                  <th>最近错误</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="tgaAcctRows"></tbody>
+            </table>
+            <div class="tga-acct-add-bar">
+              <input type="text" id="tgaAcctLabel" placeholder="备注（可选）" maxlength="40" autocomplete="off">
+              <button type="button" class="btn btn-sm" id="tgaAcctAddBtn">添加账号</button>
+            </div>
+            <div class="tga-acct-add" id="tgaAcctAdd" hidden>
+              <p class="hint">新账号将使用上方已保存的 api_id / api_hash，登录流程与首次登录相同（手机号、验证码、可选两步验证）。</p>
+              <form class="tga-form tga-add-step" data-step="phone" autocomplete="off" onsubmit="return false">
+                <label>手机号 <input type="tel" name="phone" autocomplete="off" placeholder="+60123456789（带国家区号）"></label>
+                <button type="button" class="btn btn-sm" data-tga-add-send>发送验证码</button>
+                <button type="button" class="link-btn" data-tga-add-cancel>取消</button>
+              </form>
+              <form class="tga-form tga-add-step" data-step="code" autocomplete="off" onsubmit="return false" hidden>
+                <label>验证码 <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Telegram 里收到的验证码"></label>
+                <button type="button" class="btn btn-sm" data-tga-add-code>登录</button>
+                <button type="button" class="link-btn" data-tga-add-restart>换手机号 / 重新发送</button>
+              </form>
+              <form class="tga-form tga-add-step" data-step="password" autocomplete="off" onsubmit="return false" hidden>
+                <label>两步验证密码 <input type="password" name="password" autocomplete="off"></label>
+                <button type="button" class="btn btn-sm" data-tga-add-pw>提交</button>
+              </form>
+            </div>
+          </div>
           <div class="tga-auto" id="tgaAuto">
             <div class="tga-auto-head">
               <h3>自动采集</h3>
@@ -1170,7 +1210,7 @@ a.admin-dj-entry {
         </div>
         <p class="hint tga-limits">限制：全站一次只下载一个文件，队列在后台按顺序处理（条目之间至少间隔 5 秒），不阻塞本页，也可在进行中继续追加。下载次数不再设每日上限。单个文件最大 500MB。遇到 Telegram 限流会自动等待后继续。</p>
       </section>
-      <script src="/static/tg_audio.js?v=t182auto1" defer></script>
+      <script src="/static/tg_audio.js?v=t183multi1" defer></script>
       <script src="/static/admin_backup.js?v=bak3" defer></script>
       {% endif %}
     </div>

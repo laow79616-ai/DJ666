@@ -10214,6 +10214,13 @@ TGA_Q_ACTIVE = ("queued", "downloading", "optimizing")
 TGA_RATE = {"send": (5, 3600), "signin": (10, 3600)}
 TGA_PHONE_RE = re.compile(r"^\+?[0-9]{6,16}$")
 
+TGA_ACCOUNTS_PATH = DATA_DIR / "tga_accounts.json"
+TGA_SESS_DIR = DATA_DIR / "tga_sessions"
+TGA_ACCT_MAX = 8
+TGA_DL_GLOBAL_CAP = 2
+TGA_ACCT_API_GAP = 5.0
+TGA_GLOBAL_API_GAP = 2.0
+
 _tga_lock = threading.RLock()
 _tga_api_lock = threading.Lock()
 _tga = {
@@ -10226,6 +10233,15 @@ _tga = {
     "queue_running": False,
     "attempts": {"send": [], "signin": []},
     "entities": {},
+    "clients": {},
+    "client_cfgs": {},
+    "acct_rt": {},
+    "current_id": None,
+    "busy_accounts": set(),
+    "downloads": {},
+    "login_client": None,
+    "login_is_new": False,
+    "rr": 0,
 }
 logging.getLogger("telethon").setLevel(logging.WARNING)
 
@@ -10326,6 +10342,669 @@ def tga_session_delete() -> None:
         pass
 
 
+
+# ---- inserted: multi-account support helpers ----
+
+def _tga_mask_phone(phone: str) -> str:
+    """Mask a phone as +60****1234: keep + and the first 2 digits, then ****, then last 4."""
+    raw = re.sub(r"\s+", "", str(phone or ""))
+    if not raw:
+        return ""
+    plus = raw.startswith("+")
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 6:
+        return ("+" if plus else "") + "****"
+    keep_head = 2 if len(digits) >= 8 else 1
+    return ("+" if plus else "") + digits[:keep_head] + "****" + digits[-4:]
+
+
+def _tga_exc_name(exc: BaseException) -> str:
+    if isinstance(exc, HTTPException):
+        detail = re.sub(r"\+?\d{6,}", "****", str(exc.detail or ""))
+        return (detail or type(exc).__name__)[:200]
+    return type(exc).__name__
+
+
+
+def tga_accounts_default() -> dict:
+    return {"next_id": 1, "rr": 0, "accounts": []}
+
+
+def tga_accounts_load() -> dict:
+    try:
+        raw = json.loads(TGA_ACCOUNTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    if not isinstance(raw, dict):
+        raw = tga_accounts_default()
+    accs = raw.get("accounts")
+    if not isinstance(accs, list):
+        accs = []
+    cleaned = []
+    for a in accs:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        # never persist or echo secret fields if a buggy writer added them
+        for secret_key in ("api_id", "api_hash", "session", "phone", "password", "code", "enc", "hash"):
+            a.pop(secret_key, None)
+        cleaned.append(a)
+    raw["accounts"] = cleaned
+    raw["next_id"] = int(raw.get("next_id") or (max((int(a["id"]) for a in cleaned), default=0) + 1))
+    raw["rr"] = int(raw.get("rr") or 0)
+    return raw
+
+
+def tga_accounts_save(st: dict) -> None:
+    out = {
+        "next_id": int(st.get("next_id") or 1),
+        "rr": int(st.get("rr") or 0),
+        "accounts": [],
+    }
+    for a in st.get("accounts") or []:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        out["accounts"].append({
+            "id": int(a["id"]),
+            "label": str(a.get("label") or f"账号 {a['id']}")[:40],
+            "enabled": bool(a.get("enabled", True)),
+            "phone_mask": str(a.get("phone_mask") or "")[:32],
+            "username": str(a.get("username") or "")[:64],
+            "name": str(a.get("name") or "")[:80],
+            "tg_user_id": int(a.get("tg_user_id") or 0),
+            "authorized": bool(a.get("authorized")),
+            "has_session": bool(a.get("has_session")),
+            "flood_until": float(a.get("flood_until") or 0),
+            "flood_reason": str(a.get("flood_reason") or "")[:80],
+            "last_used": float(a.get("last_used") or 0),
+            "ok_count": int(a.get("ok_count") or 0),
+            "fail_count": int(a.get("fail_count") or 0),
+            "last_error": str(a.get("last_error") or "")[:200],
+            "added": float(a.get("added") or 0),
+        })
+    TGA_SESS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(TGA_SESS_DIR, 0o700)
+    except OSError:
+        pass
+    _tga_write_private(TGA_ACCOUNTS_PATH, json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def tga_session_path_for(aid: int) -> Path:
+    p = TGA_SESS_DIR / f"{int(aid)}.enc"
+    if not p.is_file() and int(aid) == 1 and TGA_SESSION_PATH.is_file():
+        return TGA_SESSION_PATH
+    return p
+
+
+def tga_session_load_for(aid: int) -> str:
+    path = tga_session_path_for(aid)
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return ""
+    if not blob:
+        return ""
+    try:
+        return tga_decrypt(blob)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def tga_session_save_for(aid: int, session_str: str) -> None:
+    path = TGA_SESS_DIR / f"{int(aid)}.enc"
+    TGA_SESS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(TGA_SESS_DIR, 0o700)
+    except OSError:
+        pass
+    _tga_write_private(path, tga_encrypt(session_str))
+    if int(aid) == 1:
+        # keep the legacy path in sync so a rollback still sees account 1
+        _tga_write_private(TGA_SESSION_PATH, tga_encrypt(session_str))
+
+
+def tga_session_delete_for(aid: int) -> None:
+    try:
+        (TGA_SESS_DIR / f"{int(aid)}.enc").unlink(missing_ok=True)
+    except OSError:
+        pass
+    if int(aid) == 1:
+        tga_session_delete()
+
+
+def tga_accounts_migrate() -> None:
+    """Turn the existing single session into account #1 without requiring a re-login."""
+    with _tga_lock:
+        st = tga_accounts_load()
+        if st["accounts"]:
+            return
+        cfg_ok = tga_configured()
+        has_sess = TGA_SESSION_PATH.is_file() or (TGA_SESS_DIR / "1.enc").is_file()
+        if not (cfg_ok or has_sess):
+            tga_accounts_save(st)
+            return
+        st["next_id"] = max(int(st.get("next_id") or 1), 2)
+        st["accounts"] = [{
+            "id": 1,
+            "label": "账号 1",
+            "enabled": True,
+            "phone_mask": "",
+            "username": "",
+            "name": "",
+            "tg_user_id": 0,
+            "authorized": bool(has_sess),
+            "has_session": bool(has_sess),
+            "flood_until": 0.0,
+            "flood_reason": "",
+            "last_used": 0.0,
+            "ok_count": 0,
+            "fail_count": 0,
+            "last_error": "",
+            "added": time.time(),
+        }]
+        tga_accounts_save(st)
+        if has_sess and not (TGA_SESS_DIR / "1.enc").is_file() and TGA_SESSION_PATH.is_file():
+            try:
+                sess = tga_session_load()
+                if sess:
+                    tga_session_save_for(1, sess)
+            except Exception as exc:  # noqa: BLE001
+                _tga_log("migrate-session", exc)
+
+
+def tga_acct_get(aid: int) -> Optional[dict]:
+    st = tga_accounts_load()
+    return next((a for a in st["accounts"] if int(a["id"]) == int(aid)), None)
+
+
+def tga_acct_update(aid: int, **fields) -> Optional[dict]:
+    with _tga_lock:
+        st = tga_accounts_load()
+        acc = next((a for a in st["accounts"] if int(a["id"]) == int(aid)), None)
+        if not acc:
+            return None
+        acc.update(fields)
+        tga_accounts_save(st)
+        return dict(acc)
+
+
+def tga_acct_rt(aid: int) -> dict:
+    with _tga_lock:
+        rt = _tga["acct_rt"].get(int(aid))
+        if rt is None:
+            rt = {
+                "authorized": None,
+                "me": None,
+                "checked": 0.0,
+                "flood_until": 0.0,
+                "flood_reason": "",
+                "entities": {},
+                "last_api": 0.0,
+            }
+            acc = tga_acct_get(aid)
+            if acc:
+                rt["flood_until"] = float(acc.get("flood_until") or 0)
+                rt["flood_reason"] = acc.get("flood_reason") or ""
+                if acc.get("authorized"):
+                    rt["authorized"] = True
+                    rt["me"] = {
+                        "name": acc.get("name") or "Telegram 用户",
+                        "username": acc.get("username") or "",
+                        "phone_mask": acc.get("phone_mask") or "",
+                    }
+            _tga["acct_rt"][int(aid)] = rt
+        return rt
+
+
+def _tga_touch_current(aid: Optional[int]) -> None:
+    if not aid:
+        _tga["current_id"] = None
+        return
+    aid = int(aid)
+    _tga["current_id"] = aid
+    rt = tga_acct_rt(aid)
+    _tga["entities"] = rt["entities"]
+    _tga["authorized"] = rt.get("authorized")
+    _tga["me"] = rt.get("me")
+    _tga["client"] = _tga["clients"].get(aid)
+    _tga["flood_until"] = max(
+        (float(tga_acct_rt(int(a["id"])).get("flood_until") or 0) for a in tga_accounts_load()["accounts"]),
+        default=0.0,
+    )
+
+
+def tga_acct_pick(exclude=None, *, require_idle: bool = False) -> Optional[dict]:
+    now = time.time()
+    exclude = {int(x) for x in (exclude or ()) if x}
+    with _tga_lock:
+        st = tga_accounts_load()
+        cands = []
+        for a in st["accounts"]:
+            aid = int(a["id"])
+            if aid in exclude:
+                continue
+            if not a.get("enabled") or not a.get("authorized") or not a.get("has_session"):
+                continue
+            fu = float(a.get("flood_until") or 0)
+            if fu > now:
+                continue
+            if require_idle and aid in _tga["busy_accounts"]:
+                continue
+            cands.append(a)
+        if not cands:
+            return None
+        cands.sort(key=lambda a: int(a["id"]))
+        rr = int(st.get("rr") or 0)
+        chosen = next((a for a in cands if int(a["id"]) > rr), cands[0])
+        st["rr"] = int(chosen["id"])
+        tga_accounts_save(st)
+        _tga["rr"] = st["rr"]
+        return dict(chosen)
+
+
+def tga_acct_earliest_cooldown() -> float:
+    now = time.time()
+    best = 0.0
+    for a in tga_accounts_load()["accounts"]:
+        if not (a.get("enabled") and a.get("authorized") and a.get("has_session")):
+            continue
+        fu = float(a.get("flood_until") or 0)
+        if fu > now and (best == 0.0 or fu < best):
+            best = fu
+    return best
+
+
+def tga_acct_any_logged_in() -> bool:
+    return any(
+        a.get("enabled") and a.get("authorized") and a.get("has_session")
+        for a in tga_accounts_load()["accounts"]
+    )
+
+
+def tga_acct_mark_flood(aid: Optional[int], seconds: int, reason: str = "") -> None:
+    if not aid:
+        with _tga_lock:
+            _tga["flood_until"] = max(_tga["flood_until"], time.time() + max(1, int(seconds or 0)))
+        return
+    until = time.time() + max(1, int(seconds or 0))
+    reason = (reason or "FloodWait")[:80]
+    rt = tga_acct_rt(aid)
+    rt["flood_until"] = max(float(rt.get("flood_until") or 0), until)
+    rt["flood_reason"] = reason
+    tga_acct_update(aid, flood_until=rt["flood_until"], flood_reason=reason, last_error=reason)
+    _tga_touch_current(_tga.get("current_id") or aid)
+
+
+def tga_acct_mark_unauth(aid: Optional[int], reason: str = "") -> None:
+    if not aid:
+        _tga["authorized"] = False
+        return
+    reason = (reason or "unauthorized")[:80]
+    rt = tga_acct_rt(aid)
+    rt["authorized"] = False
+    tga_acct_update(aid, authorized=False, last_error=reason)
+    _tga_touch_current(aid)
+
+
+def tga_acct_note_error(aid: Optional[int], err: str, *, failed: bool = False) -> None:
+    if not aid:
+        return
+    err = (err or "")[:200]
+    fields = {"last_error": err}
+    if failed:
+        acc = tga_acct_get(aid) or {}
+        fields["fail_count"] = int(acc.get("fail_count") or 0) + 1
+    tga_acct_update(aid, **fields)
+
+
+def tga_acct_note_ok(aid: Optional[int]) -> None:
+    if not aid:
+        return
+    acc = tga_acct_get(aid) or {}
+    tga_acct_update(
+        aid,
+        ok_count=int(acc.get("ok_count") or 0) + 1,
+        last_used=time.time(),
+        last_error="",
+        flood_until=0.0,
+        flood_reason="",
+    )
+    rt = tga_acct_rt(aid)
+    rt["flood_until"] = 0.0
+    rt["flood_reason"] = ""
+
+
+def tga_acct_busy_set(aid: int, busy: bool) -> None:
+    with _tga_lock:
+        if busy:
+            _tga["busy_accounts"].add(int(aid))
+        else:
+            _tga["busy_accounts"].discard(int(aid))
+
+
+def tga_dl_cap() -> int:
+    n = sum(
+        1 for a in tga_accounts_load()["accounts"]
+        if a.get("enabled") and a.get("authorized") and a.get("has_session")
+        and float(a.get("flood_until") or 0) <= time.time()
+    )
+    return max(1, min(TGA_DL_GLOBAL_CAP, max(1, n)))
+
+
+def _tga_configured_channel_usernames() -> set[str]:
+    names = set()
+    try:
+        for ch in (tga_auto_load().get("channels") or []):
+            u = (ch.get("username") or "").lstrip("@").lower()
+            if u:
+                names.add(u)
+            ref = (ch.get("ref") or "").lstrip("@")
+            if re.fullmatch(r"[A-Za-z0-9_]{4,64}", ref):
+                names.add(ref.lower())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for r in tga_recent_load():
+            u = (r.get("username") or "").lstrip("@").lower()
+            if u:
+                names.add(u)
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def _tga_channel_is_configured(ent, ref: str = "") -> bool:
+    username = (getattr(ent, "username", None) or "").lstrip("@").lower()
+    if username and username in _tga_configured_channel_usernames():
+        return True
+    raw = (ref or "").lstrip("@").lower()
+    if raw and raw in _tga_configured_channel_usernames():
+        return True
+    try:
+        eid = int(getattr(ent, "id", 0) or 0)
+    except (TypeError, ValueError):
+        eid = 0
+    if not eid:
+        return False
+    try:
+        if any(int(ch.get("key")[3:]) == eid for ch in (tga_auto_load().get("channels") or []) if str(ch.get("key") or "").startswith("id:")):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if any(str(r.get("key") or "") == f"id:{eid}" for r in tga_recent_load()):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+async def _tga_maybe_join_public(cl, ent, ref: str = "") -> bool:
+    """Join a public channel only if the admin already configured it."""
+    username = getattr(ent, "username", None) or ""
+    if not username:
+        return False
+    if not _tga_channel_is_configured(ent, ref):
+        return False
+    try:
+        from telethon.tl.functions.channels import JoinChannelRequest
+        await cl(JoinChannelRequest(ent))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("join-public", exc)
+        return False
+
+
+def _tga_classify_exc(exc: BaseException) -> tuple[str, int]:
+    """Return (kind, seconds) where kind is flood / auth / access / other."""
+    name = type(exc).__name__
+    secs = int(getattr(exc, "seconds", 0) or 0)
+    if isinstance(exc, HTTPException):
+        detail = str(exc.detail or "")
+        if "限流" in detail or "Flood" in detail:
+            m = re.search(r"(\d+)\s*秒", detail)
+            default = 900 if "Premium" in detail else 30
+            wait = int(m.group(1)) if m else max(secs, default)
+            return ("flood", wait)
+        if any(s in detail for s in ("登录已失效", "请重新登录", "请先登录 Telegram", "已被 Telegram 封禁")):
+            return ("auth", 0)
+        if any(s in detail for s in ("无权", "私有频道", "无法读取", "还没有加入", "被移出", "不是频道", "不在这个")):
+            return ("access", 0)
+        return ("other", 0)
+    if "Flood" in name or (secs > 0 and name.endswith("WaitError")):
+        default = 900 if "Premium" in name else 30
+        return ("flood", secs or default)
+    if "FloodPremium" in str(getattr(exc, "detail", "") or "") or "FloodWait" in str(getattr(exc, "detail", "") or ""):
+        text = str(getattr(exc, "detail", "") or "")
+        default = 900 if "Premium" in text else 30
+        return ("flood", secs or default)
+    if name in (
+        "AuthKeyUnregisteredError", "AuthKeyDuplicatedError", "UserDeactivatedError",
+        "UserDeactivatedBanError", "SessionRevokedError", "SessionExpiredError",
+        "PhoneNumberBannedError", "UnauthorizedError", "AuthKeyPermEmptyError",
+    ):
+        return ("auth", 0)
+    if name in (
+        "ChannelPrivateError", "ChannelInvalidError", "ChatAdminRequiredError",
+        "UserNotParticipantError", "PeerIdInvalidError", "ChatWriteForbiddenError",
+        "ChannelBannedError", "UserBannedInChannelError",
+    ):
+        return ("access", 0)
+    return ("other", 0)
+
+
+async def _tga_client_for(aid: int):
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    cfg = tga_cfg_load()
+    if not tga_configured(cfg):
+        raise HTTPException(status_code=409, detail="未配置 api_id / api_hash")
+    key = (str(cfg.get("api_id")), str(cfg.get("api_hash")))
+    aid = int(aid)
+    acc = tga_acct_get(aid)
+    if not acc:
+        raise HTTPException(status_code=404, detail="找不到这个 Telegram 账号")
+    cl = _tga["clients"].get(aid)
+    if cl is not None and _tga["client_cfgs"].get(aid) != key:
+        try:
+            await cl.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        cl = None
+        _tga["clients"].pop(aid, None)
+    if cl is None:
+        sess = tga_session_load_for(aid)
+        cl = TelegramClient(
+            StringSession(sess or None), int(cfg["api_id"]), str(cfg["api_hash"]),
+            device_model="DJ666 Admin", system_version="Linux", app_version="dj666-1.0",
+            lang_code="zh", system_lang_code="zh", receive_updates=False, flood_sleep_threshold=0,
+            request_retries=2, connection_retries=2, retry_delay=2,
+        )
+        _tga["clients"][aid] = cl
+        _tga["client_cfgs"][aid] = key
+    if not cl.is_connected():
+        await cl.connect()
+    _tga_touch_current(aid)
+    return cl
+
+
+async def _tga_drop_client_for(aid: int, log_out: bool = False) -> None:
+    aid = int(aid)
+    cl = _tga["clients"].pop(aid, None)
+    _tga["client_cfgs"].pop(aid, None)
+    rt = _tga["acct_rt"].pop(aid, None)
+    if rt:
+        rt["entities"] = {}
+        rt["authorized"] = False
+        rt["me"] = None
+    if _tga.get("current_id") == aid:
+        _tga["current_id"] = None
+        _tga["client"] = None
+        _tga["me"] = None
+        _tga["authorized"] = False
+        _tga["entities"] = {}
+    if cl is None:
+        return
+    try:
+        if log_out and cl.is_connected():
+            await cl.log_out()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await cl.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _tga_drop_all_clients(log_out: bool = False) -> None:
+    ids = list(_tga["clients"].keys()) or [int(a["id"]) for a in tga_accounts_load()["accounts"]]
+    for aid in ids:
+        try:
+            await _tga_drop_client_for(int(aid), log_out=log_out)
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("drop-client", exc)
+    login_cl = _tga.get("login_client")
+    _tga["login_client"] = None
+    _tga["login"] = None
+    if login_cl is not None:
+        try:
+            await login_cl.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _tga_ensure_login_client(reset: bool = False):
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    cfg = tga_cfg_load()
+    if not tga_configured(cfg):
+        raise HTTPException(status_code=409, detail="未配置 api_id / api_hash")
+    cl = _tga.get("login_client")
+    if reset and cl is not None:
+        try:
+            await cl.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        cl = None
+        _tga["login_client"] = None
+    if cl is None:
+        cl = TelegramClient(
+            StringSession(None), int(cfg["api_id"]), str(cfg["api_hash"]),
+            device_model="DJ666 Admin", system_version="Linux", app_version="dj666-1.0",
+            lang_code="zh", system_lang_code="zh", receive_updates=False, flood_sleep_threshold=0,
+            request_retries=2, connection_retries=2, retry_delay=2,
+        )
+        _tga["login_client"] = cl
+    if not cl.is_connected():
+        await cl.connect()
+    return cl
+
+
+async def _tga_with_account(fn, *, ref: str = "", exclude=None, require_idle: bool = False):
+    """Run fn(cl, aid), rotating past flood / unauthorized / no-access accounts."""
+    tried: set[int] = {int(x) for x in (exclude or ()) if x}
+    last_exc: Optional[BaseException] = None
+    joined: set[int] = set()
+    while True:
+        acc = tga_acct_pick(exclude=tried, require_idle=require_idle)
+        if acc is None:
+            until = tga_acct_earliest_cooldown()
+            left = int(until - time.time()) if until else 0
+            if last_exc is not None and _tga_classify_exc(last_exc)[0] == "flood" and left > 0:
+                raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {left} 秒后再试")
+            if last_exc is not None and isinstance(last_exc, HTTPException):
+                raise last_exc
+            if last_exc is not None and _tga_classify_exc(last_exc)[0] == "access":
+                raise HTTPException(status_code=403, detail="所有可用账号都无法读取这个频道")
+            if last_exc is not None and _tga_classify_exc(last_exc)[0] == "auth":
+                raise HTTPException(status_code=401, detail="Telegram 登录已失效，请重新登录")
+            if left > 0:
+                raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {left} 秒后再试")
+            raise HTTPException(status_code=409, detail="没有可用的 Telegram 账号")
+        aid = int(acc["id"])
+        tried.add(aid)
+        cl = None
+        try:
+            cl = await _tga_client_for(aid)
+            return await fn(cl, aid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            kind, secs = _tga_classify_exc(exc)
+            if kind == "flood":
+                tga_acct_mark_flood(aid, secs or 30, _tga_exc_name(exc))
+                last_exc = exc if isinstance(exc, HTTPException) else HTTPException(
+                    status_code=429, detail=f"Telegram 限流：需要等待 {secs or 30} 秒后再操作"
+                )
+                continue
+            if kind == "auth":
+                tga_acct_mark_unauth(aid, _tga_exc_name(exc))
+                last_exc = exc
+                continue
+            if kind == "access" and cl is not None and aid not in joined:
+                joined.add(aid)
+                # try to resolve entity from ref and join if public+configured
+                try:
+                    ent = await _tga_entity(cl, ref, account_id=aid, try_join=True) if ref else None
+                    if ent is not None:
+                        return await fn(cl, aid)
+                except Exception as exc2:  # noqa: BLE001
+                    kind2, secs2 = _tga_classify_exc(exc2)
+                    if kind2 == "flood":
+                        tga_acct_mark_flood(aid, secs2 or 30, _tga_exc_name(exc2))
+                        last_exc = exc2
+                        continue
+                    last_exc = exc2
+                    continue
+                last_exc = exc
+                continue
+            if kind == "access":
+                last_exc = exc
+                continue
+            raise
+
+
+def tga_accounts_public() -> list[dict]:
+    now = time.time()
+    current = _tga.get("current_id")
+    busy = set(_tga.get("busy_accounts") or ())
+    rows = []
+    for a in tga_accounts_load()["accounts"]:
+        aid = int(a["id"])
+        fu = float(a.get("flood_until") or 0)
+        cooling = fu > now
+        rows.append({
+            "id": aid,
+            "label": a.get("label") or f"账号 {aid}",
+            "phone_mask": a.get("phone_mask") or "",
+            "name": a.get("name") or "",
+            "username": a.get("username") or "",
+            "authorized": bool(a.get("authorized")),
+            "enabled": bool(a.get("enabled", True)),
+            "has_session": bool(a.get("has_session")),
+            "cooling": cooling,
+            "cooling_until": _tga_fmt_myt(fu) if cooling else "",
+            "cooling_reason": (a.get("flood_reason") or "") if cooling else "",
+            "last_used": _tga_fmt_myt(float(a.get("last_used") or 0)) if a.get("last_used") else "",
+            "ok_count": int(a.get("ok_count") or 0),
+            "fail_count": int(a.get("fail_count") or 0),
+            "last_error": a.get("last_error") or "",
+            "in_use": (int(current) == aid) if current else False,
+            "busy": aid in busy,
+        })
+    return rows
+
+
+def tga_current_account_public() -> Optional[dict]:
+    rows = tga_accounts_public()
+    cur = next((r for r in rows if r.get("in_use") or r.get("busy")), None)
+    if cur:
+        return cur
+    return next((r for r in rows if r.get("enabled") and r.get("authorized")), None)
+
+
+# ---- end inserted helpers ----
+
 def _tga_today() -> str:
     return datetime.now(timezone.utc).astimezone(TZ_CN).strftime("%Y-%m-%d")
 
@@ -10390,114 +11069,170 @@ def _tga_run(coro, timeout: float = 60):
 
 
 def _tga_flood(exc) -> HTTPException:
-    secs = int(getattr(exc, "seconds", 0) or 0)
-    with _tga_lock:
-        _tga["flood_until"] = max(_tga["flood_until"], time.time() + secs)
+    kind, secs = _tga_classify_exc(exc)
+    secs = secs or int(getattr(exc, "seconds", 0) or 0) or 30
+    tga_acct_mark_flood(_tga.get("current_id"), secs, type(exc).__name__)
     return HTTPException(status_code=429, detail=f"Telegram 限流：需要等待 {secs} 秒后再操作")
 
 
 def _tga_check_flood() -> None:
-    left = int(_tga["flood_until"] - time.time())
+    if tga_acct_pick() is not None:
+        return
+    until = tga_acct_earliest_cooldown()
+    left = int(until - time.time()) if until else 0
     if left > 0:
-        raise HTTPException(status_code=429, detail=f"Telegram 限流中，请 {left} 秒后再试")
+        raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {left} 秒后再试")
 
 
 async def _tga_client_async():
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    cfg = tga_cfg_load()
-    if not tga_configured(cfg):
-        raise HTTPException(status_code=409, detail="未配置 api_id / api_hash")
-    key = (str(cfg.get("api_id")), str(cfg.get("api_hash")))
-    cl = _tga["client"]
-    if cl is not None and _tga["client_cfg"] != key:
-        try:
-            await cl.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
-        cl = None
-    if cl is None:
-        cl = TelegramClient(
-            StringSession(tga_session_load() or None), int(cfg["api_id"]), str(cfg["api_hash"]),
-            device_model="DJ666 Admin", system_version="Linux", app_version="dj666-1.0",
-            lang_code="zh", system_lang_code="zh", receive_updates=False, flood_sleep_threshold=0,
-            request_retries=2, connection_retries=2, retry_delay=2,
-        )
-        _tga["client"], _tga["client_cfg"] = cl, key
-    if not cl.is_connected():
-        await cl.connect()
-    return cl
+    """Return a connected client for the current/next healthy account (or a login client)."""
+    aid = _tga.get("current_id")
+    if aid:
+        acc = tga_acct_get(int(aid))
+        if acc and acc.get("enabled") and acc.get("authorized") and acc.get("has_session") and float(acc.get("flood_until") or 0) <= time.time():
+            return await _tga_client_for(int(aid))
+    picked = tga_acct_pick()
+    if picked:
+        return await _tga_client_for(int(picked["id"]))
+    until = tga_acct_earliest_cooldown()
+    if until > time.time():
+        left = int(until - time.time())
+        raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {left} 秒后再试")
+    if _tga.get("login_client") is not None or not tga_accounts_load()["accounts"]:
+        return await _tga_ensure_login_client()
+    raise HTTPException(status_code=409, detail="请先登录 Telegram 账号")
 
 
 async def _tga_drop_client(log_out: bool = False) -> None:
-    cl = _tga["client"]
-    _tga["client"], _tga["client_cfg"] = None, None
-    _tga["me"], _tga["authorized"], _tga["login"] = None, False, None
-    _tga["entities"] = {}
-    if cl is None:
-        return
-    try:
-        if log_out and cl.is_connected():
-            await cl.log_out()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        await cl.disconnect()
-    except Exception:  # noqa: BLE001
-        pass
+    """Disconnect every account client (used when API credentials change or are cleared)."""
+    await _tga_drop_all_clients(log_out=log_out)
 
 
 def _tga_me_public(me) -> Optional[dict]:
     if me is None:
         return None
     name = " ".join(x for x in [getattr(me, "first_name", "") or "", getattr(me, "last_name", "") or ""] if x).strip()
-    return {"name": name or "Telegram 用户", "username": getattr(me, "username", None) or ""}
+    phone = getattr(me, "phone", None) or ""
+    return {
+        "name": name or "Telegram 用户",
+        "username": getattr(me, "username", None) or "",
+        "phone_mask": _tga_mask_phone(phone),
+    }
 
 
-async def _tga_refresh_auth_async() -> bool:
-    cl = await _tga_client_async()
+async def _tga_refresh_auth_async(account_id: Optional[int] = None) -> bool:
+    aid = int(account_id) if account_id else _tga.get("current_id")
+    if not aid:
+        acc = tga_acct_pick()
+        if acc is None:
+            tga_accounts_migrate()
+            acc = tga_acct_get(1) if tga_acct_get(1) and tga_acct_get(1).get("has_session") else None
+        if acc is None:
+            return False
+        aid = int(acc["id"])
+    cl = await _tga_client_for(aid)
     ok = await cl.is_user_authorized()
-    _tga["authorized"] = bool(ok)
-    _tga["me"] = _tga_me_public(await cl.get_me()) if ok else None
-    _tga["checked"] = time.time()
+    rt = tga_acct_rt(aid)
+    rt["authorized"] = bool(ok)
+    rt["checked"] = time.time()
+    if ok:
+        me = await cl.get_me()
+        pub = _tga_me_public(me)
+        rt["me"] = pub
+        try:
+            tga_session_save_for(aid, cl.session.save())
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("save-session", exc)
+        tga_acct_update(
+            aid,
+            authorized=True,
+            has_session=True,
+            name=(pub or {}).get("name") or "",
+            username=(pub or {}).get("username") or "",
+            phone_mask=(pub or {}).get("phone_mask") or "",
+            tg_user_id=int(getattr(me, "id", 0) or 0),
+        )
+    else:
+        rt["me"] = None
+        tga_acct_update(aid, authorized=False)
+    _tga_touch_current(aid)
     return bool(ok)
 
 
 def tga_status(force: bool = False) -> dict:
+    try:
+        tga_accounts_migrate()
+    except Exception as exc:  # noqa: BLE001
+        _tga_log("accounts-migrate", exc)
     cfg = tga_cfg_load()
     configured = tga_configured(cfg)
-    has_session = TGA_SESSION_PATH.is_file()
     err = ""
-    if configured and has_session and (force or _tga["authorized"] is None or time.time() - _tga["checked"] > 600):
+    accounts = tga_accounts_load()["accounts"]
+    now = time.time()
+    # Refresh at most one stale authorized session per status call so polling cannot flood Telegram.
+    refresh_ids = []
+    for a in accounts:
+        if not a.get("has_session") or not a.get("enabled"):
+            continue
+        aid = int(a["id"])
+        rt = tga_acct_rt(aid)
+        stale = rt.get("authorized") is None or (now - float(rt.get("checked") or 0) > 600)
+        if force or stale:
+            refresh_ids.append(aid)
+    if not force:
+        refresh_ids = refresh_ids[:1]
+    for aid in refresh_ids:
         try:
-            _tga_run(_tga_refresh_auth_async(), 25)
+            _tga_run(_tga_refresh_auth_async(aid), 25)
         except HTTPException as exc:
             err = str(exc.detail)
         except Exception:  # noqa: BLE001
             err = "暂时连不上 Telegram，请稍后再试"
+            break
     login = _tga["login"]
     dl = _tga["download"]
     if dl and dl.get("job_id"):
         job = _opt_load(dl["job_id"])
         if job:
             dl = dict(dl, received=job.get("received") or 0, size=job.get("size") or dl.get("size"))
-    flood = max(0, int(_tga["flood_until"] - time.time()))
+    acc_pub = tga_accounts_public()
+    current = tga_current_account_public()
+    flood = 0
+    for a in acc_pub:
+        if a.get("cooling") and a.get("cooling_until"):
+            # leftover seconds computed from stored flood_until
+            rec = tga_acct_get(int(a["id"])) or {}
+            left = int(float(rec.get("flood_until") or 0) - time.time())
+            if left > flood:
+                flood = left
+    logged_in = tga_acct_any_logged_in()
+    me = None
+    if current:
+        me = {
+            "name": current.get("name") or current.get("label") or "Telegram 用户",
+            "username": current.get("username") or "",
+            "phone_mask": current.get("phone_mask") or "",
+        }
     q = _tga_queue_public()
     return {
         "configured": configured,
-        "logged_in": bool(configured and has_session and _tga["authorized"]),
-        "me": _tga["me"] if _tga["authorized"] else None,
+        "logged_in": bool(configured and logged_in),
+        "me": me if logged_in else None,
         "login_stage": (login or {}).get("stage") if login and time.time() - login.get("ts", 0) < 900 else None,
+        "login_new": bool((login or {}).get("is_new")) if login else False,
         "daily_cap": 0,
         "daily_unlimited": True,
         "today": _tga_count_today(),
         "flood_wait": flood,
         "download": dl,
+        "downloads": list((_tga.get("downloads") or {}).values()),
         "error": err,
         "recent": tga_recent_public(),
         "batch": q,
         "queue": q,
         "auto": tga_auto_public(q),
+        "accounts": acc_pub,
+        "current_account": current,
     }
 
 
@@ -10517,24 +11252,39 @@ async def _tga_json(request: Request) -> dict:
 
 
 def _tga_throttle() -> None:
-    """Global ≥5s gap between list/search/resolve calls (waits out the remainder instead of failing)."""
+    """Wait out the global / per-account API gap instead of failing."""
     _tga_check_flood()
+    aid = _tga.get("current_id")
     with _tga_api_lock:
-        gap = TGA_LIST_MIN_GAP - (time.time() - _tga["last_api"])
+        now = time.time()
+        gap_g = TGA_GLOBAL_API_GAP - (now - float(_tga.get("last_api") or 0))
+        gap_a = 0.0
+        if aid:
+            rt = tga_acct_rt(int(aid))
+            gap_a = TGA_ACCT_API_GAP - (now - float(rt.get("last_api") or 0))
+        gap = max(gap_g, gap_a, 0.0)
         if gap > 0:
             time.sleep(gap)
-        _tga["last_api"] = time.time()
+        now = time.time()
+        _tga["last_api"] = now
+        if aid:
+            tga_acct_rt(int(aid))["last_api"] = now
 
 
 def _tga_need_login() -> None:
     if not tga_configured():
         raise HTTPException(status_code=409, detail="未配置 api_id / api_hash")
-    if not TGA_SESSION_PATH.is_file() or not _tga["authorized"]:
-        if TGA_SESSION_PATH.is_file() and _tga["authorized"] is None:
+    if tga_acct_any_logged_in():
+        return
+    tga_accounts_migrate()
+    if tga_accounts_load()["accounts"]:
+        try:
             tga_status(force=True)
-            if _tga["authorized"]:
-                return
-        raise HTTPException(status_code=409, detail="请先登录 Telegram 账号")
+        except Exception:  # noqa: BLE001
+            pass
+        if tga_acct_any_logged_in():
+            return
+    raise HTTPException(status_code=409, detail="请先登录 Telegram 账号")
 
 
 @app.get("/admin/tg-audio/status")
@@ -10550,13 +11300,20 @@ async def tga_config_ep(request: Request, db: Session = Depends(get_db)):
     data = await _tga_json(request)
     cfg = tga_cfg_load()
     if data.get("action") == "clear":
-        await asyncio.to_thread(_tga_run, _tga_drop_client(True), 30)
+        await asyncio.to_thread(_tga_run, _tga_drop_all_clients(True), 30)
+        for a in list(tga_accounts_load()["accounts"]):
+            tga_session_delete_for(int(a["id"]))
         tga_session_delete()
+        tga_accounts_save(tga_accounts_default())
         try:
             TGA_CFG_PATH.unlink(missing_ok=True)
         except OSError:
             pass
-        return {"ok": True, "message": "已清除 api_id / api_hash 并退出登录", **tga_status()}
+        try:
+            TGA_ACCOUNTS_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"ok": True, "message": "已清除 api_id / api_hash，并退出全部 Telegram 账号", **tga_status()}
     api_id = str(data.get("api_id") or "").strip()
     api_hash = str(data.get("api_hash") or "").strip()
     if api_id or api_hash:
@@ -10565,11 +11322,10 @@ async def tga_config_ep(request: Request, db: Session = Depends(get_db)):
         if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
             raise HTTPException(status_code=400, detail="api_hash 应为 32 位十六进制字符串")
         if (str(cfg.get("api_id")), str(cfg.get("api_hash"))) != (api_id, api_hash):
-            await asyncio.to_thread(_tga_run, _tga_drop_client(False), 30)
+            await asyncio.to_thread(_tga_run, _tga_drop_all_clients(False), 30)
         cfg["api_id"], cfg["api_hash"] = int(api_id), api_hash.lower()
     elif not tga_configured(cfg):
         raise HTTPException(status_code=400, detail="请填写 api_id 和 api_hash")
-    # daily download cap has been removed; ignore any leftover daily_cap field
     cfg.pop("daily_cap", None)
     tga_cfg_save(cfg)
     return {"ok": True, "message": "已保存", **tga_status()}
@@ -10585,12 +11341,16 @@ async def tga_send_code_ep(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="手机号格式不对，请带国家区号，如 +60123456789")
     if not tga_configured():
         raise HTTPException(status_code=409, detail="未配置 api_id / api_hash")
+    is_new = bool(data.get("new")) or not tga_accounts_load()["accounts"]
+    if is_new and len(tga_accounts_load()["accounts"]) >= TGA_ACCT_MAX:
+        raise HTTPException(status_code=400, detail=f"最多添加 {TGA_ACCT_MAX} 个 Telegram 账号")
+    label = str(data.get("label") or "").strip()[:40]
     _tga_check_flood()
     _tga_rate("send")
 
     async def go():
         from telethon import errors
-        cl = await _tga_client_async()
+        cl = await _tga_ensure_login_client(reset=True)
         try:
             sent = await cl.send_code_request(phone)
         except errors.FloodWaitError as exc:
@@ -10603,7 +11363,11 @@ async def tga_send_code_ep(request: Request, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="api_id / api_hash 无效，请检查配置")
         except errors.RPCError as exc:
             raise HTTPException(status_code=400, detail=f"Telegram 拒绝发送验证码（{type(exc).__name__}）")
-        _tga["login"] = {"phone": phone, "hash": sent.phone_code_hash, "stage": "code", "ts": time.time()}
+        _tga["login"] = {
+            "phone": phone, "hash": sent.phone_code_hash, "stage": "code",
+            "ts": time.time(), "is_new": bool(is_new), "label": label,
+        }
+        _tga["login_is_new"] = bool(is_new)
 
     await asyncio.to_thread(_tga_run, go(), 40)
     return {"ok": True, "stage": "code", "message": "验证码已发送到你的 Telegram（或短信），请在 15 分钟内输入"}
@@ -10625,7 +11389,7 @@ async def tga_code_ep(request: Request, db: Session = Depends(get_db)):
 
     async def go():
         from telethon import errors
-        cl = await _tga_client_async()
+        cl = await _tga_ensure_login_client()
         try:
             await cl.sign_in(phone=login["phone"], code=code, phone_code_hash=login["hash"])
         except errors.SessionPasswordNeededError:
@@ -10666,7 +11430,7 @@ async def tga_password_ep(request: Request, db: Session = Depends(get_db)):
 
     async def go():
         from telethon import errors
-        cl = await _tga_client_async()
+        cl = await _tga_ensure_login_client()
         try:
             await cl.sign_in(password=pw)
         except errors.FloodWaitError as exc:
@@ -10683,26 +11447,161 @@ async def tga_password_ep(request: Request, db: Session = Depends(get_db)):
 
 def _tga_finish_login() -> None:
     async def go():
-        cl = await _tga_client_async()
-        tga_session_save(cl.session.save())
+        from telethon import errors
+        login = _tga.get("login") or {}
+        cl = _tga.get("login_client")
+        if cl is None:
+            cl = await _tga_ensure_login_client()
+        try:
+            if not await cl.is_user_authorized():
+                raise HTTPException(status_code=400, detail="登录未完成，请重试")
+            me = await cl.get_me()
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _tga_log("finish-login", exc)
+            raise HTTPException(status_code=400, detail=f"登录失败（{type(exc).__name__}）")
+        pub = _tga_me_public(me) or {}
+        tg_uid = int(getattr(me, "id", 0) or 0)
+        sess = cl.session.save()
+        label = str(login.get("label") or "").strip()[:40]
+        with _tga_lock:
+            st = tga_accounts_load()
+            existing = next((a for a in st["accounts"] if int(a.get("tg_user_id") or 0) == tg_uid and tg_uid), None)
+            if existing:
+                aid = int(existing["id"])
+                existing["authorized"] = True
+                existing["has_session"] = True
+                existing["enabled"] = True
+                existing["name"] = pub.get("name") or existing.get("name") or ""
+                existing["username"] = pub.get("username") or existing.get("username") or ""
+                existing["phone_mask"] = pub.get("phone_mask") or existing.get("phone_mask") or ""
+                if label:
+                    existing["label"] = label
+                existing["last_error"] = ""
+                tga_accounts_save(st)
+            else:
+                if len(st["accounts"]) >= TGA_ACCT_MAX:
+                    raise HTTPException(status_code=400, detail=f"最多添加 {TGA_ACCT_MAX} 个 Telegram 账号")
+                if not st["accounts"]:
+                    aid = 1
+                    st["next_id"] = max(int(st.get("next_id") or 1), 2)
+                else:
+                    aid = int(st.get("next_id") or (max(int(a["id"]) for a in st["accounts"]) + 1))
+                    st["next_id"] = aid + 1
+                st["accounts"].append({
+                    "id": aid,
+                    "label": label or f"账号 {aid}",
+                    "enabled": True,
+                    "phone_mask": pub.get("phone_mask") or "",
+                    "username": pub.get("username") or "",
+                    "name": pub.get("name") or "",
+                    "tg_user_id": tg_uid,
+                    "authorized": True,
+                    "has_session": True,
+                    "flood_until": 0.0,
+                    "flood_reason": "",
+                    "last_used": time.time(),
+                    "ok_count": 0,
+                    "fail_count": 0,
+                    "last_error": "",
+                    "added": time.time(),
+                })
+                tga_accounts_save(st)
+        tga_session_save_for(aid, sess)
+        # Adopt the login client as this account's live client (do not disconnect).
+        _tga["clients"][int(aid)] = cl
+        cfg = tga_cfg_load()
+        _tga["client_cfgs"][int(aid)] = (str(cfg.get("api_id")), str(cfg.get("api_hash")))
+        _tga["login_client"] = None
         _tga["login"] = None
-        await _tga_refresh_auth_async()
+        _tga["login_is_new"] = False
+        _tga_touch_current(int(aid))
+        rt = tga_acct_rt(int(aid))
+        rt["authorized"] = True
+        rt["me"] = pub
+        rt["checked"] = time.time()
 
     _tga_run(go(), 30)
 
 
+
+def _tga_remove_account(aid: int) -> None:
+    """Drop a live client, delete the encrypted session, and remove metadata. Never logs secrets."""
+    async def drop():
+        try:
+            await _tga_drop_client_for(int(aid), True)
+        except Exception:  # noqa: BLE001
+            try:
+                await _tga_drop_client_for(int(aid), False)
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        _tga_run(drop(), 30)
+    except Exception:  # noqa: BLE001
+        pass
+    tga_session_delete_for(int(aid))
+    tga_acct_busy_set(int(aid), False)
+    with _tga_lock:
+        st = tga_accounts_load()
+        st["accounts"] = [a for a in st["accounts"] if int(a["id"]) != int(aid)]
+        tga_accounts_save(st)
+
+
 @app.post("/admin/tg-audio/logout")
 async def tga_logout_ep(request: Request, db: Session = Depends(get_db)):
+    """Remove / log out one account. Body: {id}. If omitted and only one account exists, that one is removed."""
     _opt_csrf(request)
     _tga_admin(request, db)
-    if TGA_SESSION_PATH.is_file() and tga_configured():
+    data = await _tga_json(request)
+    accounts = tga_accounts_load()["accounts"]
+    try:
+        aid = int(data.get("id") or data.get("account_id") or 0)
+    except (TypeError, ValueError):
+        aid = 0
+    if aid <= 0 and len(accounts) == 1:
+        aid = int(accounts[0]["id"])
+    if aid <= 0:
+        raise HTTPException(status_code=400, detail="请指定要退出的账号")
+    if not tga_acct_get(aid):
+        raise HTTPException(status_code=404, detail="找不到这个 Telegram 账号")
+    await asyncio.to_thread(_tga_remove_account, aid)
+    return {"ok": True, "message": "已退出该账号并删除本机会话", **tga_status()}
+
+
+@app.post("/admin/tg-audio/accounts/edit")
+async def tga_accounts_edit_ep(request: Request, db: Session = Depends(get_db)):
+    _opt_csrf(request)
+    _tga_admin(request, db)
+    data = await _tga_json(request)
+    try:
+        aid = int(data.get("id") or 0)
+    except (TypeError, ValueError):
+        aid = 0
+    action = str(data.get("action") or "").strip()
+    if aid <= 0 or action not in ("enable", "disable", "remove", "label"):
+        raise HTTPException(status_code=400, detail="参数错误")
+    acc = tga_acct_get(aid)
+    if not acc:
+        raise HTTPException(status_code=404, detail="找不到这个 Telegram 账号")
+    if action == "remove":
+        await asyncio.to_thread(_tga_remove_account, aid)
+        return {"ok": True, "message": "已退出该账号并删除本机会话", **tga_status()}
+    if action == "label":
+        label = str(data.get("label") or "").strip()[:40]
+        if not label:
+            raise HTTPException(status_code=400, detail="请填写账号备注")
+        tga_acct_update(aid, label=label)
+        return {"ok": True, "message": "已更新备注", **tga_status()}
+    tga_acct_update(aid, enabled=(action == "enable"))
+    if action == "disable":
         try:
-            await asyncio.to_thread(_tga_run, _tga_client_async(), 20)
+            await asyncio.to_thread(_tga_run, _tga_drop_client_for(aid, False), 20)
         except Exception:  # noqa: BLE001
             pass
-    await asyncio.to_thread(_tga_run, _tga_drop_client(True), 30)
-    tga_session_delete()
-    return {"ok": True, "message": "已退出登录并删除会话", **tga_status()}
+        tga_acct_busy_set(aid, False)
+    msg = "已启用该账号，将参与轮换" if action == "enable" else "已暂停该账号，轮换时将跳过"
+    return {"ok": True, "message": msg, **tga_status()}
 
 
 def _tga_log(op: str, exc: BaseException) -> None:
@@ -10777,16 +11676,18 @@ def _tga_chat_public(ent) -> dict:
             "members": getattr(ent, "participants_count", None)}
 
 
-async def _tga_entity(cl, ref: str):
+async def _tga_entity(cl, ref: str, account_id: Optional[int] = None, try_join: bool = True):
     """Resolve a normalised ref to a channel / group entity, raising HTTPException with the real reason."""
     from telethon import errors
     from telethon.tl.functions.contacts import ResolveUsernameRequest
     from telethon.tl.functions.messages import CheckChatInviteRequest
     from telethon.tl.types import ChatInviteAlready, ChatInvitePeek, PeerChannel
+    aid = int(account_id) if account_id else _tga.get("current_id")
+    entities = tga_acct_rt(int(aid))["entities"] if aid else _tga["entities"]
     try:
         if ref.startswith("id:"):
             cid = int(ref[3:])
-            ent = _tga["entities"].get(cid)
+            ent = entities.get(cid)
             if ent is None:
                 try:
                     ah = tga_recent_access_hash(cid)
@@ -10830,14 +11731,24 @@ async def _tga_entity(cl, ref: str):
         raise HTTPException(status_code=403, detail="这是私有频道，或当前账号被移出/封禁，无法读取")
     except errors.AuthKeyUnregisteredError as exc:
         _tga_log("resolve", exc)
-        _tga["authorized"] = False
+        tga_acct_mark_unauth(aid or _tga.get("current_id"), type(exc).__name__)
         raise HTTPException(status_code=401, detail="Telegram 登录已失效，请重新登录")
     except errors.RPCError as exc:
         _tga_log("resolve", exc)
         raise HTTPException(status_code=400, detail=f"打开频道失败（{type(exc).__name__}）")
     if getattr(ent, "left", False) and not getattr(ent, "username", None) and not getattr(ent, "broadcast", False):
         raise HTTPException(status_code=403, detail="当前账号不在这个私有群组里，无法读取")
-    _tga["entities"][ent.id] = ent
+    if try_join and getattr(ent, "left", False) and getattr(ent, "username", None):
+        if await _tga_maybe_join_public(cl, ent, ref):
+            try:
+                ent = await cl.get_entity(ent)
+            except Exception:  # noqa: BLE001
+                pass
+    entities[ent.id] = ent
+    if aid:
+        tga_acct_rt(int(aid))["entities"][ent.id] = ent
+    else:
+        _tga["entities"][ent.id] = ent
     return ent
 
 
@@ -11219,13 +12130,17 @@ async def tga_list_ep(request: Request, db: Session = Depends(get_db)):
     return await asyncio.to_thread(_tga_run, go(), 60)
 
 
-async def _tga_download_async(job_id: str, ref: str, msg_id: int) -> None:
+async def _tga_download_async(job_id: str, ref: str, msg_id: int, account_id: Optional[int] = None) -> None:
     from telethon import errors
     d = _opt_job_dir(job_id)
     dl = _tga["download"]
     try:
-        cl = await _tga_client_async()
-        ent = await _tga_entity(cl, ref)
+        if account_id:
+            cl = await _tga_client_for(int(account_id))
+        else:
+            cl = await _tga_client_async()
+        aid = int(account_id) if account_id else _tga.get("current_id")
+        ent = await _tga_entity(cl, ref, account_id=aid, try_join=True)
         msg = await cl.get_messages(ent, ids=msg_id)
         if msg is None or getattr(msg, "document", None) is None:
             raise RuntimeError("消息不存在或不是音频文件")
@@ -11249,13 +12164,14 @@ async def _tga_download_async(job_id: str, ref: str, msg_id: int) -> None:
                             _opt_update(job_id, received=got, stage="从 Telegram 下载中")
                             dl["received"] = got
                 break
-            except errors.FloodWaitError as exc:
-                secs = int(exc.seconds or 0)
-                _tga["flood_until"] = time.time() + secs
-                _opt_update(job_id, stage=f"Telegram 限流，{secs} 秒后自动继续")
-                dl["state"] = f"限流等待 {secs} 秒"
-                await asyncio.sleep(secs + 1)
-                dl["state"] = "downloading"
+            except Exception as exc:
+                kind, secs = _tga_classify_exc(exc)
+                if kind != "flood":
+                    raise
+                wait = secs or 30
+                tga_acct_mark_flood(aid, wait, type(exc).__name__)
+                _opt_update(job_id, stage="Telegram 限流，切换账号后继续")
+                raise HTTPException(status_code=429, detail=f"Telegram 限流：需要等待 {wait} 秒后再操作")
         if total and got != total:
             raise RuntimeError("下载不完整，请重试")
         dl["received"] = got
@@ -11474,34 +12390,55 @@ def _tga_batch_busy() -> bool:
     )
 
 
-async def _tga_throttle_async(wait_flood: bool = False) -> None:
+async def _tga_throttle_async(wait_flood: bool = False, account_id: Optional[int] = None) -> None:
     """Async counterpart of _tga_throttle; safe to await on the Telethon loop."""
-    if wait_flood:
-        left = int(_tga["flood_until"] - time.time())
+    aid = int(account_id) if account_id else _tga.get("current_id")
+    if aid:
+        rt = tga_acct_rt(int(aid))
+        left = int(float(rt.get("flood_until") or 0) - time.time())
         if left > 0:
-            await asyncio.sleep(left + 1)
+            if wait_flood:
+                raise HTTPException(status_code=429, detail=f"Telegram 限流：需要等待 {left} 秒后再操作")
+            raise HTTPException(status_code=429, detail=f"Telegram 限流中，请 {left} 秒后再试")
     else:
         _tga_check_flood()
     while True:
         with _tga_api_lock:
-            gap = TGA_LIST_MIN_GAP - (time.time() - _tga["last_api"])
+            now = time.time()
+            gap_g = TGA_GLOBAL_API_GAP - (now - float(_tga.get("last_api") or 0))
+            gap_a = 0.0
+            if aid:
+                rt = tga_acct_rt(int(aid))
+                gap_a = TGA_ACCT_API_GAP - (now - float(rt.get("last_api") or 0))
+            gap = max(gap_g, gap_a)
             if gap <= 0:
-                _tga["last_api"] = time.time()
+                now = time.time()
+                _tga["last_api"] = now
+                if aid:
+                    tga_acct_rt(int(aid))["last_api"] = now
                 return
         await asyncio.sleep(gap)
 
 
-async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str, auto_import: bool = False) -> tuple:
+async def _tga_prepare_job(user_id: int, ref: str, msg_id: int, target: str, auto_import: bool = False, account_id: Optional[int] = None) -> tuple:
     """Create the optimize job and fill the download slot. Must run on the Telethon loop."""
     from telethon import errors
-    cl = await _tga_client_async()
+    if account_id:
+        cl = await _tga_client_for(int(account_id))
+    else:
+        cl = await _tga_client_async()
+    aid = int(account_id) if account_id else _tga.get("current_id")
     try:
-        ent = await _tga_entity(cl, ref)
+        ent = await _tga_entity(cl, ref, account_id=aid, try_join=True)
         msg = await cl.get_messages(ent, ids=msg_id)
-    except errors.FloodWaitError as exc:
-        raise _tga_flood(exc)
-    except errors.RPCError as exc:
-        raise HTTPException(status_code=400, detail=f"读取消息失败（{type(exc).__name__}）")
+    except Exception as exc:
+        kind, secs = _tga_classify_exc(exc)
+        if kind == "flood":
+            tga_acct_mark_flood(aid, secs or 30, type(exc).__name__)
+            raise HTTPException(status_code=429, detail=f"Telegram 限流：需要等待 {secs or 30} 秒后再操作")
+        if isinstance(exc, errors.RPCError):
+            raise HTTPException(status_code=400, detail=f"读取消息失败（{type(exc).__name__}）")
+        raise
     item = _tga_audio_item(msg) if msg is not None else None
     if not item:
         raise HTTPException(status_code=404, detail="消息不存在或不是音频文件")
@@ -11551,13 +12488,46 @@ def _tga_queue_kick() -> None:
 
 
 async def _tga_queue_worker() -> None:
-    """Process the DB-backed queue: one TG download at a time, then hand off to ffmpeg."""
+    """Process the DB-backed queue. At most one download per account, global cap of 2."""
+    tasks: set = set()
     try:
         while True:
-            nxt = await asyncio.to_thread(_tga_q_claim_next)
-            if not nxt:
-                return
-            await _tga_q_run_item(nxt)
+            finished = {t for t in tasks if t.done()}
+            for t in finished:
+                tasks.discard(t)
+                try:
+                    t.result()
+                except Exception as exc:  # noqa: BLE001
+                    _tga_log("queue-item-task", exc)
+            cap = tga_dl_cap()
+            started = 0
+            while len(tasks) < cap:
+                if not await asyncio.to_thread(_tga_q_has_queued):
+                    break
+                if tga_acct_pick(require_idle=True) is None:
+                    break
+                nxt = await asyncio.to_thread(_tga_q_claim_next)
+                if not nxt:
+                    break
+                tasks.add(asyncio.create_task(_tga_q_run_item(nxt)))
+                started += 1
+            if tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        t.result()
+                    except Exception as exc:  # noqa: BLE001
+                        _tga_log("queue-item-task", exc)
+                tasks = pending
+                continue
+            if await asyncio.to_thread(_tga_q_has_queued):
+                until = tga_acct_earliest_cooldown()
+                if until > time.time():
+                    await asyncio.sleep(max(1, min(60, until - time.time() + 1)))
+                else:
+                    await asyncio.sleep(3)
+                continue
+            return
     except Exception as exc:  # noqa: BLE001
         _tga_log("queue-worker", exc)
     finally:
@@ -11576,62 +12546,112 @@ async def _tga_q_run_item(nxt: dict) -> None:
     msg_id = int(nxt["msg_id"])
     target = nxt.get("target") or OPT_DEFAULT_TARGET
     user_id = int(nxt.get("user_id") or 0)
-    while True:
-        with _tga_lock:
-            cur = _tga.get("download")
-            if not (cur and cur.get("active")):
-                _tga["download"] = {
-                    "active": True, "job_id": None,
-                    "name": nxt.get("title") or nxt.get("name") or "",
-                    "size": 0, "received": 0, "state": "preparing", "error": "",
-                }
-                break
-        await asyncio.sleep(0.4)
+    tried: set[int] = set()
+    job_id = None
+    name = nxt.get("title") or nxt.get("name") or ""
+    size = int(nxt.get("size") or 0)
     last_err = ""
-    try:
-        while True:
-            try:
-                await _tga_throttle_async(wait_flood=True)
-                job_id, name, size = await _tga_prepare_job(user_id, ref, msg_id, target, bool(nxt.get("auto_import")))
+    aid = None
+    while True:
+        acc = tga_acct_pick(exclude=tried, require_idle=True)
+        if acc is None:
+            until = tga_acct_earliest_cooldown()
+            leftover = tga_acct_pick(exclude=tried)
+            if leftover is None and until > time.time():
+                when = _tga_fmt_myt(until)
                 await asyncio.to_thread(
-                    _tga_q_update, item_id, job_id=job_id, name=name, size=size, status="downloading", error=""
+                    _tga_q_update, item_id, status="queued",
+                    error=f"所有账号限流中，将于 {when} 后重试",
+                    job_id=job_id,
                 )
-                await _tga_download_async(job_id, ref, msg_id)
+                return
+            if leftover is None:
+                # No healthy account left (disabled / unauthorized / cannot access)
+                kind_err = last_err or "没有可用的 Telegram 账号"
+                fatal_all = (not tga_acct_any_logged_in()) or ("无法读取" in kind_err or "无权" in kind_err)
+                status = "failed" if fatal_all and until <= time.time() else "queued"
+                await asyncio.to_thread(
+                    _tga_q_update, item_id, status=status,
+                    error=(kind_err if status == "failed" else (kind_err + "，将在账号恢复后重试"))[:300],
+                    job_id=job_id if status == "queued" else job_id,
+                )
+                return
+            await asyncio.sleep(1)
+            continue
+        aid = int(acc["id"])
+        tga_acct_busy_set(aid, True)
+        _tga_touch_current(aid)
+        with _tga_lock:
+            _tga["download"] = {
+                "active": True, "job_id": job_id, "account_id": aid,
+                "name": name, "size": size, "received": 0, "state": "preparing", "error": "",
+            }
+            _tga["downloads"][item_id] = _tga["download"]
+        try:
+            try:
+                await _tga_throttle_async(account_id=aid)
+                if not job_id:
+                    job_id, name, size = await _tga_prepare_job(
+                        user_id, ref, msg_id, target, bool(nxt.get("auto_import")), account_id=aid
+                    )
+                    await asyncio.to_thread(
+                        _tga_q_update, item_id, job_id=job_id, name=name, size=size, status="downloading", error=""
+                    )
+                else:
+                    await asyncio.to_thread(
+                        _tga_q_update, item_id, status="downloading", error=f"已切换到{acc.get('label') or '另一账号'}继续下载"
+                    )
+                await _tga_download_async(job_id, ref, msg_id, account_id=aid)
                 job = _opt_load(job_id) or {}
                 js = job.get("state")
                 if js in ("queued", "running"):
+                    tga_acct_note_ok(aid)
                     await asyncio.to_thread(_tga_q_update, item_id, status="optimizing", error="", name=name, size=size)
                     return
                 if js == "done":
+                    tga_acct_note_ok(aid)
                     await asyncio.to_thread(_tga_q_update, item_id, status="done", progress=100, error="", name=name, size=size)
                     if nxt.get("auto_import"):
                         await asyncio.to_thread(_opt_maybe_auto_import, job_id)
                     return
                 last_err = job.get("error") or ((_tga.get("download") or {}).get("error")) or "下载失败"
+                kind, secs = _tga_classify_exc(HTTPException(status_code=400, detail=str(last_err)))
+                if kind == "flood" or "Flood" in (last_err or "") or "限流" in (last_err or ""):
+                    wait = secs or (900 if "Premium" in (last_err or "") else 30)
+                    tga_acct_mark_flood(aid, wait, last_err)
+                    tried.add(aid)
+                    continue
+                tga_acct_note_error(aid, last_err, failed=True)
                 if not _tga_q_retryable(last_err):
                     await asyncio.to_thread(_tga_q_update, item_id, status="failed", error=(last_err or "下载失败")[:300])
                     return
             except Exception as exc:  # noqa: BLE001
-                with _tga_lock:
-                    if _tga["download"] and not _tga["download"].get("job_id"):
-                        _tga["download"]["active"] = False
-                        _tga["download"]["state"] = "idle"
-                if isinstance(exc, HTTPException) and "限流" in str(exc.detail):
-                    # FloodWait raised by prepare: sleep then retry without consuming a retry slot
-                    left = int(_tga["flood_until"] - time.time())
-                    if left < 1:
-                        left = int(getattr(getattr(exc, "detail", None), "seconds", 0) or 5)
+                kind, secs = _tga_classify_exc(exc)
+                if kind == "flood":
+                    tga_acct_mark_flood(aid, secs or 30, _tga_exc_name(exc))
+                    tried.add(aid)
+                    last_err = f"Telegram 限流，切换账号重试"
                     await asyncio.to_thread(
                         _tga_q_update, item_id, status="downloading",
-                        error=f"Telegram 限流，{left} 秒后自动继续",
+                        error=f"账号{acc.get('label') or aid}限流，正在换号重试",
                     )
-                    await asyncio.sleep(max(1, left) + 1)
+                    continue
+                if kind == "auth":
+                    tga_acct_mark_unauth(aid, _tga_exc_name(exc))
+                    tried.add(aid)
+                    last_err = "Telegram 登录已失效"
+                    continue
+                if kind == "access":
+                    tga_acct_note_error(aid, _tga_exc_name(exc))
+                    tried.add(aid)
+                    last_err = "该账号无法读取这个频道"
                     continue
                 if isinstance(exc, HTTPException):
                     last_err = str(exc.detail)
                 else:
                     _tga_log("queue-item", exc)
                     last_err = f"下载失败（{type(exc).__name__}）"
+                tga_acct_note_error(aid, last_err, failed=True)
                 if not _tga_q_retryable(last_err):
                     await asyncio.to_thread(_tga_q_update, item_id, status="failed", error=(last_err or "下载失败")[:300])
                     return
@@ -11651,12 +12671,13 @@ async def _tga_q_run_item(nxt: dict) -> None:
             )
             await asyncio.sleep(delay)
             nxt = row or nxt
-    finally:
-        with _tga_lock:
-            if _tga["download"] and _tga["download"].get("active"):
-                # only release if this item still owns the slot and is not mid-transfer
-                if not _tga["download"].get("job_id") or _tga["download"].get("state") in ("done", "failed", "cancelled", "idle"):
-                    _tga["download"]["active"] = False
+        finally:
+            tga_acct_busy_set(aid, False)
+            with _tga_lock:
+                _tga["downloads"].pop(item_id, None)
+                if _tga["download"] and _tga["download"].get("account_id") == aid:
+                    if not _tga["download"].get("job_id") or _tga["download"].get("state") in ("done", "failed", "cancelled", "idle"):
+                        _tga["download"]["active"] = False
 
 
 def _tga_enqueue(user_id: int, ref: str, raw_items: list, target: str, *,
@@ -12179,10 +13200,28 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
     full = not bool(ch.get("backfill_done"))
     last_seen = int(ch.get("last_seen_id") or 0)
     offset_id = int(ch.get("backfill_offset") or 0) if full else 0
-    cl = await _tga_client_async()
-    ent = await _tga_entity(cl, ref)
-    pub = _tga_chat_public(ent)
-    open_ref = ("@" + pub["username"]) if pub.get("username") else pub["key"]
+    tried: set[int] = set()
+    aid = None
+    cl = None
+    ent = None
+    pub = {}
+    open_ref = ref
+
+    async def attach(exclude=None):
+        nonlocal cl, aid, ent, pub, open_ref
+        acc = tga_acct_pick(exclude=exclude if exclude is not None else tried)
+        if acc is None:
+            until = tga_acct_earliest_cooldown()
+            if until > time.time():
+                raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {int(until - time.time())} 秒后再试")
+            raise HTTPException(status_code=409, detail="没有可用的 Telegram 账号")
+        aid = int(acc["id"])
+        cl = await _tga_client_for(aid)
+        ent = await _tga_entity(cl, ref, account_id=aid, try_join=True)
+        pub = _tga_chat_public(ent)
+        open_ref = ("@" + pub["username"]) if pub.get("username") else pub["key"]
+
+    await attach()
     try:
         tga_sync_marks_from_jobs()
     except Exception as exc:  # noqa: BLE001
@@ -12217,22 +13256,50 @@ async def _tga_auto_scan_channel(ch: dict, user_id: int) -> dict:
             last_err = last[:300]
             pending = batch + pending
 
+    async def rotate_or_wait(secs: int, reason: str) -> None:
+        tga_acct_mark_flood(aid, secs, reason)
+        if aid:
+            tried.add(int(aid))
+        if tga_acct_pick(exclude=tried) is not None:
+            await attach(exclude=tried)
+            return
+        if secs <= TGA_FLOOD_AUTO_WAIT:
+            await asyncio.sleep(secs + 1)
+            return
+        raise HTTPException(status_code=429, detail=f"所有账号限流中，请 {secs} 秒后再试")
+
     while True:
-        await _tga_throttle_async(wait_flood=True)
+        try:
+            await _tga_throttle_async(account_id=aid)
+        except HTTPException as exc:
+            if "限流" in str(exc.detail):
+                await rotate_or_wait(_tga_classify_exc(exc)[1] or 30, "FloodWait")
+                continue
+            raise
         try:
             msgs = await cl.get_messages(ent, limit=TGA_PAGE, offset_id=offset_id, filter=InputMessagesFilterMusic)
         except errors.FloodWaitError as exc:
-            secs = int(exc.seconds or 0) or 30
-            _tga["flood_until"] = time.time() + secs
-            await asyncio.sleep(secs + 1)
+            await rotate_or_wait(int(exc.seconds or 0) or 30, type(exc).__name__)
             continue
         except Exception as exc:  # noqa: BLE001
-            secs = _tga_is_flood_exc(exc)
-            if secs:
-                _tga["flood_until"] = time.time() + secs
-                await asyncio.sleep(secs + 1)
+            kind, secs = _tga_classify_exc(exc)
+            if kind == "flood" or _tga_is_flood_exc(exc):
+                await rotate_or_wait(secs or _tga_is_flood_exc(exc) or 30, type(exc).__name__)
                 continue
-            if isinstance(exc, (errors.ChannelPrivateError, errors.ChatAdminRequiredError)):
+            if kind == "auth":
+                tga_acct_mark_unauth(aid, type(exc).__name__)
+                if aid:
+                    tried.add(int(aid))
+                if tga_acct_pick(exclude=tried) is not None:
+                    await attach(exclude=tried)
+                    continue
+                raise HTTPException(status_code=401, detail="Telegram 登录已失效，请重新登录")
+            if isinstance(exc, (errors.ChannelPrivateError, errors.ChatAdminRequiredError)) or kind == "access":
+                if aid:
+                    tried.add(int(aid))
+                if tga_acct_pick(exclude=tried) is not None:
+                    await attach(exclude=tried)
+                    continue
                 raise HTTPException(status_code=403, detail="该账号无权读取这个频道（私有频道需先加入）")
             if isinstance(exc, errors.RPCError):
                 _tga_log("auto-list", exc)
@@ -12495,6 +13562,10 @@ async def tga_auto_check_ep(request: Request, db: Session = Depends(get_db)):
 
 def tga_start() -> None:
     """Recover the persistent TG import queue after a restart and resume work."""
+    try:
+        tga_accounts_migrate()
+    except Exception:  # noqa: BLE001
+        logging.exception("tga accounts migrate failed")
     for job in _opt_all_jobs():
         if job.get("state") == "downloading":
             _opt_update(job["id"], state="failed", stage="失败",

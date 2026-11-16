@@ -96,13 +96,12 @@
     if (!st.configured) { $("#tgaCfgBox").open = true; }
     $("#tgaLogin").hidden = !st.configured || st.logged_in;
     $("#tgaMain").hidden = !st.logged_in;
+    var accn = (st.accounts || []).length;
     badge.className = "tga-badge" + (st.logged_in ? " is-ok" : st.configured ? " is-warn" : "");
-    badge.textContent = !st.configured ? "未配置 api_id / api_hash" : st.logged_in ? "已登录" : "未登录";
+    badge.textContent = !st.configured ? "未配置 api_id / api_hash" : st.logged_in ? ("已登录 " + accn + " 个账号") : "未登录";
     if (st.configured && !st.logged_in) step(st.login_stage || "phone");
-    if (st.logged_in && st.me) {
-      $("#tgaMe").textContent = "当前账号：" + st.me.name + (st.me.username ? "（@" + st.me.username + "）" : "");
-    }
-    $("#tgaQuota").textContent = "今日已下载 " + (st.today || 0) + (st.flood_wait ? " · Telegram 限流中，还需等待 " + st.flood_wait + " 秒（将自动继续）" : "");
+    paintAccounts(st);
+    $("#tgaQuota").textContent = "今日已下载 " + (st.today || 0) + (st.flood_wait ? " · 有账号限流中，最长还需 " + st.flood_wait + " 秒（将自动换号或等待后继续）" : "");
     if (st.error) say(st.error, "err");
     var dl = st.download, box = $("#tgaDl");
     if (dl && dl.job_id && (dl.active || dl.state === "failed")) {
@@ -119,8 +118,10 @@
     paintAuto(st);
     var batchBusy = batchIsBusy(st.queue || st.batch);
     var autoBusy = !!(st.auto && st.auto.checking);
+    var cooling = (st.accounts || []).some(function (a) { return a.cooling; });
     clearTimeout(pollTimer);
     if ((dl && dl.active) || batchBusy || autoBusy) pollTimer = setTimeout(load, 2000);
+    else if (cooling) pollTimer = setTimeout(load, 15000);
   }
   function batchIsBusy(b) {
     if (!b) return false;
@@ -264,6 +265,94 @@
       items.forEach(function (it) { if (it.job_id) window.DJOpt.watch(it.job_id); });
     }
   }
+
+  function accountLabel(a) {
+    var bits = [];
+    bits.push(a.label || ("账号 " + a.id));
+    if (a.name) bits.push(a.name);
+    if (a.phone_mask) bits.push(a.phone_mask);
+    if (a.username) bits.push("@" + a.username);
+    return bits.join(" · ");
+  }
+  function paintAccounts(st) {
+    var cur = st.current_account;
+    var curEl = $("#tgaCurrentAcct");
+    var meEl = $("#tgaMe");
+    if (cur) {
+      var line = (cur.label || "账号") + (cur.phone_mask ? " " + cur.phone_mask : "") +
+        (cur.name ? "（" + cur.name + (cur.username ? " @" + cur.username : "") + "）" : (cur.username ? "（@" + cur.username + "）" : ""));
+      if (curEl) curEl.textContent = "当前使用：" + line + (cur.busy ? " · 下载中" : "");
+      if (meEl) meEl.textContent = "当前使用：" + line;
+    } else {
+      if (curEl) curEl.textContent = "当前使用：暂无可用账号";
+      if (meEl) meEl.textContent = st.logged_in ? "已登录" : "";
+    }
+    var table = $("#tgaAcctTable"), body = $("#tgaAcctRows");
+    var list = st.accounts || [];
+    if (!table || !body) return;
+    table.hidden = !list.length;
+    body.innerHTML = "";
+    list.forEach(function (a) {
+      var tr = document.createElement("tr");
+      if (a.in_use || a.busy) tr.classList.add("is-current");
+      var stTxt = [];
+      stTxt.push(a.authorized ? "已授权" : "未授权");
+      stTxt.push(a.enabled ? "启用" : "已暂停");
+      if (a.busy) stTxt.push("使用中");
+      var cool = a.cooling ? ((a.cooling_until || "") + (a.cooling_reason ? "（" + a.cooling_reason + "）" : "")) : "—";
+      var counts = "成功 " + (a.ok_count || 0) + " / 失败 " + (a.fail_count || 0);
+      tr.innerHTML =
+        "<td class='tga-acct-who'><b>" + esc(a.label || ("账号 " + a.id)) + "</b>" +
+          "<span>" + esc(a.phone_mask || "号码未记录") + (a.name ? " · " + esc(a.name) : "") +
+          (a.username ? " · @" + esc(a.username) : "") + "</span></td>" +
+        "<td>" + esc(stTxt.join(" · ")) + "</td>" +
+        "<td class='tga-acct-cool'>" + esc(cool) + "</td>" +
+        "<td>" + esc(a.last_used || "—") + "</td>" +
+        "<td>" + esc(counts) + "</td>" +
+        "<td class='tga-acct-err'>" + esc(a.last_error || "") + "</td>" +
+        "<td class='tga-auto-acts'></td>";
+      var acts = tr.querySelector(".tga-auto-acts");
+      var en = document.createElement("button");
+      en.type = "button"; en.className = "btn btn-sm btn-ghost";
+      en.textContent = a.enabled ? "暂停" : "启用";
+      en.addEventListener("click", function () { acctEdit(a.id, a.enabled ? "disable" : "enable"); });
+      var lab = document.createElement("button");
+      lab.type = "button"; lab.className = "btn btn-sm btn-ghost"; lab.textContent = "改名";
+      lab.addEventListener("click", function () {
+        var v = window.prompt("账号备注", a.label || "");
+        if (v == null) return;
+        v = String(v).trim();
+        if (!v) { say("请填写账号备注", "err"); return; }
+        acctEdit(a.id, "label", v);
+      });
+      var rm = document.createElement("button");
+      rm.type = "button"; rm.className = "btn btn-sm btn-ghost danger"; rm.textContent = "移除";
+      rm.addEventListener("click", function () {
+        if (!confirm("确定移除该 Telegram 账号并删除本机会话？不会影响其他账号。")) return;
+        acctEdit(a.id, "remove");
+      });
+      acts.appendChild(en); acts.appendChild(lab); acts.appendChild(rm);
+      body.appendChild(tr);
+    });
+    var addBox = $("#tgaAcctAdd");
+    if (addBox && st.login_new && st.login_stage && st.logged_in) {
+      addBox.hidden = false;
+      addStep(st.login_stage);
+    }
+  }
+  function acctEdit(id, action, label) {
+    var body = { id: id, action: action };
+    if (label) body.label = label;
+    return act(null, "POST", "/admin/tg-audio/accounts/edit", body, "处理中…");
+  }
+  function addStep(name) {
+    var box = $("#tgaAcctAdd");
+    if (!box) return;
+    Array.prototype.forEach.call(box.querySelectorAll(".tga-add-step"), function (f) {
+      f.hidden = f.dataset.step !== name;
+    });
+  }
+
   function paintAuto(st) {
     var box = $("#tgaAuto");
     if (!box) return;
@@ -331,7 +420,7 @@
     }).catch(function () {});
   });
   $("[data-tga-cfg-clear]").addEventListener("click", function () {
-    if (!confirm("清除 api_id / api_hash，并退出 Telegram 登录、删除会话？")) return;
+    if (!confirm("清除 api_id / api_hash，并退出全部 Telegram 账号、删除本机会话？")) return;
     act(this, "POST", "/admin/tg-audio/config", { action: "clear" }, "清除中…").catch(function () {});
   });
   // login
@@ -355,7 +444,8 @@
     var v = inp.value; inp.value = "";
     act(this, "POST", "/admin/tg-audio/login/password", { password: v }, "验证中…").catch(function () {});
   });
-  $("[data-tga-logout]").addEventListener("click", function () {
+  var logoutBtn = $("[data-tga-logout]");
+  if (logoutBtn) logoutBtn.addEventListener("click", function () {
     if (!confirm("退出 Telegram 登录并删除服务器上的会话？")) return;
     act(this, "POST", "/admin/tg-audio/logout", {}, "退出中…").then(function () {
       $("#tgaList").hidden = true; $("#tgaResults").hidden = true;
@@ -558,6 +648,45 @@
     var key = btn.getAttribute("data-key") || "";
     if (action === "remove" && !confirm("从自动采集列表移除这个频道？已导入的曲目不会删除。")) return;
     autoAction(btn, "/admin/tg-audio/auto/channels/edit", { key: key, action: action }, "处理中…");
+  });
+
+
+  var addBtn = $("#tgaAcctAddBtn");
+  if (addBtn) addBtn.addEventListener("click", function () {
+    var box = $("#tgaAcctAdd");
+    if (!box) return;
+    box.hidden = false;
+    addStep("phone");
+  });
+  var addCancel = $("[data-tga-add-cancel]");
+  if (addCancel) addCancel.addEventListener("click", function () { var b = $("#tgaAcctAdd"); if (b) b.hidden = true; });
+  var addRestart = $("[data-tga-add-restart]");
+  if (addRestart) addRestart.addEventListener("click", function () { addStep("phone"); });
+  var addSend = $("[data-tga-add-send]");
+  if (addSend) addSend.addEventListener("click", function () {
+    var form = $("#tgaAcctAdd").querySelector('[data-step="phone"]');
+    var phone = form.querySelector("input[name=phone]").value.trim();
+    var label = ($("#tgaAcctLabel") && $("#tgaAcctLabel").value.trim()) || "";
+    act(this, "POST", "/admin/tg-audio/login/send-code", { phone: phone, new: true, label: label }, "发送中…").then(function () {
+      addStep("code");
+    });
+  });
+  var addCode = $("[data-tga-add-code]");
+  if (addCode) addCode.addEventListener("click", function () {
+    var form = $("#tgaAcctAdd").querySelector('[data-step="code"]');
+    var code = form.querySelector("input[name=code]").value.trim();
+    act(this, "POST", "/admin/tg-audio/login/code", { code: code, new: true }, "登录中…").then(function (d) {
+      if (d.stage === "password") addStep("password");
+      else { var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone"); }
+    });
+  });
+  var addPw = $("[data-tga-add-pw]");
+  if (addPw) addPw.addEventListener("click", function () {
+    var form = $("#tgaAcctAdd").querySelector('[data-step="password"]');
+    var password = form.querySelector("input[name=password]").value;
+    act(this, "POST", "/admin/tg-audio/login/password", { password: password, new: true }, "登录中…").then(function () {
+      var b = $("#tgaAcctAdd"); if (b) b.hidden = true; addStep("phone");
+    });
   });
 
   load();
